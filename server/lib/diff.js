@@ -90,11 +90,11 @@ function computeDiff(oldSrc, newSrc, context = 3) {
     return out;
   }
 
-  /* rows/allRows = 单栏统一视图（折叠/完整）；sideRows/allSideRows = 并排视图，同源一次返回 */
+  /* rows = 单栏统一视图；sideRows/allSideRows = 并排视图，同源一次返回 */
   return {
     changed: added > 0 || removed > 0,
     added, removed,
-    rows: compact, allRows: rows,
+    rows: compact,
     sideRows: toSide(compact), allSideRows: toSide(rows),
   };
 }

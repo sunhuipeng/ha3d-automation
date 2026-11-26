@@ -23,7 +23,7 @@ export const REL = {
 const COLLIDE_R = { script: 105, context: 92, entity: 95 };
 const OFFSET_R = { script: 80, context: 68, entity: 62 };
 export const collideR = (kind) => COLLIDE_R[kind] || 95;
-export const offsetR = (kind) => OFFSET_R[kind] || 62;
+const offsetR = (kind) => OFFSET_R[kind] || 62;
 
 /* 箭头与连线同色、同尺寸 */
 export function arrowMarker(rel) {

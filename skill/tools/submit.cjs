@@ -18,8 +18,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
-const { SSEClientTransport } = require('@modelcontextprotocol/sdk/client/sse.js');
+const { callTool } = require('./lib/mcp.cjs');
 
 const USAGE = `用法: node skill/tools/submit.cjs <scriptId> <name> <srcFile> <flowFile> [description]
       node skill/tools/submit.cjs <scriptId> <name> <srcFile> <flowFile> --new-version [description]
@@ -93,7 +92,7 @@ function checkFlowAgainstScript(flow, script) {
   }
   const rest = argv
     .filter((a, i) => !FLAGS.includes(a) && !a.startsWith('--host-mode=') && !a.startsWith('--kind=')
-      && !a.startsWith('--long-running=') && a !== '--icon' && !(iconIdxRaw !== -1 && i === iconIdxRaw + 1));
+      && a !== '--icon' && !(iconIdxRaw !== -1 && i === iconIdxRaw + 1));
   const usePlaceholder = process.argv.includes('--placeholder');
   const checkOnly = process.argv.includes('--check');
   const newVersion = process.argv.includes('--new-version');
@@ -101,8 +100,7 @@ function checkFlowAgainstScript(flow, script) {
   const hm = (process.argv.find((a) => a.startsWith('--host-mode=')) || '').split('=')[1];
   if (hm && !['fork', 'inprocess', 'worker'].includes(hm)) fail(`--host-mode 非法：${hm}（仅允许 fork / inprocess / worker）`);
   /* 业务种类：--kind=automation|script|scene（可选；不传继承上一版 / 全新默认 automation）。
-   * 运行模型由 kind 派生：automation=常驻；script/scene=一次性动作（跑完即退）。
-   * 旧参数 --long-running 已退役（传入即忽略，仅从位置参数中过滤掉）。 */
+   * 运行模型由 kind 派生：automation=常驻；script/scene=一次性动作（跑完即退）。 */
   const kind = (process.argv.find((a) => a.startsWith('--kind=')) || '').split('=')[1];
   if (kind && !['automation', 'script', 'scene'].includes(kind)) fail(`--kind 非法：${kind}（仅允许 automation / script / scene）`);
   /* 脚本图标：--icon <icon.svg>（新脚本首次提交必填；迭代不传则继承上一版） */
@@ -117,7 +115,7 @@ function checkFlowAgainstScript(flow, script) {
    * rest[0]=scriptId  rest[1]=name  rest[2]=srcFile  rest[3]=flowFile  rest[4]=description */
   const [scriptId, name, srcFile, flowFile, description] = rest;
   if (!scriptId || !name || !srcFile) fail(USAGE);
-  if (!/^[a-z0-9_-]+$/i.test(scriptId)) fail(`scriptId 不合法：${scriptId}（仅字母数字下划线短横线）`);
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(scriptId)) fail(`scriptId 不合法：${scriptId}（仅字母数字下划线短横线，1–64 位；与服务端 safeId 同口径）`);
   if (name.toLowerCase() === scriptId.toLowerCase()) fail(`脚本名不能与唯一 id 相同（"${name}"）——请传贴切的中文业务名，如「空调运行关门预警」`);
   if (/^[a-z0-9]{8}$/.test(name) && !/[^\x00-\x7F]/.test(name)) fail(`脚本名疑似是 id（"${name}"）——请传贴切的中文业务名，前端列表展示的是 name`);
   if (!fs.existsSync(srcFile)) fail(`脚本源文件不存在：${srcFile}`);
@@ -150,12 +148,5 @@ function checkFlowAgainstScript(flow, script) {
     ...(hm ? { hostMode: hm } : {}),
     ...(icon ? { icon } : {}),
   };
-  const client = new Client({ name: 'migration-submit', version: '1.0.0' }, { capabilities: {} });
-  await client.connect(new SSEClientTransport(new URL(process.env.HA3D_MCP || 'http://127.0.0.1:8100/mcp/sse')));
-  try {
-    const r = await client.callTool({ name: 'automation_submit_script', arguments: args });
-    const out = (r.content || []).map((c) => c.text).join('\n');
-    if (r.isError) { console.error('SUBMIT_ERROR: ' + out); process.exit(2); }
-    console.log(out);
-  } finally { await client.close(); }
+  await callTool('automation_submit_script', args, { clientName: 'migration-submit', errorPrefix: 'SUBMIT_ERROR' });
 })().catch((e) => { console.error('ERR ' + (e && e.message || e)); process.exit(1); });

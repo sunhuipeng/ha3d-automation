@@ -27,7 +27,6 @@ ctx 是脚本唯一能访问的宿主能力。所有 HA 调用经白名单转发
 | `listEntities` | `await ctx.ha.listEntities(filter?)` | 列出实体，`filter` 可选字符串过滤 |
 | `callService` | `await ctx.ha.callService(domain, service, data)` | HA 服务调用。**只允许写在 `ctx.actions` 注册的函数体内** |
 | `change` | `ctx.ha.change(entityId, cb)` | 订阅变化。回调签名固定 `(nextObj, prevObj)` 两个**完整状态对象**，要字符串取 `nextObj.state` |
-| `subscribe` | `ctx.ha.subscribe(condition, cb)` | 简化版：`condition` 为 entityId 字符串或 `{ entityId }`；回调内异常被忽略 |
 
 ## ctx.actions + ctx.write — 动作与统一写入口
 
@@ -184,63 +183,89 @@ ctx.watch.task('hppowersense', (state, info) => {
 | `ctx.stopped` | 布尔 getter：是否收到停止指令（**是属性不是函数**） |
 | `ctx.suspended` | 布尔 getter：是否被兜底挂起（HA 断线 / 实体缺失） |
 
-## ctx.hold — 通用「持续 N 秒确认」容器（优先用这个）
+## ctx.hold — 期待值/期待条件的双边迟滞确认器（优先用这个）
 
-框架内置的状态机，把上一节手写的 `since/timer/翻转重置/到点复核` 全部封装。**实现"持续 N 秒"时优先 `ctx.hold`，只有它不适用时（如多组条件互锁需共享计时）才手写。**
+框架内置的**二态状态机**，把上一节手写的 `since/timer/翻转重置/到点复核` 全部封装。**实现"持续 N 秒"时优先 `ctx.hold`，只有它不适用时（如多组条件互锁需共享计时）才手写。**
+
+语义：传入一个**期待值**或**期待条件**；`hold` 自己记住当前是否已确认到这个期待。期待状态与当前状态相反时开始计时；持续到点且复核仍相反，才切换状态并回调一次。同一状态持续多久都不会重复回调。
 
 ```js
-const h = ctx.hold(ms, opts?);   // ms > 0；opts 可省略
-// opts:
-//   initial   : 初始稳定值（默认 false）
-//   condition : (raw) => signal，纯投影（可 async，可自己 await ctx.ha 读实体）；
-//               不传时 signal = raw 本身
-//   nodeId / label : 日志诊断
+ctx.hold({
+  // 二选一：
+  expect: true,                  // 期待值模式：raw 等于该值即"满足期待"
+  expect: (raw) => raw > 800,    // 期待条件模式：返回 truthy/falsy（二态，不要返回 null 三态）
+
+  satisfyMs: 3000,               // 必填，>0：满足期待持续多久后回调 true
+  unsatisfyMs: 30000,            // 可选：不满足持续多久后回调 false；null/0/缺省 = 立即回落
+  initial: false,                // 可选：初始已确认状态，默认 false
+  nodeId: 'n_xxx',               // 可选：日志诊断
+  label: '大功率3s/低功率30s',    // 可选：日志诊断
+});
 ```
 
-**数据流**：`raw`（脚本写入的值）→ `condition` 投影成 `signal` → signal 连续保持 `ms` → `stable` 翻转。
+**只接受对象参数** `{ expect, satisfyMs, unsatisfyMs?, initial?, nodeId?, label? }`。**不使用旧语法**：数字首参 `ctx.hold(30000)`、`ms`、`condition`、`fallMs` 都会直接抛错（框架已删除这些兼容别名）。
 
-- `h.value`：同步读**稳定值**（翻转确认后的 signal，跨 realm getter 有效）。
-- `h.value = x`：写 **raw**（当前值）。读写不同义：写入后不满 `ms` 读到的是旧稳定值。
-- `h.watch((v, prev) => {...})`：只在**稳定值翻转**时通知（带新值/旧值）；返回 `off()` 可注销。
-- `h.cancel()`：清定时器与 watcher，彻底停用（返回是否成功取消）。
-- `h.state()`：`{ raw, signal, stable, since, active, remaining, ms, dead }` 诊断用。
+**二态回调**：
+
+- `h.value = x`：写 **raw**（当前值）。这是唯一重评入口之一。
+- `h.value`：同步读当前**已确认状态**（`true`=已满足期待，`false`=未满足/已回落），跨 realm getter 有效。
+- `h.watch((satisfied, prev, info) => {...})`：
+  - 满足期待持续满 `satisfyMs` → 回调一次 `satisfied=true`；
+  - 不满足持续满 `unsatisfyMs` → 回调一次 `satisfied=false`；
+  - `prev` 是上一次已确认状态；
+  - `info` 含 `{ satisfied, value, reason:'satisfied'|'unsatisfied', raw, expected, state, stable, ms, nodeId }`；
+  - 返回 `off()` 可注销。
+- `h.cancel()`：清定时器与 watcher、冻结状态，彻底停用（返回是否成功取消）。cancel 后再 `watch` 只会拿到空 `off()`。
+- `h.state()`：`{ raw, desired, signal, state, stable, pending, since, active, remaining, ms, satisfyMs, unsatisfyMs, dead }` 诊断用；`signal` 是 `desired` 的诊断别名、`stable` 同 `state`、`ms` 同 `satisfyMs`（这些只是读侧别名字段，不是入参旧语法）；`pending` 为 `'satisfied' | 'unsatisfied' | null`。
+- `stop`：实例收到停止指令时 hold 自动停止重评、timer 被统一清理，状态冻结；脚本不必自己 `cancel`。
 
 **没有内置实体监听**：框架不订阅任何实体，`raw` 唯一入口就是 `h.value = x`。要基于 HA 实体判断，两种写法自己选：
 
 ```js
 // ① 脚本自己订阅实体，在回调里算好值写进 raw（推荐：watch 与 projection 分离，逻辑最清晰）
-const high = ctx.hold({ ms: 3000, condition: (raw) => raw > 800 });
+const high = ctx.hold({
+  expect: (raw) => raw > 800,
+  satisfyMs: 3000,
+  unsatisfyMs: 10000,
+});
 ctx.watch([pWok, pOven, pRice], async () => {
   const sum = (await ctx.ha.num(pWok)) + (await ctx.ha.num(pOven)) + (await ctx.ha.num(pRice));
   high.value = sum;                 // 三路功率和 → raw
 });
+high.watch((satisfied) => {
+  if (satisfied) ctx.write('setFlag', '大功率', 'n_write', true);
+});
 
-// ② condition 里自己读 HA（raw 可只当触发信号，甚至不用）
-const stove = ctx.hold({ ms: 30000, condition: async () => (await ctx.ha.state('binary_sensor.stove')) === 'Busy' });
-stove.value = true;                 // 任意一次赋值触发首次判定，此后到点复核会再读 HA
+// ② expect 里自己读 HA（raw 可只当触发信号，甚至不用）
+const stove = ctx.hold({
+  expect: async () => (await ctx.ha.state('binary_sensor.stove')) === 'Busy',
+  satisfyMs: 30000,
+  unsatisfyMs: null,               // 不 Busy 立即回落
+});
+// 构造时已首次判定（此刻就读一次 HA），之后到点复核再读；raw 可完全不写
 
-// ③ 纯脚本内值（非 HA 来源）：跟踪 'Busy' 这个枚举持续 30s，无需 condition
-const mode = ctx.hold(30000);
-mode.value = 'Busy';
-const stable = mode.value;          // 同步读，满 30s 才是 'Busy'
+// ③ 纯脚本内值（非 HA 来源）：期待 true，持续 30s 后确认；false 立即回落
+const a = ctx.hold({ satisfyMs: 30000, expect: true, unsatisfyMs: null });
+a.value = true;
 ```
 
-- 只有 `h.value = x` 会触发重评；实体变化若没写进 hold 的 raw，不会推进它的计时。
-- `condition` 抛错：本轮跳过、不推进计时，保守处理。
+- **重评入口**：构造时立即判定一次（init），此后 `h.value = x`、到点复核、异常后的补排都会重跑 `expect`。实体变化本身不触发重评——脚本要么自己 `ctx.watch` 写 raw，要么在 expect 里 `await ctx.ha` 读；两种写法都不需要额外"首次赋值"。
+- **中途翻转**：期待状态与当前状态相反时开始计时；中途回到当前状态只取消本轮计时，不回调。重新相反时从 0 重新计时。
+- **二态约束**：`expect` 只返回 truthy/falsy。断线、`unavailable` 等无效值由脚本层用 `ctx.invalid` / `ctx.ha.num(eid, fallback)` 处理，不要把 `null` 当"保持"三态传进 hold。
+- **`unsatisfyMs`**：`null` / `0` / 不传都表示不满足立即回落；需要"撤销也防抖"时才传正数。
+- `expect` 抛错：本轮跳过、不推进计时，但会按剩余时间（init 失败则按 satisfyMs）自动补排重试，不会让 hold 卡死。
 
 **边界（重要）**：
 
 - 内部状态是**纯内存闭包**，不存 global/local。影子模式下 `ctx.global.set` 写影子桶、`get` 读正式桶，"写后自己读回"读不到——所以 hold 绝不能把计时状态放上下文。
 - **重启不续计时**：重启后从初始值重新判定，符合"计时起点是纯过程量"的存储分层规范。
-- 多组独立判据：每次 `ctx.hold()` 返回独立闭包，各自持有 `signal/since/timer`，天然隔离。
-- 一个脚本内多个 hold 可用 `.value` 互相组合（读另一个 hold 的稳定值），但 `condition` 里这么用需留意求值时序；跨脚本共享仍走 `ctx.global`。
+- 多组独立判据：每次 `ctx.hold()` 返回独立闭包，各自持有 `desired/pending/since/timer`，天然隔离。
+- 一个脚本内多个 hold 可用 `.value` 互相组合（读另一个 hold 的已确认状态），但 expect 里这么用需留意求值时序；跨脚本共享仍走 `ctx.global`。
 - 句柄的 `value` 是可读写 accessor，conv 桥接会搬运 setter（`ctx.dryRun` 这类只读 getter 不受影响）。
 
 ## 「持续 N 秒」的手写模式（仅 ctx.hold 不适用时）
 
-`ctx.after(ms, fn)` 只是**一次性可取消延时**，框架不会帮你做状态机。若多组条件互锁、`ctx.hold` 不够用，才自己实现成滑动窗口：
-
-`ctx.after(ms, fn)` 只是**一次性可取消延时**，框架不会帮你做状态机。"条件持续 N 秒"必须自己实现成滑动窗口：
+`ctx.after(ms, fn)` 只是**一次性可取消延时**，框架不会帮你做状态机。若多组条件互锁、`ctx.hold` 不够用，才自己实现成滑动窗口。**注意语义差异**：下面是 HA `for:` 的单边语义（条件掉出立即清零）；`ctx.hold` 是双边迟滞（满足按 `satisfyMs`、不满足按 `unsatisfyMs` 分别计时，未到阈值回到当前状态只取消计时不回调），两者不互通。
 
 1. 保存起点 `since` 与定时器 id `timer`；
 2. 条件**首次满足**时才排 `ctx.after(N, ...)`；

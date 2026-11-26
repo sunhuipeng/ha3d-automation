@@ -30,17 +30,33 @@ function broadcast(payload) {
   return n;
 }
 
+/* 心跳：浏览器/标准 WS 客户端会自动回 pong；连续两个周期无响应即判定半开连接
+ * （网络断开、设备休眠等不触发 close/error 的情况），主动 terminate 并从集合移除，
+ * 避免幽灵前端长期占用 listFrontends 并让 broadcast 静默失败。 */
+const HEARTBEAT_MS = 30000;
+
 function attach(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
   wss.on('connection', (ws) => {
     ws._cid = 'f' + (++seq);
+    ws._alive = true;
     clients.add(ws);
     send(ws, { type: 'welcome', clientId: ws._cid, ts: Date.now() });
     const n = mcpSessions();
     if (n > 0) send(ws, { type: 'mcp', event: 'connected', sessions: n, ts: Date.now() });
+    ws.on('pong', () => { ws._alive = true; });
     ws.on('close', () => clients.delete(ws));
     ws.on('error', () => clients.delete(ws));
   });
+  const beat = setInterval(() => {
+    for (const ws of clients) {
+      if (!ws._alive) { clients.delete(ws); try { ws.terminate(); } catch (e) {} continue; }
+      ws._alive = false;
+      try { ws.ping(); } catch (e) { clients.delete(ws); }
+    }
+  }, HEARTBEAT_MS);
+  beat.unref(); // 心跳不阻止进程退出
+  wss.on('close', () => clearInterval(beat));
   return wss;
 }
 

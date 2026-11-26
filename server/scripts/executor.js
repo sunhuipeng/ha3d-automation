@@ -540,8 +540,11 @@ function handleChildMessage(entry, msg, connector) {
     if (running.get(entry.key) !== entry) return;
     emitLog(entry, msg.ok ? 'info' : 'error', msg.ok ? '完成' : ('失败：' + msg.error));
     clearTimeout(entry.watchdog);
-    cleanup(entry);
+    /* 先清持久化运行意图再摘内存实例：若在两步之间进程崩溃，重启后不会把一个
+     * 已 done 的一次性脚本重新拉起（重复执行真实设备控制）。反过来先摘内存后清
+     * 清单，崩溃窗口内残留的意图会被 restore 误恢复。 */
     runState.clear(entry.sid, entry.version); // 已自然结束，重启不再恢复
+    cleanup(entry);
     /* M9：异常结束保持 error 标记（内存），不再紧跟一次 stopped 覆盖，保留失败信息给 UI/AI 自诊断。
      * 显式重跑（start）时由 clearError 归位。 */
     settleStatus(entry.sid, entry.version, {
@@ -720,11 +723,12 @@ const STOP_GRACE_MS = 500;
 const pendingRestarts = new Map();
 function stopInstance(entry, reason) {
   emitLog(entry, 'info', '停止脚本：' + (reason || '手动') + (entry.dryRun ? '（影子实例）' : '（正式实例）'));
-  running.delete(entry.key); // 先摘除，避免宽限期内重复 stop / done 误处理
-  clearRefs(entry.key);
-  /* 主动停止/超时 → 清除运行意图，重启不再恢复；
+  /* 先清运行意图再摘内存实例：崩溃窗口内不会残留"已停止但仍要恢复"的意图。
+   * 主动停止/超时 → 清除运行意图，重启不再恢复；
    * 服务关闭（shutdown）→ 保留意图，下次启动按清单恢复。宽限期内若被重启，start() 会重新 mark。 */
   if (reason !== 'shutdown') runState.clear(entry.sid, entry.version);
+  running.delete(entry.key); // 先摘除，避免宽限期内重复 stop / done 误处理
+  clearRefs(entry.key);
   clearTimeout(entry.watchdog);
   detachChild(entry);
   notifyTaskWatchers(entry.sid, reason === 'timeout' ? 'timeout' : 'stopped', entry);
@@ -1094,6 +1098,6 @@ function trigger(id, connector, channel) {
 module.exports = {
   start, stop, stopAll, restore, isRunning, runningVersion, runningVersions, runningList, onStateChange,
   acquireAction, releaseAction, submitScript, rollback, publish, removeVersion, removeScript, trigger,
-  onHaReady, onHaOffline, haStatus, writeAllowed, getRefs, broadcastRefresh,
-  versionRuntimeStatus, scriptRuntimeStatus, hotPoolStats: hotPool.stats,
+  onHaReady, onHaOffline, haStatus, writeAllowed, broadcastRefresh,
+  versionRuntimeStatus, scriptRuntimeStatus,
 };

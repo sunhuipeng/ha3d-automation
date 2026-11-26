@@ -11,7 +11,7 @@
 node skill/tools/mcp-call.cjs <tool> ['{json 参数}']
 # 例：
 node skill/tools/mcp-call.cjs automation_list_scripts
-node skill/tools/mcp-call.cjs automation_get_logs '{"id":"s2countd"}'
+node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 ```
 
 ---
@@ -90,7 +90,7 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"id":"s2countd"}'
 list_entities → list_services        # 确认实体与服务名
 submit_script (shadow)               # 首次提交 → 分配版本号
 （迭代）submit_script                 # 修改 → 原地覆盖同一版本号，revision+1
-start_script → get_logs              # 影子验证（写操作只记 [影子写操作]）
+start_script → get_logs              # 影子验证（写操作只记 [影子·拦截写操作]）
 publish_script                       # 用户确认后发布正式；运行中实例自动切换
 get_logs                             # 正式验证（[真实写操作] 符合预期）
 guard_status                         # 核对引用实体与运行健康

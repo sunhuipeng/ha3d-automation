@@ -137,15 +137,6 @@ function acquireSession({ env } = {}) {
   return handle;
 }
 
-/* 会话是否可承接新任务（启动接口用）：预热首个 worker */
-function warmup(env) {
-  if (!started) {
-    started = true;
-    if (workers.length < poolSize) spawnWorker(env);
-    log('info', `热池预热完成：worker=${workers.length}/${poolSize} maxSessions=${maxSessions}`);
-  }
-}
-
 function stats() {
   return { poolSize, maxSessions, idleMs, workers: workers.length, sessions: workers.reduce((n, x) => n + x.sessions.size, 0) };
 }
@@ -155,4 +146,4 @@ function shutdown() {
   for (const st of [...workers]) { try { st.w.terminate(); } catch (e) {} }
 }
 
-module.exports = { acquireSession, warmup, stats, shutdown, POOL_SIZE: poolSize, MAX_SESSIONS: maxSessions, IDLE_MS: idleMs };
+module.exports = { acquireSession, stats, shutdown, POOL_SIZE: poolSize, MAX_SESSIONS: maxSessions, IDLE_MS: idleMs };

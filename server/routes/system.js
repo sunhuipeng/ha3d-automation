@@ -13,16 +13,6 @@ module.exports = function systemRoutes() {
     res.json({ ok: true, ts: Date.now(), ha: connector.status, demo: connector.demo, devMode: getConfig().devMode === true, scripts: store.list().length, running: executor.runningList().length });
   });
 
-  r.get('/ha-status', (req, res) => res.json({ status: connector.status, demo: connector.demo }));
-
-  /* 兜底可观测性：HA 就绪态 + 每个运行脚本引用了哪些实体、是否因实体缺失暂停。
-   * 供前端/排查核对"脚本停了是不是因为某个实体被删"。 */
-  r.get('/guard-status', (req, res) => res.json({
-    ...executor.haStatus(),
-    haConnection: connector.status,
-    haReady: connector.isReady(),
-  }));
-
   /* HA 连接配置：token 只回传是否已配置，不回传明文 */
   r.get('/config', (req, res) => res.json(publicConfig()));
 

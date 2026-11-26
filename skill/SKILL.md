@@ -52,8 +52,7 @@ node skill/tools/sync-cache.cjs --force   # 忽略缓存全量重拉
 ## 第 0 步：前置环境检查（必做，不通过不写码）
 
 ```bash
-curl http://localhost:8100/api/health        # 服务存活；响应含 devMode=true 即开发模式
-curl http://localhost:8100/api/ha-status     # HA 连接状态（demo 模式可开发但不能真实验证）
+curl http://localhost:8100/api/health        # 服务存活；响应含 ha（连接状态）/ demo / devMode
 node skill/tools/sync-cache.cjs              # 同步本地脚本缓存（必须）
 node skill/tools/mcp-call.cjs automation_list_entities
 ```
@@ -73,7 +72,7 @@ node skill/tools/mcp-call.cjs automation_list_entities
 | publish | **允许**（影子可发布为正式；设备写仍被拦截，验证发布流程用） | 允许（发布后真实下发） |
 | MCP 直调 HA | 不拦截（`confirmed:true` 的用户显式操作） | 不拦截 |
 
-- **开发模式下**：脚本发起的所有 HA 写（含正式实例）只记日志、不下发；正式实例正常自动恢复、上下文写正式桶、可被影子读者读到。日志会标注 `[开发模式·拦截写操作]` / `[开发模式·拦截 HA 调用]`。
+- **开发模式下**：脚本发起的所有 HA 写（含正式实例）只记日志、不下发；正式实例正常自动恢复、上下文写正式桶、可被影子读者读到。日志会标注 `[开发模式·拦截写操作]` / `[开发模式·拦截 HA 调用·未下发]`。
 - **发布仍指向正式环境的 MCP 地址**：本地发布只验证"发布流程 + 上下文流转"，不会接管真实设备；真正的设备控制权在正式环境单独发布后才生效。
 - 影子实例的语义不变：只记日志、上下文写影子桶（读仍统一读正式桶）。
 
@@ -163,14 +162,14 @@ grep -rn "nowSod\|ctx.after" skill/.cache --include=script.js | head -20   # 时
 
 - **读脚本 / flow**：先读 `skill/.cache/<scriptId>/v<n>/script.js`、`flow.json`、`meta.json`；用户说"刚改过"或缓存版本明显旧时先 `--force` 同步。用户只给截图时，用图片查看工具逐节点识别 label / type / edge，识别不清的列出来问，**不脑补**。
 - **读实体**：用 `automation_list_entities` / `automation_get_state` / `automation_get_history` 核对 entity_id、当前值、变化特征（如功率 PWM 周期、状态枚举大小写）。**禁止凭空写 entity_id**。
-- **读需求**：把阈值、持续时间、通道、**每个状态变量的存储层（全局 / 本地 / 内存 / HA 实体）**与全局 key 值形态、HA 动作逐条落成可验证参数；"大于/小于/等于"的边界、断线 / unavailable 口径、重启基线都要问清或写明默认。**涉及"持续 N 秒"时，必须把"窗口内条件翻转即清零、重新满足从 0 计、到点复核"作为确认项列出**，不能只写"持续 N 秒"四个字。
+- **读需求**：把阈值、持续时间、通道、**每个状态变量的存储层（全局 / 本地 / 内存 / HA 实体）**与全局 key 值形态、HA 动作逐条落成可验证参数；"大于/小于/等于"的边界、断线 / unavailable 口径、重启基线都要问清或写明默认。**涉及"持续 N 秒"时，必须把"窗口内条件翻转即清零、重新满足从 0 计、到点复核"作为确认项列出；若回落也要防抖，必须单独确认 `unsatisfyMs`，否则默认不满足立即回落**，不能只写"持续 N 秒"四个字。
 
 ### 2.2 在对话里画图（不是交付物）
 
 - 用对话内可视化能力（diagram 模块）画**内联 SVG 流程图**，按当前 IDE 主题渲染：暗色主题用深色底 + 浅色文字，禁止黑字落黑底。
 - 图上的节点先按 `n_xxx` 命名，但在图注中明确写"**设计稿 nodeId，待脚本落地**"；此时不创建、不提交任何 `flow.json` 文件，也不手改 `skill/.cache/`。
 - **每个改变走向的判据单独成节点**：即使"A 组 >800W"与"B 组开启"都写 `true`，也要拆成两个 `condition` 节点；B 组旁路直接连到 `action`，不要合并成"A 或 B"这种模糊条件。延时用独立 `delay` 节点，播报用 `announce` 节点。
-- **"持续 N 秒"类判据：delay 节点标注"可重置"，并画出中断回边**（条件不再满足 → 回到 `condition` 从 0 重新计时）。确认表里必须写明"持续窗口 N 秒，中途判据翻转即清零、重新满足从 0 计，到点还要复核"；**禁止画成"先查一次 → 到 N 秒后再查一次"的单向链**——那是错误语义，详见第 3 步硬规则第 4 条。
+- **"持续 N 秒"类判据：delay 节点标注"可重置"，并画出中断回边**（条件不再满足 → 回到 `condition` 从 0 重新计时）。确认表里必须写明"持续窗口 N 秒，中途判据翻转即清零、重新满足从 0 计，到点还要复核"；**若有回落时间，也要单列"不满足持续 M 秒才回落 / null 表示立即回落"**；**禁止画成"先查一次 → 到 N 秒后再查一次"的单向链**——那是错误语义，详见第 3 步硬规则第 4 条。
 - 图后紧跟确认表，逐行列出：`节点 id / 类型 / 文案 / 判据参数 / 入边 / 出边`；另附 `实体清单`、`状态变量存储层（global / local / 内存 / HA 实体）与全局 key 值形态`、`边界口径` 三张小表。
 
 ### 2.3 多轮确认（硬门禁）
@@ -201,19 +200,28 @@ grep -rn "nowSod\|ctx.after" skill/.cache --include=script.js | head -20   # 时
 2. **长驻脚本末尾 `await ctx.keepAlive()`**（常驻锚点，顶层永不结束，实例不被清理）；短任务脚本自然结束。
 3. **循环/回调里检查 `ctx.stopped`**（布尔属性，不是函数），保证 stop 能退出。
 4. **「持续 N 秒」= 滑动窗口重置语义（HA `for:` / `mode:restart`），禁止「先查一次 + 到点再查一次」**：
-   - **优先用框架内置的 `ctx.hold`**（已封装翻转重置 + 到点复核，详见 `references/ctx-api.md`）：
+   - **优先用框架内置的 `ctx.hold`**（期待值/期待条件 + 双边计时 + 到点复核，详见 `references/ctx-api.md`）：
      ```js
-     const high = ctx.hold({ ms: 3000, condition: (raw) => raw > 800, nodeId: 'n_high_a' });
+     const high = ctx.hold({
+       expect: (raw) => raw > 800,    // 期待条件：二态，不返回 null 三态
+       satisfyMs: 3000,               // 满足期待持续 3s
+       unsatisfyMs: 10000,            // 不满足持续 10s 回落；null/0/不传=立即回落
+       nodeId: 'n_high_a',
+     });
      ctx.watch([pWok, pOven, pRice], async () => {    // 实体订阅由脚本自己写，框架不内置监听
        const sum = (await ctx.ha.num(pWok)) + (await ctx.ha.num(pOven)) + (await ctx.ha.num(pRice));
-       high.value = sum;                            // 只有写 raw 才推进计时
+       high.value = sum;                            // 实体变化由脚本写进 raw，从而触发重评
      });
-     high.watch((v, prev) => { if (v && !prev) ctx.write('setFlag', '大功率', 'n_write', true); });
-     // high.value 同步读稳定值；condition 里也可自己 await ctx.ha 读实体
+     high.watch((satisfied) => {                     // (satisfied, prev, info)
+       if (satisfied) ctx.write('setFlag', '大功率', 'n_write', true);
+       // if (!satisfied) ... 只在需要回落动作时处理
+     });
      ```
-     值模式（无 condition）：`const a = ctx.hold(30000); a.value = 'Busy';` 跟踪值本身持续多久。
-   - **只有 `ctx.hold` 不适用时**（如多组判据共享同一计时、需跨组互锁）才手写，照以下正例，语义必须与 `ctx.hold` 一致：
-     - **语义**：条件必须**连续**满足满 N 秒才成立；窗口内任一时刻**判据结果翻转为不满足**（实体变化导致条件不再成立）→ 立即 `ctx.cancel(id)` 取消定时器、清零起点，下次重新满足时从 0 重新计时。多组条件各自独立一套起点/定时器，不能共用一个。
+     期待值模式：`const a = ctx.hold({ satisfyMs: 30000, expect: true, unsatisfyMs: null }); a.value = true;`。满足持续 30s 回调一次 true；`a.value=false` 立即回调一次 false。
+     **只接受对象参数**：数字首参、`ms`、`condition`、`fallMs` 等旧语法已删除，用了会直接抛错。
+   - **只有 `ctx.hold` 不适用时**（如多组判据共享同一计时、需跨组互锁）才手写，照以下正例。注意下面与 hold 的语义差异，别照手写模板推断 hold 行为：
+     - **语义差异（重要）**：手写模板是 HA `for:` 的单边语义——条件掉出即**立即清零**，下次满足从 0 计；`ctx.hold` 是**期待状态双边迟滞**——满足按 `satisfyMs`、不满足按 `unsatisfyMs` 分别计时，未到阈值回到当前状态只取消计时不回调，到点仍会重跑 expect 复核。两者"中断"口径不同，细节见 `references/ctx-api.md` §ctx.hold。
+     - **手写语义**：条件必须**连续**满足满 N 秒才成立；窗口内任一时刻**判据结果翻转为不满足**（实体变化导致条件不再成立）→ 立即 `ctx.cancel(id)` 取消定时器、清零起点，下次重新满足时从 0 重新计时。多组条件各自独立一套起点/定时器，不能共用一个。
      - **反例（禁止）**：首次满足时排一个 `ctx.after(N, ...)`，中间不再重新评估，到点直接执行动作（或只到点复查一次）。这样"断断续续累计 N 秒"会被误判成"连续 N 秒"，正是用户最容易指出的错误。
      - **正例（照此写）**：
        ```js
@@ -235,7 +243,7 @@ grep -rn "nowSod\|ctx.after" skill/.cache --include=script.js | head -20   # 时
        }
        ctx.watch(ids, () => { evaluate(); });     // 每次实体变化都重评，判据掉了就重置
        ```
-   - **重置粒度**：以**判据结果（signal）翻转**为准，不是实体任意数值抖动都重置。像 PWM 功率这种周期内反复波动的场景，只要判据（如"功率和 >800W"）仍成立就不重置；若按任何数值变化都重置，则永远无法确认持续时长。
+   - **重置粒度**：以**期待结果（expect 投影）翻转**为准，不是实体任意数值抖动都重置。像 PWM 功率这种周期内反复波动的场景，只要判据（如"功率和 >800W"）仍成立就不重置；若按任何数值变化都重置，则永远无法确认持续时长。
    - `ctx.every` 只用于固定频率兜底/清理，**不用于"持续 N 秒"判定**；手写时 `ctx.after` 返回的 id 必须保存，重排或中断前先 `ctx.cancel(id)`。
 5. **防自发自收**：用 `expected` 表记录自己期望的实体值，在 watch 回调里过滤自己引起的 变化。
 6. **启动先拉当前值基线**（`ctx.ha.num/state`），续跑语义成立。
@@ -296,7 +304,7 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"<id>","mode":"sh
 验证清单：
 
 - [ ] 启动日志出现基线拉取与模式信息（`模式=影子`）；
-- [ ] 写操作只出现 `[影子写操作]`，**绝无** `[真实写操作]`；
+- [ ] 写操作只出现 `[影子·拦截写操作]`，**绝无** `[真实写操作]`；
 - [ ] 触发 → 判据 → 动作链路完整走通（可请用户在 HA 侧制造触发条件）；
 - [ ] 反复触发不产生重复下发（lock / expected 生效）；
 - [ ] 无 `脚本异常` error 日志。
@@ -314,13 +322,13 @@ node skill/tools/sync-cache.cjs --force
 
 - 发布 = 影子转正式（同版本号），旧正式自动归档；**正式版内容不可变**；
 - 若另一版本正在运行，服务端**自动切换实例**：停旧 → 以影子身份启动新 → 热切为真实下发；新版本起不来会自动回退旧版本（返回体 `switchedFrom` 会标注）——不需要也不应该再手动 start/stop；
-- 回滚：线上出问题时用 `automation_rollback {"id","fromVersion"}` 读历史版本文档 → 提交为**新影子版本**（版本号继续递增、不自动上线）→ 重新走影子验证 → publish。
+- 回滚：线上出问题时用 `automation_rollback {"scriptId","fromVersion","confirmed":true}` 读历史版本文档 → 提交为**新影子版本**（版本号继续递增、不自动上线）→ 重新走影子验证 → publish。
 
 正式版会**真实控制设备**。发布后再拉一次日志确认 `[真实写操作]` 符合预期，并建议用户在 HA 前端核对设备实际状态。
 
 ## 第 7 步：收尾汇报
 
-汇报内容：**决策三句话（选了什么 / 为什么不是另外两个 / 代价与风险）与比对过的脚本清单**、**第 2 步确认过的需求流程图最终版（节点 / 边 / 参数表）及确认轮次**、scriptId 与最终版本号、三要素落地方式、版本 flow 与脚本 nodeId 对应关系、影子验证关键日志、正式版运行状态、依赖实体清单（可 `curl http://localhost:8100/api/guard-status` 核对）、注意事项（如断线行为）。
+汇报内容：**决策三句话（选了什么 / 为什么不是另外两个 / 代价与风险）与比对过的脚本清单**、**第 2 步确认过的需求流程图最终版（节点 / 边 / 参数表）及确认轮次**、scriptId 与最终版本号、三要素落地方式、版本 flow 与脚本 nodeId 对应关系、影子验证关键日志、正式版运行状态、依赖实体清单（查单脚本运行拓扑 `GET /api/script/:id/topology`，脚本跑过后才有数据）、注意事项（如断线行为）。
 
 ---
 
@@ -332,7 +340,7 @@ node skill/tools/sync-cache.cjs --force
 
 | 刚做完什么 | 跟进的 MCP 调用 |
 |---|---|
-| 提交/覆盖影子、发布、回滚 | `automation_refresh_panel {"what":"all"}`（列表 + 右侧正文/流程图/版本条/日志一次到位；服务端虽已自动广播，再调一次保证对齐） |
+| 提交/覆盖影子、发布、回滚 | 服务端已自动广播 `scripts` + `script`（列表 + 正文/流程图/版本条/日志），**通常无需额外调用**；仅当返回后前端状态未对齐（如错过广播）才补 `automation_refresh_panel {"what":"all"}` |
 | start / stop（启停实例） | `automation_refresh_panel {"what":"scripts"}`（列表徽标）＋ 右侧正开着该脚本时补 `{"what":"logs"}` |
 | 想让用户聚焦某脚本人工验证 | `automation_select_script {"scriptId","version"}`（选中即打开详情，列表与右侧同时刷新，视线直达） |
 | 只改了日志想看新输出 | `automation_refresh_panel {"what":"logs"}` |
@@ -341,13 +349,13 @@ node skill/tools/sync-cache.cjs --force
 ### 验证链（验证影子/正式效果时组合使用）
 
 1. `automation_list_scripts`：摸清每个脚本的通道（正式 vN / 影子 vN）与运行实例，**提交前必看**（也是 1.3 决策的依据）；
-2. `automation_get_logs {"mode":"shadow"|"production"}`：按通道读日志，别猜版本号；
+2. `automation_get_logs {"scriptId":"<id>","mode":"shadow"|"production"}`：按通道读日志（scriptId 必填），别猜版本号；
 3. `automation_select_script` + `automation_refresh_panel`：把你正在验证的脚本带到用户面前；
 4. `automation_get_script_status`：确认运行实例、暂停原因、HA 连接状态。
 
 ### 其他灵活运用的要点
 
-- **提交前**：`list_scripts` 查重与冲突（1.3 决策）、`ha_list_entities` / 实体解析工具确认依赖实体真实存在；
+- **提交前**：`automation_list_scripts` 查重与冲突（1.3 决策）、`automation_list_entities` / `automation_resolve_entities` 确认依赖实体真实存在；
 - **别重复调用**：submit/publish 本身已自动广播刷新与列表更新，除非不确定前端是否在线，否则无需紧跟两次 all；
 - **报错先读返回体**：MCP 工具的失败信息（槽位占用、flow 校验、sha 不符）都写了原因和修法，先按提示处理再重试；
 - **写操作永远带 `confirmed:true`**，只读工具不要带。
@@ -357,6 +365,6 @@ node skill/tools/sync-cache.cjs --force
 ## 环境注意
 
 - Bash 会话 cwd 固定在 `D:\Workbuddy\home`，`cd` 前缀可能被剥离，用子 shell `(cd ha3d-automation && <cmd>)` 最稳。
-- 测试跑法：`(cd ha3d-automation && npm test)`（node:test，15 文件 / 76 项，测试位于顶层 `tests/`）。
+- 测试跑法：`(cd ha3d-automation && npm test)`（node:test，测试位于顶层 `tests/`）。
 - 改动服务端代码（runner/executor/store）不在本 skill 范围；只做脚本开发时**不要重启服务**（会按运行意图清单恢复，但正在验证的影子实例会重跑）。
 - `skill/.cache/` 是运行时缓存，已加入 `.gitignore`，不要提交。

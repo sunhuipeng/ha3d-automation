@@ -1,5 +1,12 @@
 import { defineStore } from 'pinia';
 
+/* 所有 POST/DELETE 的错误响应都是 { error: '...' }：统一在此转为异常，
+ * 避免调用方各自 if (r.error) throw 造成漏检，也让成功路径直接拿到响应体。 */
+function unwrap(r) {
+  if (r && r.error) throw new Error(r.error);
+  return r;
+}
+
 export const useScriptStore = defineStore('scripts', {
   state: () => ({
     list: [],
@@ -31,7 +38,7 @@ export const useScriptStore = defineStore('scripts', {
       }
       await Promise.all([this.loadLogs(id, this.current.version), this.loadVersions(id)]);
       /* API 的 running = 该脚本任一实例在跑；这里收敛为"当前打开版本是否有实例"（与头部按钮对应） */
-      this.current.running = this.runningVersions.some((x) => x.version === this.current.version);
+      this.syncRunning();
     },
     async loadVersions(id) {
       if (!id) return;
@@ -56,13 +63,12 @@ export const useScriptStore = defineStore('scripts', {
       const detail = await fetch(`/api/script/${id}${q}`).then((x) => x.json());
       this.current.meta = detail.meta;
       this.runningVersions = detail.runningVersions || [];
-      this.current.running = this.runningVersions.some((x) => x.version === this.current.version);
+      this.syncRunning();
     },
     async start(id, version) {
       const r = await fetch(`/api/script/${id}/start`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version }),
-      }).then((x) => x.json());
-      if (r.error) throw new Error(r.error);
+      }).then((x) => x.json()).then(unwrap);
       await this.syncStatus(id, version);
     },
     /* 一次性脚本（script/scene）按次触发：跑完自然退出，不常驻。
@@ -71,8 +77,7 @@ export const useScriptStore = defineStore('scripts', {
       const r = await fetch(`/api/script/${id}/trigger`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(channel ? { channel } : {}),
-      }).then((x) => x.json());
-      if (r.error) throw new Error(r.error);
+      }).then((x) => x.json()).then(unwrap);
       await this.syncStatus(id);
       return r;
     },
@@ -87,16 +92,14 @@ export const useScriptStore = defineStore('scripts', {
     async publish(id, version) {
       const r = await fetch(`/api/script/${id}/publish`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version }),
-      }).then((x) => x.json());
-      if (r.error) throw new Error(r.error);
+      }).then((x) => x.json()).then(unwrap);
       await Promise.all([this.load(), this.loadVersions(id)]);
       await this.open(id, version || r.version);
       return r;
     },
     /* 清理版本（运行中版本不可删） */
     async deleteVersion(id, version) {
-      const r = await fetch(`/api/script/${id}/version/${version}`, { method: 'DELETE' }).then((x) => x.json());
-      if (r.error) throw new Error(r.error);
+      const r = await fetch(`/api/script/${id}/version/${version}`, { method: 'DELETE' }).then((x) => x.json()).then(unwrap);
       await this.load();
       await this.loadVersions(id);
       // 删掉的是当前打开的版本则回退到最新版本
@@ -111,12 +114,17 @@ export const useScriptStore = defineStore('scripts', {
     async rollback(id, fromVersion) {
       const r = await fetch(`/api/script/${id}/rollback`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fromVersion }),
-      }).then((x) => x.json());
-      if (r.error) throw new Error(r.error);
+      }).then((x) => x.json()).then(unwrap);
       await this.load();
       await this.loadVersions(id);
       await this.open(id, r.version);
       return r;
+    },
+    /* 当前打开版本是否有实例：runningVersions 是唯一真相源。
+     * open / syncStatus / WS setStatus 三处同源派生，避免口径漂移。 */
+    syncRunning() {
+      if (!this.current) return;
+      this.current.running = this.runningVersions.some((x) => x.version === this.current.version);
     },
     /* 运行时日志事件：只追加，不改动 flow（展示层只读） */
     pushLog(entry) {
@@ -141,7 +149,7 @@ export const useScriptStore = defineStore('scripts', {
       } else {
         this.runningVersions = this.runningVersions.filter((x) => x.version !== v);
       }
-      this.current.running = this.runningVersions.some((x) => x.version === this.current.version);
+      this.syncRunning();
       /* 运行状态在顶层（详情接口由 executor 内存合成，meta.json 已不存 status） */
       if (v === this.current.version) this.current.status = status;
       const row = this.versions.find((x) => x.version === v);

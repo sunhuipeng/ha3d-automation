@@ -5,7 +5,6 @@ const { HaConnector } = require('../ha/connector');
 const hub = require('./ws-hub');
 const store = require('../scripts/store');
 const executor = require('../scripts/executor');
-const { validateScript } = require('../scripts/validate');
 const { getConfig } = require('../config');
 
 const connector = new HaConnector({
@@ -52,11 +51,8 @@ function restoreOnReady() {
 /* allowMcpCallService 用 getter 读实时配置：saveConfig 会重置缓存，
  * 模块加载时的快照会导致开关改了也不生效（F6 跨层碎片）。 */
 const mcpCtx = {
-  connector, scripts: store, executor, hub,
+  connector, executor, hub,
   get allowMcpCallService() { return getConfig().allowMcpCallService === true; },
-  /* devMode 仅供健康接口展示；写闸只约束脚本发起的 HA 写，
-   * MCP 直调是用户显式 confirmed 操作，不受开发模式限制。 */
-  get devMode() { return getConfig().devMode === true; },
 };
 
-module.exports = { connector, hub, store, executor, validate: validateScript, mcpCtx, startConnector, restoreOnReady };
+module.exports = { connector, hub, store, executor, mcpCtx, startConnector, restoreOnReady };

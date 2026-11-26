@@ -343,13 +343,12 @@ html[data-theme="dark"] .side-row.change > .scode:last-of-type .chg { background
 /* ---- 脚本源码预览：类 VSCode 只读面板，默认折叠 ---- */
 .code-box { margin-top: 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .code-box > summary {
-  padding: 10px 12px; color: var(--muted); cursor: pointer; font-size: 12px;
+  padding: 10px 14px; color: var(--muted); cursor: pointer; font-size: 12px;
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   list-style: none;
 }
 .code-box > summary::-webkit-details-marker { display: none; }
-.cb-title { display: inline-flex; align-items: center; gap: 7px; color: var(--text); font-weight: 600; }
-.cb-file { color: var(--muted); font-weight: 400; font-family: 'SF Mono', Menlo, monospace; }
+.cb-title { display: inline-flex; align-items: center; }
 .cb-meta { color: var(--hint); font-size: 11px; }
 .vs-editor { background: var(--vsc-bg); border-top: 1px solid var(--line); border-radius: 0 0 6px 6px; overflow: hidden; }
 .vs-tabs { display: flex; align-items: center; justify-content: space-between; height: 34px; background: var(--vsc-chrome); border-bottom: 1px solid var(--vsc-line); }
@@ -380,10 +379,14 @@ html[data-theme="dark"] .side-row.change > .scode:last-of-type .chg { background
 }
 .panel-chev svg { display: block; }
 details[open] > summary .panel-chev { transform: rotate(90deg); }
-/* flex 标题容器自身有 gap，避免叠加双份间距 */
-.cb-title .panel-chev { margin-right: 0; }
+/* 三个折叠面板标题统一：字号 / 字重 / 颜色 / 箭头间距，避免观感不一致 */
+.panel-title {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 500; color: var(--text);
+}
+.panel-title .panel-chev { margin-right: 0; }
 .log-box { margin-top: 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
-.log-box summary { padding: 10px 12px; color: var(--muted); cursor: pointer; font-size: 12px; list-style: none; }
+.log-box summary { padding: 10px 14px; color: var(--muted); cursor: pointer; font-size: 12px; list-style: none; }
 .log-box summary::-webkit-details-marker { display: none; }
 .log-follow { float: right; margin: -3px 0 0 8px; padding: 2px 8px; font-size: 11px; color: #fff; background: var(--accent); border: none; border-radius: 4px; }
 .log-follow:hover { filter: brightness(1.1); }

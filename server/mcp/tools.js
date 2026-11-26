@@ -1,8 +1,8 @@
 'use strict';
-/* MCP 工具：只读 15 个 + 受控写 7 个 + 面板控制 2 个（切换选中/刷新面板），共 24 个。
+/* MCP 工具：只读 15 个 + 受控写 8 个 + 面板控制 2 个（切换选中/刷新面板），共 25 个。
  * 版本模型：shadow（工作副本，可原地反复修改）→ production（不可变，真实下发）→ archive（不可变，分 published/discarded）。
  * 只读里含 5 个 HA 自动规划迁移工具（list automations / get config / list scripts / get script config / resolve entities）。
- * ctx = { connector, scripts, executor, hub }
+ * ctx = { connector, executor, hub }
  * 所有工具四参注册，wrapToolActivity 统一包活动广播 + 错误兜底。 */
 const { z } = require('zod');
 const { text, fail, wrapToolActivity } = require('./helpers');

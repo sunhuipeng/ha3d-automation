@@ -4,8 +4,8 @@
 
 ## 能力一览
 
-- **脚本托管**：三种执行模式（`EXECUTION_MODE`：`fork` 每脚本独立子进程 / `inprocess` 单进程 vm 执行省内存 / `worker` 每脚本一个线程，OS 抢占式调度 + 强杀）；**影子脚本强制 fork**——未验证代码独享子进程硬隔离，失控只影响自己，正式脚本才按 `EXECUTION_MODE` 走省资源宿主；realm 沙箱 + AST 静态校验（含无界同步循环拦截），版本仓库、影子/正式双通道灰度
-- **MCP 接入**：24 个工具（15 只读 + 7 受控写 + 2 面板控制），SSE 端点供 Agent 直接读写脚本与 HA 实体
+- **脚本托管**：三种执行模式（`EXECUTION_MODE`：`fork` 每脚本独立子进程 / `inprocess` 单进程 vm 执行省内存 / `worker` 每脚本一个线程，OS 抢占式调度 + 强杀）；**影子脚本强制独立 worker**（每次新建、用完即毁）——未验证代码独享 worker 线程隔离，失控只影响自己，正式脚本才按 `EXECUTION_MODE` 走省资源宿主；realm 沙箱 + AST 静态校验（含无界同步循环拦截），版本仓库、影子/正式双通道灰度
+- **MCP 接入**：25 个工具（15 只读 + 8 受控写 + 2 面板控制），SSE 端点供 Agent 直接读写脚本与 HA 实体
 - **兜底体系**：服务重启按运行意图清单自动恢复；HA 断线挂起写操作、重连自动继续；引用实体被删自动暂停、恢复后自动继续
 - **前端面板**：Vue 3 可视化管理脚本、版本、日志与运行状态
 
@@ -19,11 +19,11 @@
 
 ```bash
 npm install
-npm run client:build        # 构建前端到 client/dist
+npm --prefix client run build   # 构建前端到 client/dist
 npm start                   # http://localhost:8100
 ```
 
-开发模式：终端 A `npm start`，终端 B `npm run client:dev`（Vite 5176，代理到 8100）。
+开发模式：终端 A `npm start`，终端 B `npm --prefix client run dev`（Vite 5176，代理到 8100）。
 
 ### 启动方式对比
 
@@ -32,7 +32,7 @@ npm start                   # http://localhost:8100
 | `npm start` | 完整功能实例 | ✅ 正常下发 | **正式环境**（NAS Docker 部署即此形态，不加任何 DEV 环境变量） |
 | `npm run start:dev` | **全局开发模式**实例 | ❌ 全部拦截只记日志 | **本地开发**：家里正式 HA 已由 NAS 实例托管，本地再起一份会双份裁决抢设备，必须用这个 |
 | `npm run watch` | 服务端代码热重启（`node --watch`） | ✅ 同 `npm start` | 改 `server/` 源码时的开发辅助；正式 HA 已在线上托管时同样建议配合 `HA3D_DEV_MODE=true` 用 |
-| `npm run client:dev` | 前端 Vite 热更新（5176，代理 8100） | —（不跑服务端） | 改 `client/` 前端源码时与上面任一服务端命令配合使用 |
+| `npm --prefix client run dev` | 前端 Vite 热更新（5176，代理 8100） | —（不跑服务端） | 改 `client/` 前端源码时与上面任一服务端命令配合使用 |
 
 **全局开发模式（`npm run start:dev`，即 `HA3D_DEV_MODE=true`）与 `npm start` 的行为差异**：
 
@@ -45,11 +45,11 @@ npm start                   # http://localhost:8100
 
 `EXECUTION_MODE`：`fork`（默认，每脚本一个子进程，进程级隔离最硬）、`inprocess`（全部脚本在主进程内 vm 执行，最省内存；脚本回调有 V8 timeout 防同步死循环）或 `worker`（每脚本一个 worker 线程，OS 抢占式公平调度 + `terminate()` 可强杀 vm timeout 拦不住的异步续体，内存居中）。三种模式脚本与数据完全兼容，改配置重启即切换。选型口诀：信脚本用 `inprocess`，不信用 `fork`，省内存又要隔离用 `worker`。
 
-**脚本级宿主覆盖**：提交时传 `hostMode`（submit_script 参数 / submit.cjs `--host-mode=`），可让个别脚本脱离全局模式单独指定宿主（三值对称：全局 inprocess 时给重脚本覆盖 `fork` 独享子进程，全局 fork 时给轻脚本覆盖 `inprocess` 省内存）。跟随版本持久化、影子迭代自动继承；影子实例恒为 fork 不受覆盖影响。优先级：影子强制 fork > 脚本级 `hostMode` > 全局 `EXECUTION_MODE`。发布迁移：目标宿主为 fork 时同宿主热切换零中断，否则 stop+start 重建到目标宿主。
+**脚本级宿主覆盖**：提交时传 `hostMode`（submit_script 参数 / submit.cjs `--host-mode=`），可让个别脚本脱离全局模式单独指定宿主（三值对称：全局 inprocess 时给重脚本覆盖 `fork` 独享子进程，全局 fork 时给轻脚本覆盖 `inprocess` 省内存）。跟随版本持久化、影子迭代自动继承；影子实例恒为独立 worker 不受覆盖影响。优先级：影子强制 fork > 脚本级 `hostMode` > 全局 `EXECUTION_MODE`。发布迁移：目标宿主为 fork 时同宿主热切换零中断，否则 stop+start 重建到目标宿主。
 
 ## MCP 接入
 
-SSE 地址：`http://localhost:8100/mcp/sse`（24 个工具：15 只读 + 7 受控写 + 2 面板控制，写操作需 `confirmed: true`，其中 `automation_call_service` 默认关闭，需开启 `allowMcpCallService`）。工具清单与调用示例见 [skill/SKILL.md](skill/SKILL.md) 与 `skill/tools/mcp-call.cjs`。
+SSE 地址：`http://localhost:8100/mcp/sse`（25 个工具：15 只读 + 8 受控写 + 2 面板控制，写操作需 `confirmed: true`，其中 `automation_call_service` 默认关闭，需开启 `allowMcpCallService`）。工具清单与调用示例见 [skill/SKILL.md](skill/SKILL.md) 与 `skill/tools/mcp-call.cjs`。
 
 ## 文档
 
@@ -62,8 +62,6 @@ SSE 地址：`http://localhost:8100/mcp/sse`（24 个工具：15 只读 + 7 受�
 | [skill/references/file-specs.md](skill/references/file-specs.md) | script.js / flow.json / meta.json 规范 |
 | [skill/tools/](skill/tools/) | 服务操作工具（mcp-call.cjs 通用 MCP 调用器 / submit.cjs 提交并校验 flow / sync-cache.cjs 同步本地脚本缓存） |
 | `skill/.cache/` | 本地脚本镜像（`sync-cache.cjs` 生成，服务端最新版的只读副本 + `_index.md` 实体索引，已 gitignore） |
-| [ENTITY-MAP.md](ENTITY-MAP.md) | 实体映射核对表（脚本 ↔ HA 实体） |
-| [MIGRATION-ANALYSIS-2026-11-24.md](MIGRATION-ANALYSIS-2026-11-24.md) | HA 原生自动化迁移分析（18 条 → 8 脚本） |
 
 ## 测试
 

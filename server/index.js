@@ -34,8 +34,8 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 /* 按域挂载（同 studio 口径）：routes/ 下每个文件自带 Router，零参工厂。
- *   system.js   /api/health、/api/ha-status
- *   scripts.js  /api/scripts…（列表 / 提交 / 启停 / 日志 / 运行态） */
+ *   system.js   /api/health、/api/config、/api/mcp-config、/api/skill-package
+ *   scripts.js  /api/scripts…（列表 / 发布 / 启停 / 日志 / 运行态；提交走 MCP） */
 const api = express.Router();
 api.use(systemRoutes());
 api.use(scriptRoutes());

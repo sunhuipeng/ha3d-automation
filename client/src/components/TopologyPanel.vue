@@ -127,7 +127,7 @@ watch(() => store.current?.id, () => {
 <template>
   <details ref="detailsEl" class="topo-box" @toggle="onToggle">
     <summary>
-      <span class="tb-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行拓扑</span>
+      <span class="tb-title panel-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行拓扑</span>
       <span class="tb-tools" @click.stop>
         <span class="tb-switch">
           <button class="tb-view" :class="{ on: view === 'list' }" @click="setView('list')">列表</button>
@@ -205,7 +205,8 @@ watch(() => store.current?.id, () => {
 .topo-box > summary { cursor: pointer; padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; list-style: none; background: var(--surface); border-bottom: 1px solid var(--line); border-radius: 9px 9px 0 0; }
 .topo-box:not([open]) > summary { border-bottom-color: transparent; border-radius: 10px; }
 .topo-box > summary::-webkit-details-marker { display: none; }
-.tb-title { font-size: 13px; font-weight: 500; color: var(--text); display: inline-flex; align-items: center; }
+/* 标题排版统一走全局 .panel-title，这里只保留 scoped 所需的结构样式 */
+.tb-title { display: inline-flex; align-items: center; }
 .tb-meta { font-size: 12px; color: var(--hint); }
 .tb-tools { display: inline-flex; align-items: center; gap: 8px; }
 .tb-switch { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }

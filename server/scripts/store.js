@@ -146,12 +146,10 @@ function listVersions(id) {
   } catch (e) { return []; }
 }
 
-/* 推断版本的渠道：新数据读 meta.channel；老数据（无 channel）按残留的 dryRun 推断 ——
- * dryRun=true → shadow，false → production。dryRun 落盘字段已退役（2026-11-26，
- * 与 channel 完全冗余），推断仅为兼容无 channel 的历史 meta，剥除发生在推断之后。 */
+/* 版本渠道：一律读 meta.channel（dryRun 已退役，不留读取兜底）；
+ * 无合法 channel 的异常 meta 归 shadow，交给 normalizeChannels 收敛。 */
 function channelOf(meta) {
-  if (CHANNELS.includes(meta && meta.channel)) return meta.channel;
-  return meta && meta.dryRun === false ? 'production' : 'shadow';
+  return CHANNELS.includes(meta && meta.channel) ? meta.channel : 'shadow';
 }
 
 /* 读取所有版本的 meta */
@@ -161,7 +159,7 @@ function allMetas(id) {
 }
 
 /* 渠道不变式校验/自愈：至多 1 个 shadow、1 个 production。
- * 老数据可能同时有多个 dryRun=true（多个 shadow），这里保留最新的一个为 shadow，其余归档。
+ * 异常数据可能同时有多个 shadow，这里保留最新的一个为 shadow，其余归档。
  * 返回是否发生迁移写盘。 */
 function normalizeChannels(id) {
   if (!safeId(id)) return false;
@@ -212,9 +210,8 @@ function detailedVersions(id) {
       /* mutable：只有影子可覆盖修改；正式/归档内容不可变 */
       mutable: ch === 'shadow',
       /* 归档分类：published = 曾经上线过（回滚候选），discarded = 影子试错废弃。
-       * archivedKind 在归档动作发生时写入；旧数据兼容读 publishedAt。 */
-      archivedKind: ch === 'archive'
-        ? (meta.archivedKind || (meta.publishedAt ? 'published' : 'discarded')) : null,
+       * archivedKind 在归档动作发生时写入；缺失按 discarded 处理。 */
+      archivedKind: ch === 'archive' ? (meta.archivedKind || 'discarded') : null,
       sha256: meta.sha256 || null,
       createdAt: meta.createdAt || null, updatedAt: meta.updatedAt || null,
       description: meta.description || null,

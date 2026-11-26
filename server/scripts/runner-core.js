@@ -21,6 +21,16 @@ const { shadowWrite, devWrite } = require('./log-text');
  * 可用 meta.cbTimeoutMs 覆盖（测试加速用）。 */
 const CB_TIMEOUT_MS = 2000;
 
+/* hold 的 expect 值等值判定：标量严格相等；对象/数组按 JSON 结构比较。
+ * 严格引用比较下，"expect 每次返回结构相同的新对象"会被当成每次都翻转，
+ * 计时永远重置、状态永不确认。循环引用等无法序列化的对象回退引用比较。 */
+function signalEquals(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  try { return JSON.stringify(a) === JSON.stringify(b); }
+  catch (e) { return false; }
+}
+
 function createCore({ emit }) {
   /* emit(msg)：宿主桥。fork 宿主 = process.send；inline 宿主 = EventEmitter。 */
   let script = '';
@@ -91,31 +101,67 @@ function createCore({ emit }) {
     taskWaiters.clear();
   }
 
-  /* 受控回调：同步死循环被 V8 timeout 中断；async 返回值挂 reject，
-   * 不让 unhandledRejection 漏进宿主（fork 侧防崩溃重启风暴，inline 侧防主进程被打）。 */
-  function guardedCall(fn, args) {
+  /* realm 函数受控调用的唯一通道：同步部分受 vm timeout 中断。
+   * wantResult=true → await 结果并把异常抛给调用方（hold 的 condition/watcher 用）；
+   * wantResult=false → 只管副作用，async 异常记日志，不让 unhandledRejection 漏进宿主。 */
+  function callRealm(fn, args, wantResult) {
+    const key = wantResult ? '__holdFn' : '__guardFn';
     try {
-      vmCtx.__guardFn = fn;
-      vmCtx.__guardArgs = args || [];
-      const r = vm.runInContext('__guardFn(...__guardArgs)', vmCtx, { timeout: cbTimeoutMs });
+      vmCtx[key] = fn;
+      vmCtx[`${key}Args`] = args || [];
+      const r = vm.runInContext(`${key}(...${key}Args)`, vmCtx, { timeout: cbTimeoutMs });
+      if (wantResult) return Promise.resolve(r); // thenable 由 Promise.resolve 展开，等价 await
       if (r && typeof r.catch === 'function') {
         r.catch((e) => emit({ type: 'log', level: 'error', message: '异步回调异常：' + (e && e.message || e) }));
       }
     } catch (e) {
+      /* 同步超时/异常就地记日志（保持原同步时序，inline 宿主不能延迟一个 microtask）；
+       * 取值回调则交给调用方 catch（hold 的 reevaluate 有 catch 与补排）。 */
+      if (wantResult) return Promise.reject(e);
       emit({ type: 'log', level: 'error', message: '回调执行被中断（同步超时/异常）：' + (e && e.message || e) });
     }
   }
 
-  /* 取回 realm 函数返回值的受控调用：guardedCall 只管副作用、丢弃返回值；
-   * ctx.hold 的 condition/watcher 必须拿到投影结果，故另开一条同构通道：
-   * 同步部分同样受 vm timeout 中断，async 结果由宿主 await（回调 promise 已由 realm 承载，
-   * 错误在这里捕获并记日志，不让 unhandledRejection 冒出去）。 */
-  async function evalRealm(fn, args) {
-    vmCtx.__holdFn = fn;
-    vmCtx.__holdArgs = args || [];
-    const r = vm.runInContext('__holdFn(...__holdArgs)', vmCtx, { timeout: cbTimeoutMs });
-    return await r; // realm Promise 可被宿主 await（thenable）
+  /* 副作用回调：异常已在 callRealm 内兜底，绝不冒泡到宿主。 */
+  function guardedCall(fn, args) { callRealm(fn, args, false); }
+
+  /* 取值回调：异常留给调用方（hold 的 reevaluate 有 catch 与补排）。 */
+  function evalRealm(fn, args) { return callRealm(fn, args, true); }
+
+  /* 退订闭包统一实现：幂等；集合空了再执行 onEmpty（回收 Map 条目 / 通知宿主取消订阅）。 */
+  function makeOff(set, cb, onEmpty) {
+    let active = true;
+    return () => {
+      if (!active) return false;
+      active = false;
+      set.delete(cb);
+      if (!set.size && onEmpty) onEmpty();
+      return true;
+    };
   }
+
+  /* 一次性受控定时器的单一入口：注册表存宿主句柄，对外只返回序号。
+   * 回调统一做 stopped 检查（stop 与到点同轮竞态时不得再执行真实写），
+   * 并走 guardedCall 防同步死循环。 */
+  function scheduleTimer(fn, ms, rest) {
+    const id = ++timerSeq;
+    const t = setTimeout(() => {
+      timers.delete(id);
+      if (ctxRuntime.stopped) return;
+      guardedCall(fn, rest || []);
+    }, Math.max(0, Number(ms) || 0));
+    timers.set(id, t);
+    return id;
+  }
+  /* 取消必须先查表拿宿主句柄：直接 clearTimeout(序号) 是 no-op（审计 P0-1）。 */
+  function unregisterTimer(id, clearer) {
+    const t = timers.get(id);
+    if (!t) return false;
+    clearer(t);
+    timers.delete(id);
+    return true;
+  }
+  const cancelTimer = (id) => unregisterTimer(id, clearTimeout);
 
   /* ---------------- 沙箱构造（S2 运行层加固）----------------
    * 只把 realm 内对象暴露给脚本：vm context 自带 realm 的 Math/Date/JSON/Promise 等内建，
@@ -152,6 +198,22 @@ function createCore({ emit }) {
     };
     const tools = factory(invoke);
 
+    /* 宿主对象/函数的可枚举属性统一搬进 realm 对应物：accessor 连 setter 一起搬，
+     * 否则 h.value = x 这类回写会落到只有 getter 的 realm 对象上被静默丢弃。
+     * 函数子接口（ctx.watch.task）与对象属性共用一条路径，避免两处漏改。 */
+    function copyAccessors(target, src, depth) {
+      for (const k of Object.keys(src)) {
+        const d = Object.getOwnPropertyDescriptor(src, k);
+        if (d && typeof d.get === 'function') {
+          const desc = { get: () => conv(d.get.call(src), depth + 1), enumerable: true };
+          if (typeof d.set === 'function') desc.set = (nv) => { d.set.call(src, nv); };
+          Object.defineProperty(target, k, desc);
+        } else {
+          target[k] = conv(src[k], depth + 1);
+        }
+      }
+    }
+
     function conv(v, depth = 0) {
       if (v == null) return v;
       if (depth > 12) return null; // 超深嵌套截断为 null——绝不能把宿主对象原样交给脚本（realm 逃逸）
@@ -160,20 +222,8 @@ function createCore({ emit }) {
         if (memo.has(v)) return memo.get(v);
         const w = tools.wrapFn(v);
         memo.set(v, w);
-        /* 函数上的可枚举子接口（ctx.watch.task）必须一并搬进 realm：
-         * wrapFn 只返回裸函数，不复制自身属性，脚本里会读不到 ctx.watch.task。 */
-        for (const k of Object.keys(v)) {
-          const d = Object.getOwnPropertyDescriptor(v, k);
-          if (d && typeof d.get === 'function') {
-            /* 读写 accessor（如 ctx.hold 句柄的 value）必须连 setter 一起搬，
-             * 否则脚本侧 a.value = x 落到只有 getter 的 realm 对象上被静默丢弃。 */
-            const desc = { get: () => conv(d.get.call(v), depth + 1), enumerable: true };
-            if (typeof d.set === 'function') desc.set = (nv) => { d.set.call(v, nv); };
-            Object.defineProperty(w, k, desc);
-          } else {
-            w[k] = conv(v[k], depth + 1);
-          }
-        }
+        /* wrapFn 只返回裸函数，不复制自身属性；ctx.watch.task 这类子接口靠这里搬进 realm */
+        copyAccessors(w, v, depth);
         return w;
       }
       if (t !== 'object') return v;
@@ -186,18 +236,7 @@ function createCore({ emit }) {
       }
       const out = tools.makeObject(); // realm 内对象
       memo.set(v, out);
-      for (const k of Object.keys(v)) {
-        const d = Object.getOwnPropertyDescriptor(v, k);
-        if (d && typeof d.get === 'function') {
-          /* 同函数子接口：有 setter 就一起搬，供 ctx.hold().value = x 这类回写使用。
-           * 只读 getter（ctx.dryRun/stopped/suspended）没有 set，行为不变。 */
-          const desc = { get: () => conv(d.get.call(v), depth + 1), enumerable: true };
-          if (typeof d.set === 'function') desc.set = (nv) => { d.set.call(v, nv); };
-          Object.defineProperty(out, k, desc);
-        } else {
-          out[k] = conv(v[k], depth + 1);
-        }
-      }
+      copyAccessors(out, v, depth); // 只读 getter（dryRun/stopped/suspended）没有 set，行为不变
       return out;
     }
     return { sandbox, context, conv };
@@ -220,17 +259,10 @@ function createCore({ emit }) {
         const first = set.size === 0;
         set.add(cb);
         if (first) emit({ type: 'contextSubscribe', scope: 'global', key: k });
-        let active = true;
-        return () => {
-          if (!active) return false;
-          active = false;
-          set.delete(cb);
-          if (!set.size) {
-            globalSubs.delete(k);
-            emit({ type: 'contextUnsubscribe', scope: 'global', key: k });
-          }
-          return true;
-        };
+        return makeOff(set, cb, () => {
+          globalSubs.delete(k);
+          emit({ type: 'contextUnsubscribe', scope: 'global', key: k });
+        });
       };
     }
     return api;
@@ -273,7 +305,6 @@ function createCore({ emit }) {
         /* 脚本侧状态接口：entity 取完整实体对象 / state 取 state 字符串 / num 取数字 /
          * attr 取单属性 / attrs 取整属性对象 / listEntities 列实体 / change 订阅实体变化。
          * IPC 动作名（getState 等）是主进程与 runner 的内部协议，不对外暴露。 */
-        entity: (eid) => request('getState', { entityId: eid }),
         listEntities: (filter) => request('listEntities', { filter }),
         callService: (domain, service, data) => request('callService', { domain, service, data }),
         change: (entityId, cb) => {
@@ -281,16 +312,6 @@ function createCore({ emit }) {
           if (!subscriptions.has(key)) subscriptions.set(key, []);
           subscriptions.get(key).push(cb);
           emit({ type: 'subscribe', entityId: key });
-        },
-        subscribe: (condition, cb) => {
-          // condition 为 entityId 字符串或 {entityId}；条件（entityId 匹配）在注册时已确定，
-          // 每次状态变化都会调用 cb（不是只调一次），需要"只触发一次"请在 cb 里自行注销判断。
-          const eid = typeof condition === 'string' ? condition : (condition && condition.entityId);
-          if (eid) {
-            ctx.ha.change(eid, (s, prev) => {
-              try { cb(s, prev); } catch (e) { emit({ type: 'log', level: 'error', message: 'subscribe 回调异常：' + (e && e.message || e) }); }
-            });
-          }
         },
       },
       log: (level, message, nodeId) => emit({ type: 'log', level: String(level || 'info'), message: String(message), nodeId: nodeId ? String(nodeId) : undefined }),
@@ -331,6 +352,12 @@ function createCore({ emit }) {
       const fn = actionRegistry.get(op);
       if (!fn) throw new Error(`未注册的动作：${op}（先调用 ctx.actions({...})）`);
       writeStats.intent += 1;
+      /* 停止后不得再下发：stop 只置标志不强杀执行流，已入队的续体仍可能走到这里。 */
+      if (ctxRuntime.stopped) {
+        writeStats.blocked += 1;
+        emit({ type: 'log', level: 'warn', message: `[兜底] 动作已跳过（实例已停止）：${desc}`, nodeId });
+        return false;
+      }
       /* 兜底：脚本被挂起（HA 断线 / 依赖实体缺失）时不执行任何动作，只记日志。 */
       if (ctxRuntime.suspended) {
         writeStats.blocked += 1;
@@ -376,7 +403,9 @@ function createCore({ emit }) {
 
     /* 读取实体状态的薄封装：state 原样返回字符串（有效性由脚本用 ctx.invalid 自己判）；
      * num 在「实体缺失 / 状态无效 / 非数字」三种情况都返回 fallback，让传入的 null/100 真正兑现。 */
+    /* getState 的唯一薄封装：entity / state / num / attr 共用，避免两处口径漂移 */
     const readState = (eid) => request('getState', { entityId: eid });
+    ctx.ha.entity = readState;
     ctx.ha.state = async (eid) => { const s = await readState(eid); return s ? s.state : null; };
     ctx.ha.num = async (eid, fallback = 0) => {
       const s = await readState(eid);
@@ -425,17 +454,10 @@ function createCore({ emit }) {
       const first = set.size === 0;
       set.add(cb);
       if (first) emit({ type: 'taskSubscribe', scriptId: sid });
-      let active = true;
-      return () => {
-        if (!active) return false;
-        active = false;
-        set.delete(cb);
-        if (!set.size) {
-          taskSubs.delete(sid);
-          emit({ type: 'taskUnsubscribe', scriptId: sid });
-        }
-        return true;
-      };
+      return makeOff(set, cb, () => {
+        taskSubs.delete(sid);
+        emit({ type: 'taskUnsubscribe', scriptId: sid });
+      });
     };
 
     /* 时间工具：sod = 当日秒数，与 HA input_datetime 的 timestamp 属性同口径 */
@@ -452,22 +474,9 @@ function createCore({ emit }) {
       },
     };
 
-    /* 可取消延时：对应 HA 的 mode:restart / for: 语义。stop 时统一 clear 防止退出后回调乱跑。 */
-    ctx.after = (ms, fn) => {
-      const id = ++timerSeq;
-      const t = setTimeout(() => {
-        timers.delete(id);
-        guardedCall(fn, []);
-      }, Math.max(0, Number(ms) || 0));
-      timers.set(id, t);
-      return id;
-    };
-    ctx.cancel = (id) => {
-      if (!timers.has(id)) return false;
-      clearTimeout(timers.get(id));
-      timers.delete(id);
-      return true;
-    };
+    /* 可取消延时：对应 HA 的 mode:restart / for: 语义；与裸 setTimeout 共用 scheduleTimer。 */
+    ctx.after = (ms, fn) => scheduleTimer(fn, ms);
+    ctx.cancel = cancelTimer;
 
     /* 语义化周期定时：受控 setInterval —— 与 ctx.after 共用 timers 注册表（stop 统一清理、
      * ctx.cancel(id) 可停止）；stopped 后自动注销且不再触发；回调走 guardedCall 防同步死循环。
@@ -476,88 +485,168 @@ function createCore({ emit }) {
       const period = Math.max(0, Number(ms) || 0);
       const id = ++timerSeq;
       const t = setInterval(() => {
-        if (ctxRuntime.stopped) { clearInterval(t); timers.delete(id); return; }
+        if (ctxRuntime.stopped) { unregisterTimer(id, clearInterval); return; }
         guardedCall(fn, []);
       }, period);
       timers.set(id, t);
       return id;
     };
 
-    /* ctx.hold：通用「持续 N 秒确认」容器（ref-like 句柄）。
-     * 数据流：raw（脚本写入的最新值）→ condition 投影 → signal → 持续 ms 翻转确认 → stable（value 读出）。
-     * raw 只由脚本赋值：a.value = x。实体变化由脚本自己 ctx.watch 订阅并在回调里算好值写进来；
-     *   condition 需要读 HA 也可在投影函数里自行 await ctx.ha.xxx —— 框架不内置任何实体监听。
-     * 读写同属性不同义：写=设 raw 目标，读=持续确认后的 stable（写后不满 ms 读到旧值）。
-     * 内部状态纯闭包内存，不碰 global/local：影子写隔离、读不隔离，写后读回会读空。
-     * 翻转即重置计时（mode:restart）、到点回调重新跑 condition 复核，杜绝「先查一次+到点再查」。 */
-    ctx.hold = (msOrOpts, opts) => {
-      const conf = (msOrOpts && typeof msOrOpts === 'object' && !Array.isArray(msOrOpts))
-        ? msOrOpts : { ...(opts || {}), ms: msOrOpts };
-      if (!conf || typeof conf !== 'object') throw new Error('ctx.hold 需要配置对象或时长(ms)');
-      const ms = Math.max(0, Number(conf.ms) || 0);
-      if (ms <= 0) throw new Error('ctx.hold 的持续时长 ms 必须大于 0');
-      const initial = conf.initial === undefined ? false : conf.initial;
-      /* 投影回调：优先 condition；兼容中文「条件」与旧名 read（仅内部兼容，文档只写 condition） */
-      const condition = typeof conf.condition === 'function' ? conf.condition
-        : (typeof conf['条件'] === 'function' ? conf['条件']
-          : (typeof conf.read === 'function' ? conf.read : null));
+    /* ctx.hold：期待值/期待条件的双边迟滞确认器（ref-like 句柄）。
+     * 数据流：raw（脚本写入的最新值）→ expect 投影 → desired（是否满足期待，二态）→
+     *   desired !== state 时按方向计时（满足=satisfyMs / 不满足=unsatisfyMs）→
+     *   持续到点复核仍成立 → state 切换并通知 watcher 一次。
+     * watch 回调：(satisfied, prev, info)，satisfied=true 表示"满足期待持续到位"，
+     *   false 表示"不满足期待/回落持续到位"。同一状态持续多久都不会重复回调。
+     * raw 只由脚本赋值：a.value = x。实体变化由脚本自己 ctx.watch 订阅并在回调里写 raw；
+     *   expect 需要读 HA 也可在函数里 await ctx.ha.xxx —— 框架不内置实体监听。
+     * 只接受对象参数：{ expect, satisfyMs, unsatisfyMs?, initial?, nodeId?, label? }；
+     *   不使用旧语法（数字首参 / ms / condition / fallMs）。unsatisfyMs=null/0/缺省 → 不满足立即回落。
+     * 内部状态纯闭包内存，不碰 global/local；stop 时 ctx.after 统一清理。 */
+    ctx.hold = (opts) => {
+      if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new Error('ctx.hold 只接受对象参数 { expect, satisfyMs, unsatisfyMs? }');
+      }
+      const conf = opts;
+      const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+      for (const oldKey of ['ms', 'condition', 'fallMs']) {
+        if (hasOwn(conf, oldKey)) {
+          throw new Error(`ctx.hold 不再支持旧参数 ${oldKey}：请改用 ${oldKey === 'ms' ? 'satisfyMs' : oldKey === 'condition' ? 'expect' : 'unsatisfyMs'}`);
+        }
+      }
+      const satisfyMs = Math.max(0, Number(conf.satisfyMs) || 0);
+      if (satisfyMs <= 0) throw new Error('ctx.hold 的满足持续时长 satisfyMs 必须大于 0');
+
+      const unsatisfyRaw = hasOwn(conf, 'unsatisfyMs') ? conf.unsatisfyMs : null;
+      const unsatisfyMs = (unsatisfyRaw === null || unsatisfyRaw === undefined || unsatisfyRaw === '')
+        ? 0 : Math.max(0, Number(unsatisfyRaw) || 0);
+
+      const initial = conf.initial === undefined ? false : !!conf.initial;
+      const expectFn = typeof conf.expect === 'function' ? conf.expect : null;
+      const hasExpectValue = !expectFn && hasOwn(conf, 'expect');
+      const expectValue = hasExpectValue ? conf.expect : undefined;
       const nodeId = conf.nodeId;
       const label = conf.label ? `[hold·${conf.label}] ` : '[hold] ';
       const log = (message, level = 'info') =>
         emit({ type: 'log', level, message: label + message, nodeId });
+      /* 日志文案中文化：只翻显示用的方向/触发标记，info.reason、state().pending 等字段值仍是英文。 */
+      const dirCn = (v) => v === 'satisfied' ? '满足' : v === 'unsatisfied' ? '回落' : String(v);
+      const trigCn = (v) => String(v).split(':').map((p) => ({
+        init: '初始化', assign: '赋值', timer: '到点', retry: '重试', resume: '补排',
+      }[p] || dirCn(p))).join('·');
 
       let raw = initial;
-      let signal = initial;
-      let stable = initial;
-      let since = 0;      // 当前 signal 开始持续的起点；0 = 未计时
-      let timer = null;   // ctx.after 句柄（受 timers 注册表管理，stop 统一清理）
-      let seq = 0;        // 重评序号：异步 condition 期间被新一次重评抢占则放弃旧结果
+      let state = initial;   // 当前已确认状态：true=已确认满足期待，false=未满足/已回落
+      let stable = state;    // 兼容旧 state()/文档：与 state 同步，不再作为 watch 触发条件
+      let desired = false;   // 最近一次 expect 投影结果：是否满足期待
+      let pending = null;    // 'satisfied' / 'unsatisfied' / null
+      let since = 0;         // 当前等待方向开始持续的起点；0 = 未计时
+      let timer = null;      // ctx.after 句柄（受 timers 注册表管理，stop 统一清理）
+      let seq = 0;           // 重评序号：异步 expect 期间被新一次重评抢占则放弃旧结果
       let dead = false;
       const watchers = new Set();
+      const clearHoldTimer = () => { if (timer) { cancelTimer(timer); timer = null; } };
+      const delayFor = (direction) => direction === 'satisfied' ? satisfyMs : unsatisfyMs;
+
+      const notify = (trigger, waitedMs) => {
+        const prev = state;
+        state = desired;
+        stable = state;
+        pending = null;
+        since = 0;
+        const reason = state ? 'satisfied' : 'unsatisfied';
+        log(`确认${state ? '满足' : '不满足'}：状态 ${String(prev)} → ${String(state)}` +
+          `（持续 ${waitedMs}ms，触发=${trigCn(trigger)}）`);
+        const info = {
+          satisfied: state,
+          value: state,
+          reason,
+          raw,
+          expected: desired,
+          state,
+          stable,
+          ms: waitedMs,
+          nodeId,
+        };
+        for (const cb of [...watchers]) {
+          evalRealm(cb, [state, prev, info]).catch((e) =>
+            log(`watcher 异常：${e && e.message || e}`, 'error'));
+        }
+      };
+
+      /* 统一到点排程：回调先确认自己仍是当前 timer 再处理（过期回调直接丢弃），
+       * 句柄清理也收在这里。到点复核抛异常时保留 pending/since，由异常路径补排重试。 */
+      const arm = (delay, trigger) => {
+        const id = ctx.after(delay, () => {
+          if (timer !== id) return;
+          timer = null;
+          reevaluate(trigger);
+        });
+        timer = id;
+      };
+      /* 异常重试/句柄补排的间隔：到点后剩余时间为 0 时给 50ms 下限，
+       * 避免 expect 连续抛错形成 0ms 紧循环刷日志。 */
+      const retryDelay = () => {
+        if (!pending) return satisfyMs;
+        const delay = delayFor(pending);
+        return since > 0 ? Math.max(50, delay - (Date.now() - since)) : Math.max(50, delay);
+      };
 
       async function reevaluate(trigger) {
         if (dead || ctxRuntime.stopped) return;
         const my = ++seq;
-        /* 1) 投影 signal（condition 可同步可 async，可自行 await ctx.ha 读实体；
-         *    抛错则保守跳过，不推进计时）。raw 就是脚本最后一次写入的值。 */
-        let next = raw;
-        if (condition) {
-          try { next = await evalRealm(condition, [raw]); }
-          catch (e) { log(`condition 异常，本轮跳过：${e && e.message || e}`, 'error'); return; }
+        /* 1) 投影 desired：expect 可同步可 async，可自行 await ctx.ha 读实体；
+         *    抛错则保守跳过、不推进计时，但必须补排重试。 */
+        let next;
+        if (expectFn) {
+          try { next = !!(await evalRealm(expectFn, [raw])); }
+          catch (e) {
+            log(`expect 异常，本轮跳过：${e && e.message || e}`, 'error');
+            if (my === seq && !dead && !ctxRuntime.stopped && !timer) arm(retryDelay(), 'retry');
+            return;
+          }
+        } else if (hasExpectValue) {
+          next = signalEquals(raw, expectValue); // 期待值模式：raw 等于 expect 才算满足
+        } else {
+          next = !!raw;                          // 默认期待值：truthy 即满足，兼容 a.value=true/'Busy'
         }
         if (my !== seq || dead || ctxRuntime.stopped) return;
-        /* 2) signal 翻转 → 重置计时、重新排到点复核 */
-        if (next !== signal) {
-          signal = next;
-          since = Date.now();
-          if (timer) { ctx.cancel(timer); timer = null; }
-          timer = ctx.after(ms, () => { timer = null; reevaluate('timer'); });
-          log(`signal → ${String(signal)}，计时重置 ${ms}ms（${trigger}）`);
-          return;
-        }
-        /* 3) signal 未变且已连续满 ms → 确认稳定值翻转，通知 watcher */
-        if (since > 0 && Date.now() - since >= ms) {
+        desired = next;
+
+        /* 2) 期待结果与当前已确认状态一致：没有待确认边沿，取消本轮计时，不回调。 */
+        if (desired === state) {
+          if (pending) log(`期待回到已确认状态 ${String(desired)}，取消${dirCn(pending)}计时`);
+          pending = null;
           since = 0;
-          if (timer) { ctx.cancel(timer); timer = null; }
-          if (stable !== signal) {
-            const prev = stable;
-            stable = signal;
-            log(`稳定值 ${String(prev)} → ${String(stable)}（连续满 ${ms}ms，${trigger}）`);
-            for (const cb of [...watchers]) {
-              evalRealm(cb, [stable, prev]).catch((e) =>
-                log(`watcher 异常：${e && e.message || e}`, 'error'));
-            }
-          }
+          clearHoldTimer();
           return;
         }
-        /* 4) 计时中但句柄丢失（如被 cancel 内部清过）：按剩余时间补排，保证到点复核 */
-        if (since > 0 && !timer) {
-          timer = ctx.after(Math.max(0, ms - (Date.now() - since)), () => { timer = null; reevaluate('resume'); });
+
+        /* 3) 期待结果与当前状态相反：按方向计时；中途回到当前状态则上一步会取消。 */
+        const direction = desired ? 'satisfied' : 'unsatisfied';
+        const delay = delayFor(direction);
+        if (pending !== direction) {
+          pending = direction;
+          since = Date.now();
+          clearHoldTimer();
+          log(`期待${desired ? '满足' : '不满足'}，${dirCn(direction)}计时 ${delay}ms（触发=${trigCn(trigger)}）`);
+          if (delay === 0) { notify(trigger + ':立即', 0); return; }
+          arm(delay, trigger);
+          return;
         }
+
+        /* 4) 同方向已计时：到点复核仍成立就切换状态并通知一次；句柄丢失则按剩余时间补排。 */
+        if (since > 0 && Date.now() - since >= delay) {
+          const waitedMs = Date.now() - since;
+          clearHoldTimer();
+          notify(trigger, waitedMs);
+          return;
+        }
+        if (since > 0 && !timer) arm(Math.max(1, delay - (Date.now() - since)), 'resume');
       }
 
       const handle = {
-        get value() { return stable; },
+        get value() { return state; },
         set value(nv) {
           if (dead) return;
           raw = nv;
@@ -565,29 +654,36 @@ function createCore({ emit }) {
         },
         watch(cb) {
           if (typeof cb !== 'function') throw new Error('hold.watch 需要回调函数');
+          if (dead) return () => false;
           watchers.add(cb);
-          let active = true;
-          return () => { if (!active) return false; active = false; return watchers.delete(cb); };
+          return makeOff(watchers, cb);
         },
         cancel() {
           if (dead) return false;
           dead = true;
           seq++;
-          if (timer) { ctx.cancel(timer); timer = null; }
+          clearHoldTimer();
+          pending = null;
+          since = 0;
           watchers.clear();
           return true;
         },
         state() {
+          const active = pending !== null;
           return {
-            raw, signal, stable,
+            raw, desired, signal: desired, state, stable: state,
+            pending,
             since,
-            active: since > 0,
-            remaining: since > 0 ? Math.max(0, ms - (Date.now() - since)) : 0,
-            ms, dead,
+            active,
+            remaining: active ? Math.max(0, delayFor(pending) - (Date.now() - since)) : 0,
+            ms: satisfyMs,
+            satisfyMs,
+            unsatisfyMs,
+            dead,
           };
         },
       };
-      reevaluate('init'); // 首次投影：让初始实体值/condition 立即进入判定
+      reevaluate('init'); // 首次投影：让初始实体值/expect 立即进入判定
       return handle;
     };
 
@@ -614,27 +710,10 @@ function createCore({ emit }) {
         log: (...a) => emit({ type: 'log', level: 'info', message: a.map(String).join(' ') }),
         error: (...a) => emit({ type: 'log', level: 'error', message: a.map(String).join(' ') }),
       });
-      /* 裸 setTimeout 同样收编到 timers 注册表：stop 时统一清理（否则脚本让步退出后
-       * 定时器回调仍会执行，成为唯一残留源）；回调走 guardedCall + stopped 检查。
-       * 脚本层语义仍与原生 setTimeout 一致（返回 id 传给 clearTimeout 可取消）。 */
-      sandbox.setTimeout = conv((fn, ms, ...rest) => {
-        const id = ++timerSeq;
-        const t = setTimeout(() => {
-          timers.delete(id);
-          if (ctxRuntime.stopped) return;
-          guardedCall(fn, rest);
-        }, Math.max(0, Number(ms) || 0));
-        timers.set(id, t);
-        return id;
-      });
-      /* setTimeout 返回的是自定义序号（宿主句柄存在 timers 注册表），取消必须先查表
-       * 拿到宿主句柄再 clearTimeout——直接 clearTimeout(序号) 是 no-op，取消会静默失效
-       * （序号被当成普通数字忽略），回调到期仍执行且 stop 兜底清理扫不到（审计 2026-11-26 P0-1）。 */
-      sandbox.clearTimeout = conv((id) => {
-        const t = timers.get(id);
-        if (t) { clearTimeout(t); timers.delete(id); }
-        return true;
-      });
+      /* 裸 setTimeout 与 ctx.after 共用 scheduleTimer（同一注册表 / stopped 闸 / guardedCall）。
+       * 脚本层语义仍与原生一致：返回序号交给 clearTimeout 取消（内部由 cancelTimer 查表）。 */
+      sandbox.setTimeout = conv((fn, ms, ...rest) => scheduleTimer(fn, ms, rest));
+      sandbox.clearTimeout = conv((id) => { cancelTimer(id); return true; });
       /* setInterval 不直接暴露宿主版本：登记到 intervals 便于 stop 统一清理，
        * 且 stopped 后不再触发回调；回调走 guardedCall 防同步死循环。 */
       sandbox.setInterval = conv((fn, ms, ...rest) => {
@@ -731,7 +810,7 @@ function createCore({ emit }) {
         ctxRuntime.stopped = true;
         cleanupLocal(); // 订阅/等待者/定时器统一清（与 destroy 同一套，stop 多一条日志）
         emit({ type: 'log', level: 'info', message: '收到停止指令，等待脚本让步退出' });
-        /* 不强杀执行流：让长驻脚本在 sleep / 回调后检查 ctx.stopped() 自行让步退出；
+        /* 不强杀执行流：让长驻脚本在 sleep / 回调后检查 ctx.stopped 布尔属性（不是函数）自行让步退出；
          * 主进程延迟宽限期后会 child.kill() 兜底。 */
         return;
       }

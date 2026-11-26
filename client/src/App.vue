@@ -393,7 +393,7 @@ async function rollbackTo(version) {
           <TopologyPanel />
           <ScriptViewer />
           <details class="log-box" @toggle="onLogToggle">
-            <summary><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行日志 <button v-if="!followLogs" class="log-follow" @click.stop="scrollLogsToBottom">↓ 回到最新</button></summary>
+            <summary><span class="panel-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行日志</span><button v-if="!followLogs" class="log-follow" @click.stop="scrollLogsToBottom">↓ 回到最新</button></summary>
             <div ref="logBox" class="logs" @scroll="onLogScroll">
               <div v-for="(l, i) in scripts.logs" :key="i" class="log" :class="l.level">
                 <span class="ts">{{ new Date(l.ts).toLocaleTimeString() }}</span>

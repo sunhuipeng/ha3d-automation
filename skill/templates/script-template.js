@@ -1,6 +1,6 @@
 /* 【模板】ha3d-automation 长驻脚本骨架
  * 用法：复制本文件为任意路径下的源文件（如临时目录），替换 ⬜ 占位内容，删除用不到的段落注释。
- * 硬规则见 skill/SKILL.md 第 2 步；ctx 接口见 skill/references/ctx-api.md。 */
+ * 硬规则见 skill/SKILL.md 第 3 步；ctx 接口见 skill/references/ctx-api.md。 */
 
 /* ⬜ 文件头注释：业务说明 + 触发/判据/动作三要素 + 关键设计决策 */
 
@@ -34,8 +34,8 @@ function arm() {
 async function onTick() {
   await ctx.lock('main', async () => {           // 防重入：定时器与订阅回调可能同时触发
     if (ctx.stopped) return;                     // 停止指令 → 让步退出
-    const cur = await ctx.ha.num(ENTITIES.main, 0);   // 每拍核对真实值（断线返回 fallback）
-    if (cur === null || cur <= THRESHOLD) { timerId = null; return; }   // 保守分支
+    const cur = await ctx.ha.num(ENTITIES.main, null);   // 每拍核对真实值；传 null = 读不到就跳过（断线/unavailable）
+    if (cur === null || cur <= THRESHOLD) { timerId = null; return; }   // 保守分支：读不到或低于阈值都不推进
     selfValue = cur - 1;
     expected[ENTITIES.main] = selfValue;         // 记录期望值，watch 里过滤自发变化
     await ctx.write('do_thing', `⬜ 描述：${cur}→${selfValue}`, 'n_act');

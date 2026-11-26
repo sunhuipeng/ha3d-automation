@@ -1,6 +1,6 @@
 'use strict';
 /* 第三部分 Bug 修复的回归测试：S2 沙箱逃逸 / M2 影子 dryRun / M6 路径穿越 /
- * L5 互斥 + 释放 / L1 subscribe 单回调 / M9 error 状态保留 / L4 反代 URL。
+ * L5 互斥 + 释放 / L1 ha.change 单回调 / M9 error 状态保留 / L4 反代 URL。
  * 用隔离进程与 tmp 数据，不连真实 HA。 */
 import { createRequire } from 'node:module';
 import { test } from 'node:test';
@@ -67,7 +67,7 @@ test('L5：同键并发互斥，释放后可再次获取', () => {
   if (c.ok) executor.releaseAction(c.key);
 });
 
-/* ---------- L1：subscribe 对象条件回调只触发一次（真实 runner） ---------- */
+/* ---------- L1：ha.change 按实体注册，每次状态变化只回调一次（真实 runner） ---------- */
 const { fork } = require('node:child_process');
 const RUNNER = path.join(__dirname, '../server/scripts/runner.js');
 
@@ -87,7 +87,7 @@ function runSubscribeScript() {
       if (msg.type === 'done') finish();
     });
     const script = `
-      ctx.ha.subscribe({entityId:'light.x'}, (s)=>{ ctx.log('info','CB'); });
+      ctx.ha.change('light.x', (s)=>{ ctx.log('info','CB'); });
       await new Promise(r=>setTimeout(r,200));
     `;
     child.send({ type: 'run', script, meta: { version: 1, dryRun: true } });
@@ -95,7 +95,7 @@ function runSubscribeScript() {
   });
 }
 
-test('L1：subscribe 对象条件每次状态变化只回调一次', async () => {
+test('L1：ha.change 每次状态变化只回调一次', async () => {
   const count = await runSubscribeScript();
   assert.equal(count, 2, '两次状态变化应各回调一次，共 2 次（非 4 次）');
 });

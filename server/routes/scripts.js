@@ -1,8 +1,8 @@
 'use strict';
-/* 域 3：脚本 —— 列表 / 版本 / 详情 / 提交 / 发布 / 启停 / 清理 / 日志 / 运行态。
+/* 域 3：脚本 —— 列表 / 版本 / 详情 / 发布 / 启停 / 清理 / 日志 / 运行态。
  * 版本角色：shadow（影子，至多1）+ production（正式，至多1）+ archive（归档）。 */
 const express = require('express');
-const { store, executor, connector, hub, validate } = require('../lib/runtime');
+const { store, executor, connector, hub } = require('../lib/runtime');
 const { computeDiff } = require('../lib/diff');
 const topology = require('../scripts/topology');
 
@@ -154,18 +154,8 @@ module.exports = function scriptRoutes() {
    * 脚本没跑过则为空对象 {}，不是错误。 */
   r.get('/script/:id/topology', (req, res) => res.json(topologyForDisplay(req.params.id)));
 
-  r.post('/scripts', (req, res) => {
-    try {
-      /* dryRun / longRunning 是旧参数：语义分别由 channel / kind 派生，此处不再透传（传入即忽略） */
-      const { scriptId, name, script, flow, description, newVersion, channel, icon, kind, runnerTimeoutMs, restartable } = req.body || {};
-      const err = validate(script);
-      if (err) return res.status(400).json({ error: '脚本校验未通过：' + err });
-      const rec = executor.submitScript(scriptId, { name, script, flow, description, newVersion, channel, icon, kind, runnerTimeoutMs, restartable });
-      executor.broadcastRefresh(['scripts', 'script'], { scriptId: rec.id, version: rec.version });
-      res.json({ ok: true, id: rec.id, version: rec.version, overwritten: !!rec.overwritten });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-  });
-
+  /* 脚本提交统一走 MCP automation_submit_script（skill/tools/submit.cjs），
+   * 不再提供 REST POST /api/scripts；校验与写盘逻辑只在 MCP 工具一处维护。 */
   r.post('/script/:id/start', (req, res) => {
     try {
       executor.start(req.params.id, req.body && req.body.version, connector);

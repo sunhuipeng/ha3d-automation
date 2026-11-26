@@ -17,7 +17,7 @@ const lines = computed(() => source.value.replace(/\r\n?/g, '\n').split('\n').ma
 <template>
   <details class="code-box">
     <summary>
-      <span class="cb-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>脚本源码 <span class="cb-file">script.js</span></span>
+      <span class="cb-title panel-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>脚本源码</span>
       <span class="cb-meta">只读 · v{{ store.current?.version || '-' }} · {{ lines.length }} 行</span>
     </summary>
     <div class="vs-editor">
