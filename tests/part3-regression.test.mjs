@@ -26,7 +26,7 @@ test('S2：静态校验拒绝 constructor / __proto__ 逃逸链', () => {
 
 test('S2：静态校验保留合法 ctx / 原生内建语法', () => {
   assert.equal(validateScript("const d = new Date(); Math.floor(d.getTime()/1000); ctx.log('info','ok');"), null);
-  assert.equal(validateScript("ctx.ha.onStateChange('light.x', (s)=>ctx.log('info', s.state));"), null);
+  assert.equal(validateScript("ctx.ha.change('light.x', (s)=>ctx.log('info', s.state));"), null);
 });
 
 /* ---------- M2 / M6：用隔离 tmp 数据加载 store ---------- */

@@ -4,9 +4,9 @@ import { validateScript } from '../server/scripts/validate.js';
 
 test('validateScript：合法 ctx 白名单脚本通过', () => {
   const src = `
-    const s = await ctx.ha.getState('light.living');
+    const s = await ctx.ha.entity('light.living');
     ctx.log('info', 'state=' + (s && s.state));
-    ctx.ha.onStateChange('light.living', (state) => { ctx.log('info', state); });
+    ctx.ha.change('light.living', (state) => { ctx.log('info', state); });
     await ctx.sleep(100);
   `;
   assert.equal(validateScript(src), null);

@@ -2,3 +2,4 @@
 /examples/
 *.json
 /skill/.cache/
+/.work/

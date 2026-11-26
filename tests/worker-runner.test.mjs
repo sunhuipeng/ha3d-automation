@@ -103,7 +103,7 @@ test('worker：订阅回调同步死循环被 guardedCall 中断，主线程不�
   const child = createWorkerChild({});
   const { logs } = bridge(child);
   await run(child, `
-    ctx.ha.onStateChange('sensor.test', () => { const t = Date.now(); while (Date.now() - t < 60000) {} });
+    ctx.ha.change('sensor.test', () => { const t = Date.now(); while (Date.now() - t < 60000) {} });
     ctx.log('info', 'READY');
   `, { dryRun: true, cbTimeoutMs: 100 });
   child.send({ type: 'state', entityId: 'sensor.test', state: STATES['sensor.test'], prev: null });

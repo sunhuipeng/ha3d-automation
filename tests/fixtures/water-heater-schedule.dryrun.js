@@ -45,7 +45,7 @@ let lastHelperTs = null;
 
 /* input_datetime 的 timestamp 属性是“当日秒数”，不是 Unix 时间戳 */
 async function readStartSod() {
-  const s = await ctx.ha.getState(ID.startTime);
+  const s = await ctx.ha.entity(ID.startTime);
   if (!s) return 20 * 3600 + 30 * 60;
   if (s.attributes && typeof s.attributes.timestamp === 'number') return ctx.num(s.attributes.timestamp);
   const p = String(s.state || '').split(':').map(Number);
@@ -86,7 +86,7 @@ async function actionAllowed(key) {
 }
 
 async function ensureTarget(target) {
-  const s = await ctx.ha.getState(ID.wh);
+  const s = await ctx.ha.entity(ID.wh);
   const cur = s && s.attributes && s.attributes.temperature != null ? ctx.num(s.attributes.temperature) : null;
   if (cur != null && Math.abs(cur - target) < 0.1) return;
   await ctx.write('setTarget', `设置目标温度 ${target}°C`, 'n_night', target);
@@ -144,7 +144,7 @@ async function evaluate() {
     const target = await ctx.ha.num(ID.target, null);
     const lower = await ctx.ha.num(ID.lower, null);
     const upper = await ctx.ha.num(ID.upper, null);
-    const whState = await ctx.ha.getState(ID.wh);
+    const whState = await ctx.ha.entity(ID.wh);
     const whOn = whState ? String(whState.state) === 'on' : false;
     const avoiding = !!(await ctx.global.get('waterHeater.avoiding', false));
     const lastDate = await ctx.local.get('schedule.lastDate', null);

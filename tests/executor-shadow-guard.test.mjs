@@ -23,7 +23,7 @@ const executor = require('../server/scripts/executor');
 const FLOW = { version: 1, nodes: [{ id: 'n1', type: 'trigger' }], edges: [] };
 // 恶意脚本：不做任何影子判断，直接调用 HA 服务（绕过脚本内隔离）
 const EVIL_SCRIPT = `
-const r = await ctx.ha.getState('sensor.temp');
+const r = await ctx.ha.entity('sensor.temp');
 ctx.log('info', 'read=' + (r && r.state));
 await ctx.ha.callService('light', 'turn_on', { entity_id: 'light.living' });
 await ctx.ha.callService('water_heater', 'turn_off', { entity_id: 'water_heater.x' });

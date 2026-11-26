@@ -38,7 +38,7 @@ function createCore({ emit }) {
   const timers = new Map();        // ctx.after 定时器：id -> timeout（stop 时统一清理）
   const intervals = new Set();     // sandbox.setInterval 建立的循环定时器（stop 时统一 clear）
   let timerSeq = 0;
-  /* 同步等待宿主回执（getState 这类要返回值的调用） */
+  /* 同步等待宿主回执（entity/list 这类要返回值的调用） */
   const waiting = new Map();
   let waitSeq = 0;
 
@@ -106,6 +106,17 @@ function createCore({ emit }) {
     }
   }
 
+  /* 取回 realm 函数返回值的受控调用：guardedCall 只管副作用、丢弃返回值；
+   * ctx.hold 的 condition/watcher 必须拿到投影结果，故另开一条同构通道：
+   * 同步部分同样受 vm timeout 中断，async 结果由宿主 await（回调 promise 已由 realm 承载，
+   * 错误在这里捕获并记日志，不让 unhandledRejection 冒出去）。 */
+  async function evalRealm(fn, args) {
+    vmCtx.__holdFn = fn;
+    vmCtx.__holdArgs = args || [];
+    const r = vm.runInContext('__holdFn(...__holdArgs)', vmCtx, { timeout: cbTimeoutMs });
+    return await r; // realm Promise 可被宿主 await（thenable）
+  }
+
   /* ---------------- 沙箱构造（S2 运行层加固）----------------
    * 只把 realm 内对象暴露给脚本：vm context 自带 realm 的 Math/Date/JSON/Promise 等内建，
    * 不再注入宿主版本；ctx/console/timers 这些必须桥接宿主能力的函数，全部转成 realm 内
@@ -154,7 +165,11 @@ function createCore({ emit }) {
         for (const k of Object.keys(v)) {
           const d = Object.getOwnPropertyDescriptor(v, k);
           if (d && typeof d.get === 'function') {
-            Object.defineProperty(w, k, { get: () => conv(d.get.call(v), depth + 1), enumerable: true });
+            /* 读写 accessor（如 ctx.hold 句柄的 value）必须连 setter 一起搬，
+             * 否则脚本侧 a.value = x 落到只有 getter 的 realm 对象上被静默丢弃。 */
+            const desc = { get: () => conv(d.get.call(v), depth + 1), enumerable: true };
+            if (typeof d.set === 'function') desc.set = (nv) => { d.set.call(v, nv); };
+            Object.defineProperty(w, k, desc);
           } else {
             w[k] = conv(v[k], depth + 1);
           }
@@ -174,7 +189,11 @@ function createCore({ emit }) {
       for (const k of Object.keys(v)) {
         const d = Object.getOwnPropertyDescriptor(v, k);
         if (d && typeof d.get === 'function') {
-          Object.defineProperty(out, k, { get: () => conv(d.get.call(v), depth + 1), enumerable: true });
+          /* 同函数子接口：有 setter 就一起搬，供 ctx.hold().value = x 这类回写使用。
+           * 只读 getter（ctx.dryRun/stopped/suspended）没有 set，行为不变。 */
+          const desc = { get: () => conv(d.get.call(v), depth + 1), enumerable: true };
+          if (typeof d.set === 'function') desc.set = (nv) => { d.set.call(v, nv); };
+          Object.defineProperty(out, k, desc);
         } else {
           out[k] = conv(v[k], depth + 1);
         }
@@ -251,10 +270,13 @@ function createCore({ emit }) {
       global: contextApi('global'),
       local: contextApi('local'),
       ha: {
-        getState: (eid) => request('getState', { entityId: eid }),
+        /* 脚本侧状态接口：entity 取完整实体对象 / state 取 state 字符串 / num 取数字 /
+         * attr 取单属性 / attrs 取整属性对象 / listEntities 列实体 / change 订阅实体变化。
+         * IPC 动作名（getState 等）是主进程与 runner 的内部协议，不对外暴露。 */
+        entity: (eid) => request('getState', { entityId: eid }),
         listEntities: (filter) => request('listEntities', { filter }),
         callService: (domain, service, data) => request('callService', { domain, service, data }),
-        onStateChange: (entityId, cb) => {
+        change: (entityId, cb) => {
           const key = String(entityId || '');
           if (!subscriptions.has(key)) subscriptions.set(key, []);
           subscriptions.get(key).push(cb);
@@ -265,7 +287,7 @@ function createCore({ emit }) {
           // 每次状态变化都会调用 cb（不是只调一次），需要"只触发一次"请在 cb 里自行注销判断。
           const eid = typeof condition === 'string' ? condition : (condition && condition.entityId);
           if (eid) {
-            ctx.ha.onStateChange(eid, (s, prev) => {
+            ctx.ha.change(eid, (s, prev) => {
               try { cb(s, prev); } catch (e) { emit({ type: 'log', level: 'error', message: 'subscribe 回调异常：' + (e && e.message || e) }); }
             });
           }
@@ -333,18 +355,47 @@ function createCore({ emit }) {
     };
 
     ctx.stats = () => ({ ...writeStats });
+    /* 数字转换：保留原语义（非数字 → 0）供明确想当 0 的场合；
+     * "读不到"不要靠它，请用 ctx.ha.num 的 fallback 或先 ctx.invalid 判定。 */
     ctx.num = (v) => { const x = Number(v); return Number.isNaN(x) ? 0 : x; };
 
-    /* 读取实体状态的薄封装：state 只要字符串，num 直接转数字（实体不存在时可指定 fallback） */
+    /* 统一的"无效状态"判定（实体掉线 / 读不到）：
+     * null / undefined / 空串 / 'unavailable' / 'unknown' / 'none' / (number 类型) NaN → true。
+     * 刻意不对普通字符串做 Number()：'Busy'/'on' 等合法枚举不能被判无效；
+     * 数字语义下"字符串转不出数字"由 ctx.ha.num 自己兜底成 fallback。 */
+    const INVALID_STATES = ['unavailable', 'unknown', 'none'];
+    ctx.invalid = (v) => {
+      if (v == null) return true;
+      if (typeof v === 'number') return Number.isNaN(v);
+      if (typeof v === 'string') {
+        const s = v.trim().toLowerCase();
+        return s === '' || INVALID_STATES.includes(s);
+      }
+      return false;
+    };
+
+    /* 读取实体状态的薄封装：state 原样返回字符串（有效性由脚本用 ctx.invalid 自己判）；
+     * num 在「实体缺失 / 状态无效 / 非数字」三种情况都返回 fallback，让传入的 null/100 真正兑现。 */
     const readState = (eid) => request('getState', { entityId: eid });
     ctx.ha.state = async (eid) => { const s = await readState(eid); return s ? s.state : null; };
-    ctx.ha.num = async (eid, fallback = 0) => { const s = await readState(eid); return s ? ctx.num(s.state) : fallback; };
-    /* 读取实体属性：空调 hvac_action、input_datetime.timestamp 等触发判据在属性里 */
-    ctx.ha.getAttribute = async (eid, attr, fallback = null) => {
+    ctx.ha.num = async (eid, fallback = 0) => {
+      const s = await readState(eid);
+      if (!s || ctx.invalid(s.state)) return fallback;
+      const x = Number(s.state);
+      return Number.isNaN(x) ? fallback : x;
+    };
+    /* 读取实体属性：空调 hvac_action、input_datetime.timestamp 等触发判据在属性里。
+     * attr = 读单个属性；attrs = 读完整 attributes 对象。 */
+    ctx.ha.attr = async (eid, key, fallback = null) => {
       const s = await readState(eid);
       if (!s || !s.attributes) return fallback;
-      const v = s.attributes[String(attr)];
+      const v = s.attributes[String(key)];
       return v === undefined || v === null ? fallback : v;
+    };
+    ctx.ha.attrs = async (eid, fallback = null) => {
+      const s = await readState(eid);
+      if (!s || !s.attributes) return fallback;
+      return s.attributes;
     };
 
     /* 防重入：默认单锁；传 key 可开多把独立锁。上一次未结束则直接返回 false */
@@ -358,10 +409,10 @@ function createCore({ emit }) {
       try { await fn(); return true; } finally { locks.delete(key); }
     };
 
-    /* 批量订阅实体变化（转发 onStateChange，签名一致） */
+    /* 批量订阅实体变化（转发 ctx.ha.change，签名一致） */
     ctx.watch = (entityIds, cb) => {
       const list = Array.isArray(entityIds) ? entityIds : [entityIds];
-      for (const eid of list) if (eid) ctx.ha.onStateChange(eid, cb);
+      for (const eid of list) if (eid) ctx.ha.change(eid, cb);
     };
     /* ctx.watch.task(scriptId, cb)：订阅另一个脚本的运行状态（软通知，业务侧自行兜底重启抖动）。
      * 回调签名 (state, info)，info = { scriptId, version, mode, reason }；
@@ -430,6 +481,114 @@ function createCore({ emit }) {
       }, period);
       timers.set(id, t);
       return id;
+    };
+
+    /* ctx.hold：通用「持续 N 秒确认」容器（ref-like 句柄）。
+     * 数据流：raw（脚本写入的最新值）→ condition 投影 → signal → 持续 ms 翻转确认 → stable（value 读出）。
+     * raw 只由脚本赋值：a.value = x。实体变化由脚本自己 ctx.watch 订阅并在回调里算好值写进来；
+     *   condition 需要读 HA 也可在投影函数里自行 await ctx.ha.xxx —— 框架不内置任何实体监听。
+     * 读写同属性不同义：写=设 raw 目标，读=持续确认后的 stable（写后不满 ms 读到旧值）。
+     * 内部状态纯闭包内存，不碰 global/local：影子写隔离、读不隔离，写后读回会读空。
+     * 翻转即重置计时（mode:restart）、到点回调重新跑 condition 复核，杜绝「先查一次+到点再查」。 */
+    ctx.hold = (msOrOpts, opts) => {
+      const conf = (msOrOpts && typeof msOrOpts === 'object' && !Array.isArray(msOrOpts))
+        ? msOrOpts : { ...(opts || {}), ms: msOrOpts };
+      if (!conf || typeof conf !== 'object') throw new Error('ctx.hold 需要配置对象或时长(ms)');
+      const ms = Math.max(0, Number(conf.ms) || 0);
+      if (ms <= 0) throw new Error('ctx.hold 的持续时长 ms 必须大于 0');
+      const initial = conf.initial === undefined ? false : conf.initial;
+      /* 投影回调：优先 condition；兼容中文「条件」与旧名 read（仅内部兼容，文档只写 condition） */
+      const condition = typeof conf.condition === 'function' ? conf.condition
+        : (typeof conf['条件'] === 'function' ? conf['条件']
+          : (typeof conf.read === 'function' ? conf.read : null));
+      const nodeId = conf.nodeId;
+      const label = conf.label ? `[hold·${conf.label}] ` : '[hold] ';
+      const log = (message, level = 'info') =>
+        emit({ type: 'log', level, message: label + message, nodeId });
+
+      let raw = initial;
+      let signal = initial;
+      let stable = initial;
+      let since = 0;      // 当前 signal 开始持续的起点；0 = 未计时
+      let timer = null;   // ctx.after 句柄（受 timers 注册表管理，stop 统一清理）
+      let seq = 0;        // 重评序号：异步 condition 期间被新一次重评抢占则放弃旧结果
+      let dead = false;
+      const watchers = new Set();
+
+      async function reevaluate(trigger) {
+        if (dead || ctxRuntime.stopped) return;
+        const my = ++seq;
+        /* 1) 投影 signal（condition 可同步可 async，可自行 await ctx.ha 读实体；
+         *    抛错则保守跳过，不推进计时）。raw 就是脚本最后一次写入的值。 */
+        let next = raw;
+        if (condition) {
+          try { next = await evalRealm(condition, [raw]); }
+          catch (e) { log(`condition 异常，本轮跳过：${e && e.message || e}`, 'error'); return; }
+        }
+        if (my !== seq || dead || ctxRuntime.stopped) return;
+        /* 2) signal 翻转 → 重置计时、重新排到点复核 */
+        if (next !== signal) {
+          signal = next;
+          since = Date.now();
+          if (timer) { ctx.cancel(timer); timer = null; }
+          timer = ctx.after(ms, () => { timer = null; reevaluate('timer'); });
+          log(`signal → ${String(signal)}，计时重置 ${ms}ms（${trigger}）`);
+          return;
+        }
+        /* 3) signal 未变且已连续满 ms → 确认稳定值翻转，通知 watcher */
+        if (since > 0 && Date.now() - since >= ms) {
+          since = 0;
+          if (timer) { ctx.cancel(timer); timer = null; }
+          if (stable !== signal) {
+            const prev = stable;
+            stable = signal;
+            log(`稳定值 ${String(prev)} → ${String(stable)}（连续满 ${ms}ms，${trigger}）`);
+            for (const cb of [...watchers]) {
+              evalRealm(cb, [stable, prev]).catch((e) =>
+                log(`watcher 异常：${e && e.message || e}`, 'error'));
+            }
+          }
+          return;
+        }
+        /* 4) 计时中但句柄丢失（如被 cancel 内部清过）：按剩余时间补排，保证到点复核 */
+        if (since > 0 && !timer) {
+          timer = ctx.after(Math.max(0, ms - (Date.now() - since)), () => { timer = null; reevaluate('resume'); });
+        }
+      }
+
+      const handle = {
+        get value() { return stable; },
+        set value(nv) {
+          if (dead) return;
+          raw = nv;
+          reevaluate('assign');
+        },
+        watch(cb) {
+          if (typeof cb !== 'function') throw new Error('hold.watch 需要回调函数');
+          watchers.add(cb);
+          let active = true;
+          return () => { if (!active) return false; active = false; return watchers.delete(cb); };
+        },
+        cancel() {
+          if (dead) return false;
+          dead = true;
+          seq++;
+          if (timer) { ctx.cancel(timer); timer = null; }
+          watchers.clear();
+          return true;
+        },
+        state() {
+          return {
+            raw, signal, stable,
+            since,
+            active: since > 0,
+            remaining: since > 0 ? Math.max(0, ms - (Date.now() - since)) : 0,
+            ms, dead,
+          };
+        },
+      };
+      reevaluate('init'); // 首次投影：让初始实体值/condition 立即进入判定
+      return handle;
     };
 
     /* 常驻模式锚点：脚本结尾 await ctx.keepAlive() 让顶层协程永不 resolve，

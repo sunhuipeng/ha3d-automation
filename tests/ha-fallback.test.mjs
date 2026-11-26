@@ -56,11 +56,11 @@ ctx.actions({
   ping: () => ctx.ha.callService('light', 'turn_on', { entity_id: 'light.a' }),
 });
 ctx.log('info', 'test setup start');
-const a = await ctx.ha.getState('light.a');
-const b = await ctx.ha.getState('light.b');
+const a = await ctx.ha.entity('light.a');
+const b = await ctx.ha.entity('light.b');
 ctx.log('info', 'read a=' + JSON.stringify(a) + ' b=' + JSON.stringify(b));
-ctx.ha.onStateChange('light.a', () => {});
-ctx.ha.onStateChange('light.b', () => {});
+ctx.ha.change('light.a', () => {});
+ctx.ha.change('light.b', () => {});
 await new Promise(() => {});
 `;
 

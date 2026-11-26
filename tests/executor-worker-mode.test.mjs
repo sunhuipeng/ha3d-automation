@@ -46,7 +46,7 @@ function waitDone(sid, timeoutMs = 8000) {
 test('worker 模式：短脚本完整走通生命周期并正确落日志', async () => {
   const rec = store.submit('wkr-short', {
     name: 'worker 短脚本', script: `
-      const s = await ctx.ha.getState('sensor.temp');
+      const s = await ctx.ha.entity('sensor.temp');
       ctx.log('info', 'read=' + (s && s.state));
       const w = await ctx.local.set('run.count', 1);
       ctx.log('info', 'LOCAL:' + JSON.stringify(await ctx.local.get('run.count')));
