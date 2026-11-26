@@ -335,6 +335,18 @@ html[data-theme="dark"] .side-row.change > .scode:last-of-type .chg { background
 .mode-note { font-size: 12px; padding: 7px 11px; border-radius: 6px; margin-bottom: 12px; }
 .mode-note.shadow { background: var(--code-bg); color: var(--muted); border: 1px solid var(--line); }
 .mode-note.live { background: var(--err-bg); color: var(--err-fg); border: 1px solid var(--err-fg); }
+/* 仿真提示条：与影子区分开（虚线 + 强调色），避免和"真实影子运行"混淆 */
+.mode-note.sim { background: var(--code-bg); color: var(--accent); border: 1px dashed var(--accent); }
+.mode-note.sim code { font-family: 'SF Mono', Menlo, monospace; font-size: 11px; }
+/* 验证方式切换按钮：不抢主操作（启动/停止）的视觉权重 */
+.mode-switch-btn { padding: 7px 11px; background: var(--surface2); border: 1px dashed var(--accent); color: var(--accent); border-radius: 6px; font-weight: 600; font-size: 12px; }
+.mode-switch-btn:hover { background: var(--code-bg); }
+.mode-switch-btn:disabled { opacity: .55; cursor: progress; }
+/* 仿真徽标：与影子运行徽标区分（虚线强调），提示"世界是虚拟的" */
+.badge.sim-run { background: var(--code-bg); color: var(--accent); border: 1px dashed var(--accent); box-shadow: none; }
+.vb-tag.sim { background: var(--code-bg); color: var(--accent); border: 1px dashed var(--accent); }
+.panel-title .log-src { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 500; }
+.panel-title .log-src.sim { background: var(--code-bg); color: var(--accent); border: 1px dashed var(--accent); }
 .primary { padding: 8px 14px; background: var(--accent); border: none; color: #fff; border-radius: 6px; }
 .danger { padding: 8px 14px; background: var(--red); border: none; color: #fff; border-radius: 6px; }
 .flow-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }

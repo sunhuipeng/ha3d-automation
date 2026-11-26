@@ -183,6 +183,21 @@ module.exports = function scriptRoutes() {
     res.json({ ok, running: executor.isRunning(req.params.id), runningVersions: executor.runningVersions(req.params.id) });
   });
 
+  /* 切换影子验证方式（follow / simulate）：内部「暂停 → 等真正退出 → 按目标模式启动」，
+   * 不做热切换；正式实例是另一个槽位、完全不受影响。前端切换按钮走这里，
+   * MCP 侧对应 automation_switch_verify_mode。startAt/seed 仅 simulate 生效。 */
+  r.post('/script/:id/verify-mode', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const mode = body.mode === 'simulate' ? 'simulate' : 'follow';
+      const result = await executor.switchVerifyMode(req.params.id, mode, {
+        startAt: body.startAt, seed: body.seed,
+      });
+      executor.broadcastRefresh(['scripts', 'script'], { scriptId: req.params.id });
+      res.json({ ok: true, ...result });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+  });
+
   /* 发布影子版本为正式版本：{ version?, autoSwitch? }；省略版本则取当前影子。
    * 运行中是另一个版本时默认自动切换实例（停旧启新，失败回退）；autoSwitch=false 则严格报错。
    * 若发布的正是运行中的影子版本，则同版本热切为真实下发。 */
@@ -229,8 +244,12 @@ module.exports = function scriptRoutes() {
 
   r.get('/script/:id/logs', (req, res) => {
     const v = req.query.version ? Number(req.query.version) : (store.listVersions(req.params.id).slice(-1)[0]);
-    /* 默认只返回最近 100 行，避免打开面板时全量拉取；可用 ?limit= 覆盖 */
-    res.json({ scriptId: req.params.id, version: v || null, logs: store.readLogs(req.params.id, v, Number(req.query.limit) || 100) });
+    /* 默认只返回最近 100 行，避免打开面板时全量拉取；可用 ?limit= 覆盖。
+     * source=sim 读仿真独立日志（v<n>.sim.log），前端在仿真实例运行时自动切换。 */
+    const source = req.query.source === 'sim' ? 'sim' : 'real';
+    const limit = Number(req.query.limit) || 100;
+    const logs = source === 'sim' ? store.readSimLogs(req.params.id, v, limit) : store.readLogs(req.params.id, v, limit);
+    res.json({ scriptId: req.params.id, version: v || null, source, logs });
   });
 
   /* 全局运行拓扑：只汇总正式通道；前端全局视图手动拉取，不定时刷新 */

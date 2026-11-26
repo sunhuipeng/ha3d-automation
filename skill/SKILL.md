@@ -1,6 +1,6 @@
 ---
 name: ha3d-automation
-description: 在 ha3d-automation（HA 自动化托管平台，端口 8100）中开发新的自动化脚本。流程：① 前置环境检查 + 同步本地脚本缓存 → ② 需求合理性检查（与已有脚本比对冲突 / 重复 / 可合并，按需求性质判定扩展 / 合并 / 新建并给出依据）→ ③ 对话内需求流程图共创：读需求、实体集合、当前脚本或 flow.json，多轮在对话中画内联流程图并确认，未确认不写码 → ④ 按已确认流程图写脚本，再从 script.js 反推版本 flow.json（触发 / 条件 / 延时 / 动作 / 播报，不逐行也不笼统）→ ⑤ 提交影子版本（flow 与脚本 nodeId 交叉校验）→ ⑥ 影子验证（写操作只记不下发）→ ⑦ 用户确认后发布正式版并重启验证。**发布正式版（真实控制设备）必须先经用户确认。** 触发词：开发脚本、写自动化脚本、新增脚本、新脚本、自动化脚本、迁移 HA 自动化、脚本冲突检查、脚本合并、该新建还是扩展、画流程图、确认流程图、需求流程图、ha3d-automation 脚本、8100 脚本、倒计时脚本、联动脚本、定时脚本、提交脚本、发布脚本、持续N秒、状态持续、重置计时、滑动窗口、影子验证、同步脚本缓存、ctx.hold、持续确认容器、状态机封装。
+description: 在 ha3d-automation（HA 自动化托管平台，端口 8100）中开发新的自动化脚本。流程：① 前置环境检查 + 同步本地脚本缓存 → ② 需求合理性检查（与已有脚本比对冲突 / 重复 / 可合并，按需求性质判定扩展 / 合并 / 新建并给出依据）→ ③ 对话内需求流程图共创：读需求、实体集合、当前脚本或 flow.json，多轮在对话中画内联流程图并确认，未确认不写码 → ④ 按已确认流程图写脚本，再从 script.js 反推版本 flow.json（触发 / 条件 / 延时 / 动作 / 播报，不逐行也不笼统）→ ⑤ 提交影子版本（flow 与脚本 nodeId 交叉校验）→ ⑥ 影子验证两段固定节点：先进入仿真（simulate）跑一轮断言，再切回影子模式（follow）并启动影子版本真跑观察（写操作只记不下发）→ ⑦ 用户确认后发布正式版并重启验证。**发布正式版（真实控制设备）必须先经用户确认。** 触发词：开发脚本、写自动化脚本、新增脚本、新脚本、自动化脚本、迁移 HA 自动化、脚本冲突检查、脚本合并、该新建还是扩展、画流程图、确认流程图、需求流程图、ha3d-automation 脚本、8100 脚本、倒计时脚本、联动脚本、定时脚本、提交脚本、发布脚本、持续N秒、状态持续、重置计时、滑动窗口、影子验证、影子模式、仿真收尾、切回影子模式、同步脚本缓存、ctx.hold、持续确认容器、状态机封装、仿真验证、跑仿真、进入仿真、切仿真、simulate、验证方式、虚拟时钟、快进时间、注入实体、写意图断言、sim_run_steps、sim_inject、sim_advance、sim_snapshot、导出回归用例、fixture 重放、时间旅行、sim_rewind、复制影子版本、可复用脚本、用例回归、沉淀用例。
 agent_created: true
 ---
 
@@ -8,7 +8,7 @@ agent_created: true
 
 本 skill 指导 AI 在 ha3d-automation 平台（`http://localhost:8100`，项目目录 `D:\Workbuddy\home\ha3d-automation`）上开发新的自动化脚本，从需求到正式上线一条路走通。
 
-**资料分工**：本文件是流程与硬规则的唯一现行版本；ctx 接口完整参考见 `references/ctx-api.md`；版本文件（script.js / flow.json / meta.json）规范见 `references/file-specs.md`；MCP 工具完整清单见 `references/mcp-tools.md`；脚本骨架模板见 `templates/script-template.js`。规范细节以 references 为准，本文件冲突时以 references 为准。
+**资料分工**：本文件是流程与硬规则的唯一现行版本；ctx 接口完整参考见 `references/ctx-api.md`；版本文件（script.js / flow.json / meta.json）规范见 `references/file-specs.md`；MCP 工具完整清单见 `references/mcp-tools.md`；**仿真（simulate）的完整用法、断言 DSL、踩坑清单见 `references/simulation.md`**；脚本骨架模板见 `templates/script-template.js`；**可复用脚本与仿真用例库存放在 `.scripts/` 与 `.fixtures/`（见下节）**。规范细节以 references 为准，本文件冲突时以 references 为准。
 
 ---
 
@@ -46,6 +46,43 @@ node skill/tools/sync-cache.cjs --force   # 忽略缓存全量重拉
 | 读缓存发现版本旧、或用户说"我刚改过" | 以服务端为准，先同步再读 |
 
 **使用约定**：读脚本、看流程、做冲突分析**一律先读缓存**（快、可 grep）；需要权威运行态（status / desired-running / 日志）时再查 API。**缓存是只读镜像，绝不手改缓存文件当交付物**，改脚本要改自己的源文件再提交。
+
+---
+
+## 可复用资产（skill/.scripts、skill/.fixtures）— 下次别从零写
+
+两个**本地资产目录**（不进 Git；`scripts/pack-skill.cjs` 当前把它们列进 `SKIP_NAMES`，不打进 `skill.zip`，要带走请手动 `cp -r`）：
+
+| 目录 | 放什么 | 怎么用 |
+|---|---|---|
+| `skill/.scripts/<name>/` | 已验证的脚本实现：`script.js` + 可选 `flow.json` + `note.md`（用途 / 出处 `scriptId vN` / 依赖实体 / 可调参数） | `cp -r` 出去改实体与参数；**不要直接改库里的文件当交付物** |
+| `skill/.fixtures/<scriptId>/<用例>.json` | 可直接执行的仿真用例 DSL：`startAt` + `seed` + `steps`，可选 `expected.writes` | `case.cjs run` 一键回归；`case.cjs push --run-fixture` 走服务端重放 |
+
+**开工前先看这两处**（比翻 `.cache` 里十几个业务脚本快得多）：
+
+```bash
+cat skill/.scripts/README.md            # 索引：有哪些可复用实现
+node skill/tools/case.cjs list          # 索引：目标脚本已有哪些用例
+grep -rl "ctx.hold" skill/.scripts      # 按判据形态找实现
+```
+
+**做完要沉淀**（否则库会空转）：
+
+- 写出跑通的判据/结构 → 复制进 `.scripts/<name>/`、补 `note.md`、更新 `.scripts/README.md` 索引表；
+- 仿真跑通一个场景 → `node skill/tools/case.cjs save <scriptId> <用例名>` 归档进 `.fixtures`，补 `note`、更新 `.fixtures/README.md` 索引表；
+- 收录门槛：**验证通过 + 真被复用至少一次**；半成品、一次性业务脚本（留在 `.cache`）不收。
+
+用例命令速查：
+
+```bash
+node skill/tools/case.cjs list                                  # 全部用例
+node skill/tools/case.cjs run  <scriptId>/<name> [--continue] [--fail-fast]
+node skill/tools/case.cjs push <scriptId>/<name> --run-fixture   # 服务端重放（同一目录，不复制）
+node skill/tools/case.cjs save <scriptId> <name>                 # sim_export → 直接写进 .fixtures
+node skill/tools/case.cjs finish <scriptId>                      # 仿真收尾：切回 follow 并确认影子在跑
+```
+
+`case.cjs run` 默认**重建虚拟世界**（`startAt`/`seed` 生效），跑完打印每条断言与终态写意图；用例带 `expected.writes` 时会追加一次 `since:0` 的全序列写意图断言（steps 里的 assert 已消耗游标，所以单独验）。
 
 ---
 
@@ -194,7 +231,7 @@ grep -rn "nowSod\|ctx.after" skill/.cache --include=script.js | head -20   # 时
 
 ## 第 3 步：写脚本 + 从脚本反推版本 flow.json（硬规则，违反任一条 = 无法正常运行）
 
-从 `templates/script-template.js` 骨架起手，遵守全部硬规则：
+从 `templates/script-template.js` 骨架起手（若 `.scripts/` 里有形态相近的已验证实现，先 `cp -r` 出来改实体与参数，别从零写），遵守全部硬规则：
 
 1. **写操作一律走 `ctx.write(op, desc, nodeId, ...args)`**，HA 调用只出现在 `ctx.actions({...})` 注册的函数体内。绝不裸调 `ctx.ha.callService` 做业务写。
 2. **长驻脚本末尾 `await ctx.keepAlive()`**（常驻锚点，顶层永不结束，实例不被清理）；短任务脚本自然结束。
@@ -291,29 +328,131 @@ node skill/tools/submit.cjs <scriptId> "<脚本名>" <脚本源文件路径> <fl
 - flow 文件是**必填**：只做链路联通测试时可显式加 `--placeholder`（写入通用三节点模板，正式交付前必须换真图）；
 - 提交成功后立即 `node skill/tools/sync-cache.cjs --force`，让缓存对齐新内容（影子内容会变，缓存靠 sha256 比对，不要只看版本号）。
 
-## 第 5 步：影子验证（验收门禁）
+**提交完不要先 `start` 观察**：影子版本到手后，固定顺序是「5.1 进仿真跑一轮断言 → 5.2 切回 follow → 5.3 影子真跑」。先 follow 再仿真等于多停一次实例，也容易漏掉仿真这段。
+
+## 第 5 步：影子验证（验收门禁）— 先仿真，再影子真跑
+
+影子通道固定，但验证是**两段固定节点**，顺序不能省、也不能只做前一段：
+
+```
+第 4 步 提交影子版本
+   ↓
+5.1 进入仿真（simulate）   虚拟实体 + 虚拟时钟，秒级跑完一轮，断言流程/时序/写意图
+   ↓  仿真通过 ≠ 可以上线；仿真也不是流程终点
+5.2 切回影子模式（follow） 一条命令停仿真 + 以 follow 重启同一个影子版本（收尾固定动作）
+   ↓
+5.3 影子真跑（follow）     真实基线、真实触发、真实时序，写只拦截不下发 —— 真正的验收门禁
+   ↓  两段都通过 + 用户确认
+第 6 步 发布正式版
+```
+
+为什么两段都得走：仿真用的是虚拟实体，**不模拟设备不响应、失败、延迟**，它只证明「流程走得到、判据算得对、写序列不错」；`follow` 才证明「真实实体读得对、真实触发真的会来」。只跑仿真就发布 = 拿模拟器结论给线上背书。
+
+| 方式 | 阶段职责 | 能验证什么 |
+|---|---|---|
+| `simulate`（仿真） | 第一段：分支覆盖与时序回归，可重复、秒级 | 流程 / 时序（虚拟时钟）/ 写意图；**不模拟设备不响应、失败、延迟** |
+| `follow`（影子模式） | 第二段：真实环境验收 | 真实实体值 + 真实触发 + 真实回调时序；慢，需要人配合造条件 |
+
+三条边界（硬规则）：
+- 仿真**不造假失败**。要看"设备没响应脚本怎么办"，在 `follow` 下用真实设备跑——这类异常分支只在那里能验。
+- 仿真只覆盖本脚本，不联动其他脚本；依赖脚本状态用 `inject_task` 造。
+- **仿真通过 ≠ 线上可用**：`publish` 前必须在 `follow` 下用真实设备跑一轮（5.3），不接受"仿真全绿就直接发布"。
+
+### 5.1 进入仿真（simulate）— 第一段：流程 / 时序 / 写意图
+
+前置：目标脚本必须有**影子版本**（正式版内容不可变）。正式版要验证就先复制：`automation_submit_script` 带 `newVersion:true` + `channel:'shadow'`，源码/flow/icon/kind 原样带上，复制后校验 `script.js` sha 与原版一致。
 
 ```bash
-# 常驻自动化（kind=automation）：start 起影子实例观察
-node skill/tools/mcp-call.cjs automation_start_script '{"scriptId":"<id>","version":<n>,"confirmed":true}'
+# ① 切仿真 + 种子（用真实 entity_id，状态枚举照抄；时间型脚本把 startAt 落在业务窗口边界）
+node skill/tools/mcp-call.cjs automation_switch_verify_mode '{
+  "scriptId":"<id>","mode":"simulate","startAt":"2026-11-26T20:50:00+08:00",
+  "seed":{"entities":{"sensor.p":{"state":"0"}},"context":{"global":{},"local":{}}},
+  "confirmed":true}'
+
+# ② 看启动瞬间：写意图（硬证据）+ 日志 + 此刻在等什么
+node skill/tools/mcp-call.cjs automation_sim_snapshot '{"scriptId":"<id>","include":["writes","logs","execution"],"confirmed":true}'
+
+# ③ 先跑已有可复用用例（有的话）：重建世界 + 逐步断言 + 全序列写意图校验
+node skill/tools/case.cjs list
+node skill/tools/case.cjs run <scriptId>/<用例名>
+
+# ③' 新写/临时用例：放 skill/.fixtures/<scriptId>/<name>.json 后同样 run；也可直接喂 MCP
+node skill/tools/mcp-call.cjs automation_sim_run_steps "$(cat case.json)"
+
+# ④ 跑通后归档成资产（sim_export → skill/.fixtures），或推给服务端重放
+node skill/tools/case.cjs save <scriptId> <用例名>
+node skill/tools/case.cjs push <scriptId>/<用例名> --run-fixture
+
+# 收尾 → 直接进 5.2（不是 sim_close）：切回 follow 并确认影子在跑
+node skill/tools/case.cjs finish <scriptId>
+```
+
+验证清单：
+
+- [ ] 断言 `ok=true`，`passed/total` 全通过（失败点看 `checks[].expected` 与 `actual`）；
+- [ ] 写意图时间点与判据边界吻合（如 2999ms 不写、3000ms 写），终态上下文符合预期；
+- [ ] 无 `脚本异常` error 日志（仿真崩溃现场保留在 `data/runtime/<id>/v<n>.sim.crash.json`，只读）；
+- [ ] 用例已归档到 `skill/.fixtures/<id>/<用例名>.json`（`case.cjs save`），`case.cjs run` 全绿；推服务端重放时 `versionDrift=false` 且写意图序列一致。
+
+**断言速记**：`ctx.write` 一次产生**两条**写意图（`service` + `write`），`ctx.global.set` 也会产生 `kind:'context', op:'contextSet'` —— 断言序列别漏；`writes` 是「自上次断言以来新增 + 全序列等长逐条部分匹配」；`expect` 是路径 DSL（`writes[0].op`、`context.global["x.y"]`、算子 `eq/gte/includes/exists/type`，可 `all/any/not`）。`sim_run_steps` 默认重建世界，`continue:true` 才续跑且与 `startAt/seed` 互斥。其余坑（Date 桥接、fixture 缺 advance、entities 默认只含用过的）见 `references/simulation.md` §7。
+
+### 5.2 切回影子模式（follow）— 仿真的收尾，固定动作
+
+仿真跑完**不要停在 simulate**：`publish` 前必须让同一个影子版本回到真实环境跑一轮，所以切回 follow 是流程节点，不是可选清理。
+
+```bash
+# 一条命令：停仿真实例 → 以 follow 重启同一影子版本 → 查状态兜底启动 → 打印最近日志
+node skill/tools/case.cjs finish <scriptId>
+```
+
+等价的底层两步（`finish` 内部就是它们 + 校验）：
+
+```bash
+node skill/tools/mcp-call.cjs automation_switch_verify_mode '{"scriptId":"<id>","mode":"follow","confirmed":true}'
+node skill/tools/mcp-call.cjs automation_get_script_status '{"scriptId":"<id>"}'
+```
+
+校验清单：
+
+- [ ] 切换返回 `to:"follow"`、`version` = 影子版本号（不是正式版号），`idempotent:true` 表示本来就在 follow；
+- [ ] `runningVersions` 里存在 `mode:"shadow"` **且** `verifyMode:"follow"` 的实例 —— 只是"切了模式"但没在跑，等于没验；
+- [ ] `status=running`，版本日志开头有 `runner 启动 vN｜模式=影子`、基线拉取（`写入全局 …｜启动基线`），没有 error；
+- [ ] 此后的写操作只出现 `[影子·拦截写操作]`，**绝无** `[真实写操作]`；
+- [ ] 仿真日志 `v<n>.sim.log` 停止增长，之后看的都是真实日志（`GET /logs?source=sim` 是仿真专用）。
+
+三条硬规则：
+
+- **不要用 `sim_close` 收尾**：它只销毁虚拟世界并停实例，不会回 follow，验证链会断在这里。它只适合"这批用例不打算继续验了、先收摊"。
+- **切回 follow 后不要 stop 影子**：影子必须一直 running 才能观察真实触发；停掉就等于跳过 5.3 这道门禁。
+- 虚拟世界随 worker 退出自动销毁、不持久化；要复现靠 `skill/.fixtures` 里的用例，不靠"留着仿真会话"。
+
+### 5.3 影子真跑（follow）— 验收门禁
+
+```bash
+# 常驻自动化（kind=automation）：跑起来后观察（5.2 已启动，这里只在被外部停过时补）
+node skill/tools/mcp-call.cjs automation_start_script '{"scriptId":"<id>","version":<影子版本号>,"confirmed":true}'
 # 一次性动作/场景（kind=script/scene）：按次触发影子版（跑完自动清理，写不下发）
 node skill/tools/mcp-call.cjs automation_trigger_script '{"scriptId":"<id>","channel":"shadow","confirmed":true}'
 node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"<id>","mode":"shadow"}'
 ```
 
-验证清单：
+- 常驻自动化：`start` 后**保持运行**，请用户在 HA 侧造真实触发条件，隔一段时间回来看日志；
+- 一次性动作/场景：`trigger` 一次跑完即退，可以反复触发；
+- 补 start 时**必须点名影子版本号**：不传 `version` 会取最高版本，正式版号更高时会误启正式实例。
 
-- [ ] 启动日志出现基线拉取与模式信息（`模式=影子`）；
+验证清单（全部满足才算通过）：
+
+- [ ] 启动日志出现 `runner 启动 vN｜模式=影子` 与基线拉取（不是仿真种子值）；
 - [ ] 写操作只出现 `[影子·拦截写操作]`，**绝无** `[真实写操作]`；
-- [ ] 触发 → 判据 → 动作链路完整走通（可请用户在 HA 侧制造触发条件）；
+- [ ] 触发 → 判据 → 动作链路完整走通（真实实体值符合预期，不是仿真种子）；
 - [ ] 反复触发不产生重复下发（lock / expected 生效）；
 - [ ] 无 `脚本异常` error 日志。
 
-不满足则修改脚本源码 → 重新提交（**原地覆盖当前影子**，版本号不变）→ 重复第 3~5 步。影子阶段随便改，不消耗版本号。
+不满足则修改脚本源码 → 重新提交（**原地覆盖当前影子**，版本号不变）→ **从 5.1 重跑仿真，再 5.2 切回、5.3 重验**。影子阶段随便改，不消耗版本号。
 
 ## 第 6 步：发布正式版（**必须先经用户确认**）
 
-影子验证全部通过后，向用户展示影子日志摘要，**明确确认后**才执行：
+前置：**5.1 仿真全绿 + 5.3 影子真跑通过**，且此刻影子实例已切回 `follow` 并在运行（`case.cjs finish` 的结果）。只有仿真结果、或影子停在 simulate，都不算通过。向用户展示仿真断言摘要 + 影子真实日志摘要，**明确确认后**才执行：
 
 ```bash
 node skill/tools/mcp-call.cjs automation_publish_script '{"scriptId":"<id>","version":<n>,"confirmed":true}'
@@ -328,7 +467,7 @@ node skill/tools/sync-cache.cjs --force
 
 ## 第 7 步：收尾汇报
 
-汇报内容：**决策三句话（选了什么 / 为什么不是另外两个 / 代价与风险）与比对过的脚本清单**、**第 2 步确认过的需求流程图最终版（节点 / 边 / 参数表）及确认轮次**、scriptId 与最终版本号、三要素落地方式、版本 flow 与脚本 nodeId 对应关系、影子验证关键日志、正式版运行状态、依赖实体清单（查单脚本运行拓扑 `GET /api/script/:id/topology`，脚本跑过后才有数据）、注意事项（如断线行为）。
+汇报内容：**决策三句话（选了什么 / 为什么不是另外两个 / 代价与风险）与比对过的脚本清单**、**第 2 步确认过的需求流程图最终版（节点 / 边 / 参数表）及确认轮次**、scriptId 与最终版本号、三要素落地方式、版本 flow 与脚本 nodeId 对应关系、验证结果（`simulate` 写清起点时刻与种子、断言通过数、写意图时间点、归档的用例名 `skill/.fixtures/<id>/<name>.json`；`follow` 写清已切回影子模式、影子版本号与运行状态、关键真实日志）、正式版运行状态、依赖实体清单（查单脚本运行拓扑 `GET /api/script/:id/topology`，脚本跑过后才有数据）、注意事项（如断线行为）。
 
 ---
 
@@ -349,9 +488,10 @@ node skill/tools/sync-cache.cjs --force
 ### 验证链（验证影子/正式效果时组合使用）
 
 1. `automation_list_scripts`：摸清每个脚本的通道（正式 vN / 影子 vN）与运行实例，**提交前必看**（也是 1.3 决策的依据）；
-2. `automation_get_logs {"scriptId":"<id>","mode":"shadow"|"production"}`：按通道读日志（scriptId 必填），别猜版本号；
+2. `automation_get_logs {"scriptId":"<id>","mode":"shadow"|"production"}`：按通道读日志（scriptId 必填），别猜版本号；**仿真实例的日志是独立文件**（`v<n>.sim.log`，时间列是虚拟时刻），用 `automation_sim_snapshot` 的 `logs` 或 `GET /api/script/:id/logs?source=sim` 读，别拿真实日志判断仿真结果；
 3. `automation_select_script` + `automation_refresh_panel`：把你正在验证的脚本带到用户面前；
-4. `automation_get_script_status`：确认运行实例、暂停原因、HA 连接状态。
+4. `automation_get_script_status`：确认运行实例、暂停原因、HA 连接状态；`runningVersions[].verifyMode` 区分该影子实例是 `follow` 还是 `simulate`；
+5. **仿真收尾**：`switch_verify_mode {"mode":"follow"}`（或 `case.cjs finish <id>`）→ 再查一次状态，确认 `mode:"shadow"` + `verifyMode:"follow"` + `status:"running"` 三者同时成立，然后才去 5.3 造真实触发；停在 simulate 或切了模式但实例没起来，都算没验完。
 
 ### 其他灵活运用的要点
 
@@ -367,4 +507,7 @@ node skill/tools/sync-cache.cjs --force
 - Bash 会话 cwd 固定在 `D:\Workbuddy\home`，`cd` 前缀可能被剥离，用子 shell `(cd ha3d-automation && <cmd>)` 最稳。
 - 测试跑法：`(cd ha3d-automation && npm test)`（node:test，测试位于顶层 `tests/`）。
 - 改动服务端代码（runner/executor/store）不在本 skill 范围；只做脚本开发时**不要重启服务**（会按运行意图清单恢复，但正在验证的影子实例会重跑）。
+- 可复用资产在 `skill/.scripts/`（脚本实现）与 `skill/.fixtures/`（仿真用例）——**用例目录同时是服务端 `sim_export` / `sim_run_fixture` 的读写目录**，不再有 `data/fixtures`；已 `.gitignore`，`pack:skill` 也跳过；**只增不删**，删之前先确认没有脚本在用例里引用。
+- 崩溃现场 `data/runtime/<id>/v<n>.sim.crash.json`（只读）是运行数据：别清理、别手改成"通过"。
+- **仿真是临时状态**：影子实例的常态是 `follow`。`simulate` 只在 5.1 存在，跑完必须 `case.cjs finish` 切回 follow 并保持运行；服务重启后仿真实例也会恢复成 follow（虚拟世界不持久化，别指望"留着会话"复现，复现靠 `.fixtures` 用例）。
 - `skill/.cache/` 是运行时缓存，已加入 `.gitignore`，不要提交。

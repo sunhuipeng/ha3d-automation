@@ -16,8 +16,18 @@ export const useScriptStore = defineStore('scripts', {
     productionVersion: null,
     runningVersions: [], // 实例真正在跑的列表 [{version, mode}]：正式与影子可各有一个（运行态唯一真相源）
     logs: [],
+    logsSource: 'real',  // 'real' = v<n>.log；'sim' = v<n>.sim.log（仿真实例运行时）
     nodeStates: {},      // nodeId -> state（运行时投影，不写回 flow.json）
   }),
+  getters: {
+    /* 当前打开版本实例的验证方式：'follow' | 'simulate'，无实例为 null。
+     * runningVersions 仍是唯一真相源，verifyMode 只是实例上的一个属性。 */
+    currentVerifyMode(state) {
+      if (!state.current) return null;
+      const row = state.runningVersions.find((x) => x.version === state.current.version);
+      return row ? (row.verifyMode || 'follow') : null;
+    },
+  },
   actions: {
     async load() {
       this.list = await fetch('/api/scripts').then((r) => r.json());
@@ -31,12 +41,14 @@ export const useScriptStore = defineStore('scripts', {
       /* 用详情的运行态真相回填左侧列表徽标，防止列表残留旧状态。
        * 必须用 scriptStatus（脚本级口径）：status 是版本级（当前打开版本的徽章），
        * 影子版本 stopped 会把脚本级 error 遮蔽掉。 */
+      /* 先回填 runningVersions，后续选日志源（real/sim）依赖它 */
+      this.runningVersions = this.current.runningVersions || [];
       const item = this.list.find((x) => x.id === id);
       if (item) {
         item.status = this.current.scriptStatus || this.current.status || 'stopped';
         item.runningVersions = this.current.runningVersions || [];
       }
-      await Promise.all([this.loadLogs(id, this.current.version), this.loadVersions(id)]);
+      await Promise.all([this.loadLogs(id, this.current.version, 100, this.logsSourceForCurrent()), this.loadVersions(id)]);
       /* API 的 running = 该脚本任一实例在跑；这里收敛为"当前打开版本是否有实例"（与头部按钮对应） */
       this.syncRunning();
     },
@@ -48,12 +60,35 @@ export const useScriptStore = defineStore('scripts', {
       this.productionVersion = r.productionVersion;
       this.runningVersions = r.runningVersions || [];
     },
-    /* 打开脚本面板只拉最近 100 行（后端仍支持 ?limit= 覆盖）；实时日志由 WS 增量追加 */
-    async loadLogs(id, version, limit = 100) {
+    /* 打开脚本面板只拉最近 100 行（后端仍支持 ?limit= 覆盖）；实时日志由 WS 增量追加。
+     * source='sim' 读仿真独立日志（v<n>.sim.log）——仿真实例运行时不该给用户看真实日志，
+     * 否则会把虚拟世界里的行为误当成真实运行记录。 */
+    async loadLogs(id, version, limit = 100, source = 'real') {
       const q = new URLSearchParams({ limit: String(limit) });
       if (version) q.set('version', version);
+      if (source === 'sim') q.set('source', 'sim');
       const r = await fetch(`/api/script/${id}/logs?${q}`).then((x) => x.json());
       this.logs = r.logs || [];
+      this.logsSource = r.source || source;
+    },
+    /* 当前场景该读哪份日志：只有「当前打开版本的实例正在仿真」时才读 sim */
+    logsSourceForCurrent() {
+      const c = this.current;
+      if (!c) return 'real';
+      return this.currentVerifyMode === 'simulate' ? 'sim' : 'real';
+    },
+    /* 切换影子验证方式（follow ↔ simulate）：后端暂停→启动，再同步状态与日志源。
+     * 前端不做乐观更新——以服务端返回和广播为准，避免模式与实例不一致。 */
+    async switchVerifyMode(id, mode) {
+      const r = await fetch(`/api/script/${id}/verify-mode`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      }).then((x) => x.json()).then(unwrap);
+      await this.syncStatus(id);
+      if (this.current && this.current.id === id) {
+        await this.loadLogs(id, this.current.version, 100, mode === 'simulate' ? 'sim' : 'real');
+      }
+      return r;
     },
     /* 启停后同步状态：刷新列表/版本，并用详情的运行态（executor 内存合成）覆盖当前徽标（WS 事件的兜底） */
     async syncStatus(id, version) {
@@ -126,8 +161,12 @@ export const useScriptStore = defineStore('scripts', {
       if (!this.current) return;
       this.current.running = this.runningVersions.some((x) => x.version === this.current.version);
     },
-    /* 运行时日志事件：只追加，不改动 flow（展示层只读） */
+    /* 运行时日志事件：只追加，不改动 flow（展示层只读）。
+     * sim 日志与服务端广播分两条流：当前在仿真就看 sim 条目，否则只看真实日志，
+     * 避免切换瞬间两边的行混在一起。 */
     pushLog(entry) {
+      const isSim = entry.sim === true;
+      if (this.logsSource === 'sim' ? !isSim : isSim) return;
       this.logs.push(entry);
       if (this.logs.length > 500) this.logs.splice(0, this.logs.length - 500);
     },
@@ -136,16 +175,20 @@ export const useScriptStore = defineStore('scripts', {
      * current.running 只反映**当前打开版本**是否有实例——头部按钮对应版本条选中项，
      * 想停另一版本在版本条上点开它即可（避免"停止"一次停掉正式+影子两个实例）。
      * mode：服务端 status 事件附带实例通道（broadcastScript 从 running 表读）；
+     * verifyMode：实例的验证方式（follow/simulate），切换时随之更新徽章。
      * 缺席（实例已摘除的终态事件）才回退用 shadowVersion 反推。 */
-    setStatus(status, version, mode) {
+    setStatus(status, version, mode, verifyMode) {
       if (!this.current) return;
-      const live = status === 'running' || status === 'paused'; // 暂停也有实例在
+      /* 切换空窗：暂停旧实例会先广播 stopped，随后才 running。保留下发起始的 switching，
+       * 否则用户会看到「切换中 → 已停止 → 运行中」的假崩溃闪动。 */
+      if (status === 'stopped' && this.current.status === 'switching') return;
+      const live = status === 'running' || status === 'paused' || status === 'switching';
       const v = version || this.current.version;
       if (live) {
         const m = mode || ((this.shadowVersion === v) ? 'shadow' : 'production');
         const row = this.runningVersions.find((x) => x.version === v);
-        if (row) row.mode = m;
-        else this.runningVersions.push({ version: v, mode: m });
+        if (row) { row.mode = m; if (verifyMode) row.verifyMode = verifyMode; }
+        else this.runningVersions.push({ version: v, mode: m, verifyMode: verifyMode || 'follow' });
       } else {
         this.runningVersions = this.runningVersions.filter((x) => x.version !== v);
       }
@@ -158,6 +201,14 @@ export const useScriptStore = defineStore('scripts', {
       if (item) {
         if (v === this.current.version) item.status = status;
         item.runningVersions = [...this.runningVersions];
+      }
+      /* 模式切换完成（running 且带 verifyMode）：日志源跟着切，并重拉一次对应文件 */
+      if (status === 'running' && verifyMode && v === this.current.version) {
+        const want = verifyMode === 'simulate' ? 'sim' : 'real';
+        if (this.logsSource !== want) {
+          this.logsSource = want;
+          this.loadLogs(this.current.id, v, 100, want).catch(() => {});
+        }
       }
     },
   },

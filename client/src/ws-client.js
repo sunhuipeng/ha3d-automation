@@ -62,7 +62,7 @@ function onScriptEvent(msg) {
     s.pushLog(msg);
   }
   if (msg.event === 'status' && s.current && msg.scriptId === s.current.id) {
-    s.setStatus(msg.status, msg.version, msg.mode);
+    s.setStatus(msg.status, msg.version, msg.mode, msg.verifyMode);
     if (msg.status === 'running') s.nodeStates = {};
   }
   // 发布后的版本角色变化统一交给 refresh what:'versions'（executor.publish 已广播），
@@ -81,7 +81,7 @@ function onRefresh(msg) {
   }
   if (msg.what === 'versions' && s.current) s.loadVersions(s.current.id);
   if (msg.what === 'logs' && s.current) {
-    s.loadLogs(s.current.id, s.current.version);
+    s.loadLogs(s.current.id, s.current.version, 100, s.logsSourceForCurrent());
   }
   // flows：flow.json 按版本不可变、前端预览只读投影；提交变更走 what:'script' 整体重拉
   // entities：当前无实体浏览页，HA 状态经 ha 事件与 getState 按需读取，契约不再列此 what

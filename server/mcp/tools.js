@@ -408,6 +408,201 @@ function buildTools(server, ctx) {
       }
     }
   );
+
+  /* ---------------- 影子双模式验证：仿真控制（SIMULATION-DESIGN §8）----------------
+   * 不新增"仿真通道"：影子通道固定，验证方式 follow/simulate 二选一，切换走暂停→启动。
+   * 仿真只覆盖本脚本流程与逻辑，不联动其他脚本；WS 广播只发状态，不注入当真实事件。 */
+  server.tool(
+    'automation_switch_verify_mode',
+    '切换影子的验证方式：follow（跟随真实 HA/时钟，即现在的影子）或 simulate（虚拟实体/虚拟时钟/写意图）。内部走「暂停旧实例→等真正退出→以目标模式启动」，不做热切换，正式实例不受影响。startAt 为 ISO（如 2026-11-26T20:29:55+08:00），seed 为 { entities, context }。需 confirmed:true。',
+    {
+      scriptId: z.string().describe('脚本 id'),
+      mode: z.enum(['follow', 'simulate']).describe('目标验证方式'),
+      startAt: z.string().optional().describe('simulate 起始时刻 ISO（缺省当前系统时间）'),
+      seed: z.object({}).passthrough().optional().describe('simulate 种子：{ entities: { eid: { state, attributes } }, context: { global, local } }'),
+      confirmed: z.literal(true).describe('必须显式确认为 true'),
+    },
+    async ({ scriptId, mode, startAt, seed }) => {
+      const r = await executor.switchVerifyMode(scriptId, mode, { startAt, seed });
+      executor.broadcastRefresh(['scripts', 'script']);
+      return text(JSON.stringify({
+        ok: true, ...r,
+        note: r.idempotent
+          ? `脚本 ${scriptId} 已经是 ${mode} 模式，无需切换。`
+          : `已从 ${r.from} 切换到 ${mode}（影子 v${r.version}）。` + (mode === 'simulate'
+            ? ' 虚拟世界已就绪，用 sim_inject 注入实体状态、sim_advance 快进时间、sim_snapshot 取证据。'
+            : ' 已恢复真实 HA 数据与时钟。'),
+      }, null, 2));
+    }
+  );
+
+  server.tool(
+    'automation_sim_inject',
+    '向仿真实例注入一个变化：实体状态（entity，先改虚拟表再触发订阅回调）、上下文（context）、依赖脚本状态（task）、挂起（suspend）。一次一个，AI 看响应后再决定下一步。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      payload: z.object({
+        entity: z.object({ entityId: z.string(), state: z.any().optional(), attributes: z.object({}).passthrough().optional(), friendly_name: z.string().optional() }).optional(),
+        context: z.object({ scope: z.enum(['global', 'local']).optional(), key: z.string(), value: z.any() }).optional(),
+        task: z.object({ scriptId: z.string(), state: z.enum(['running', 'stopped', 'error', 'paused']) }).optional(),
+        suspend: z.boolean().optional(),
+      }).describe('注入内容，可组合多个字段'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, payload }) => {
+      const r = await executor.simInject(scriptId, payload);
+      return text(JSON.stringify({ ok: true, ...r }, null, 2));
+    }
+  );
+
+  server.tool(
+    'automation_sim_advance',
+    '快进仿真实例的虚拟时钟（毫秒）。到点定时器按 dueAt 顺序触发，脚本回调内的 request 在微任务内应答。返回本次推进量与新时刻。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      ms: z.number().int().min(0).describe('快进毫秒数'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, ms }) => {
+      const r = await executor.simAdvance(scriptId, ms);
+      return text(JSON.stringify({ ok: true, ...r }, null, 2));
+    }
+  );
+
+  server.tool(
+    'automation_sim_run_steps',
+    '批量跑完整用例：一次提交整组 steps 顺序执行并逐步断言，返回每条断言的通过/失败（含实际写意图序列）与终态快照，适合回归。step.op 支持 advance / inject_entity / inject_context / inject_task / inject_params / inject_suspend / mark / rewind / snapshot / assert。断言字段：writes（写意图序列，按 kind/op/nodeId/args 部分匹配，自上次 assert 以来新增）、noWrites（true 或 op 列表）、state（实体终值）、context、logs、expect（路径 DSL，见 automation_sim_snapshot 说明）。**默认每次重建虚拟世界**（用例可独立重跑），传 startAt/seed 指定起点；只有 continue:true 才在当前仿真会话续跑（多段探索，此时不能再传 startAt/seed）。断言失败默认不中断（收集全部失败点），failFast:true 首败即停。需 confirmed:true。',
+    {
+      scriptId: z.string().describe('脚本 id'),
+      steps: z.array(z.object({ op: z.enum(['advance', 'inject_entity', 'inject_context', 'inject_task', 'inject_params', 'inject_suspend', 'mark', 'rewind', 'snapshot', 'assert']) }).passthrough())
+        .min(1).describe('步骤数组，见各 op 字段：advance.ms / inject_*.entityId|state|scope|key|value|scriptId|params|suspend / mark.name / rewind.mark / assert.writes|noWrites|state|context|logs|expect'),
+      startAt: z.string().optional().describe('给定则用该 ISO 起点重建世界（如 2026-11-26T20:29:55+08:00）'),
+      seed: z.object({}).passthrough().optional().describe('随重建一起生效的种子：{ entities, context }'),
+      continue: z.boolean().optional().describe('true = 在当前仿真会话上续跑（保留世界状态）；缺省 false = 每次重建'),
+      failFast: z.boolean().optional().describe('首个断言失败即停，缺省收集全部失败点'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, steps, startAt, seed, continue: reuse, failFast }) => {
+      const r = await executor.simRunSteps(scriptId, { steps, startAt, seed, continue: reuse, failFast });
+      return text(JSON.stringify({
+        ok: r.ok, passed: r.passed, failed: r.failed, total: r.total,
+        executed: r.executed, aborted: r.aborted,
+        steps: r.results, final: r.final,
+      }, null, 2));
+    }
+  );
+
+  server.tool(
+    'automation_sim_snapshot',
+    '同步拉取仿真会话快照：clockNow/seq、logs、writes（写意图=硬证据）、entities、context、stats、execution/timers/watchers（脚本此刻在等什么）。entities 默认只含脚本用过的实体（读过/写过/注入过），要全量传 entityScope:"all"。since 传上次 seq 只取增量；include 裁剪字段。两次 advance 之间世界静止，拉取不漏事件。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      since: z.number().int().min(0).optional().describe('上次快照的 seq，只返回新增 logs/writes'),
+      include: z.array(z.enum(['logs', 'writes', 'entities', 'context', 'stats', 'execution', 'timers', 'watchers'])).optional().describe('字段裁剪，缺省全部'),
+      entityScope: z.enum(['used', 'all']).optional().describe('used（缺省）= 只回脚本用过的实体；all = 全量虚拟实体表'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, since, include, entityScope }) => {
+      const r = await executor.simSnapshot(scriptId, { since, include, entityScope });
+      return text(JSON.stringify(r, null, 2));
+    }
+  );
+
+  server.tool(
+    'automation_sim_close',
+    '结束仿真实例（等价停止 simulate 影子实例，虚拟世界随之销毁、不持久化）。已停止或没有实例也视为成功；当前影子是 follow 模式时会拒绝（避免误停真实验证态），停 follow 请用 automation_stop_script。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId }) => {
+      const r = await executor.simClose(scriptId);
+      return text(JSON.stringify({
+        ok: true, ...r,
+        running: executor.isRunning(scriptId),
+        runningVersions: executor.runningVersions(scriptId),
+      }, null, 2));
+    }
+  );
+
+  /* ---------- P2：交互式断言 / 时间旅行 / 用例导出 ---------- */
+
+  server.tool(
+    'automation_sim_assert',
+    '对当前仿真会话做一次断言（不重建世界、不推进时间）。字段与 run_steps 的 assert 相同：writes / noWrites / state / context / logs / expect。增量基准默认「自上次断言以来新增」，可用 since 指定 seq。expect 是路径 DSL：{path:"writes[0].op", eq:"heatOn"}，算子 eq/ne/gt/gte/lt/lte/match/includes/exists/type，可组合 all/any/not，数组即全部满足。返回每条 check 的通过情况与路径实际值。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      expect: z.union([z.object({}).passthrough(), z.array(z.object({}).passthrough())]).optional()
+        .describe('路径 DSL，例：[{path:"writes.length", eq:2},{path:"context.global.heated", eq:true}]'),
+      writes: z.array(z.object({}).passthrough()).optional().describe('写意图序列精确匹配（自上次断言以来）'),
+      noWrites: z.union([z.literal(true), z.array(z.string())]).optional().describe('true=不允许任何写意图；数组=不允许这些 op'),
+      state: z.array(z.object({}).passthrough()).optional().describe('实体终值：[{entityId, state?, attributes?}]'),
+      context: z.array(z.object({}).passthrough()).optional().describe('上下文值：[{scope?, key, value}]'),
+      logs: z.array(z.union([z.string(), z.object({}).passthrough()])).optional().describe('日志出现：字符串包含或 {level?, message?}'),
+      label: z.string().optional().describe('断言名，便于结果里区分'),
+      since: z.number().int().min(0).optional().describe('从该 seq 之后取增量（缺省用上次断言游标）'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, since, confirmed, ...step }) => {
+      const r = await executor.simAssert(scriptId, step, { since });
+      return text(JSON.stringify(r, null, 2));
+    }
+  );
+
+  server.tool(
+    'automation_sim_mark',
+    '给当前仿真世界打标记（实体/上下文/task 的数据点），用于之后 sim_rewind 回到这个输入状态测试另一条分支。name 缺省自动生成。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      name: z.string().optional().describe('标记名，缺省 m1/m2…'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, name }) => text(JSON.stringify(await executor.simMark(scriptId, name), null, 2))
+  );
+
+  server.tool(
+    'automation_sim_rewind',
+    '把仿真世界的数据回滚到某个标记点（实体/上下文/task），用于在不同输入下重试同一段逻辑。**只回滚数据**：虚拟时钟继续前进、脚本已注册的定时器与订阅不回退；要完全重放请用 run_steps 重建或 sim_run_fixture。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      mark: z.string().describe('sim_mark 返回的标记名'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, mark }) => text(JSON.stringify(await executor.simRewind(scriptId, mark), null, 2))
+  );
+
+  server.tool(
+    'automation_sim_export',
+    '把当前仿真会话导成回归用例并落盘（skill/.fixtures/<脚本id>/<name>.json，与可复用用例同目录、随 skill.zip 走）：起始时刻 + 初始种子 + 驱动流水（所有 inject/advance）+ 观测到的写意图序列 + 脚本版号。导出后可用 sim_run_fixture 一键重放。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      name: z.string().describe('用例名（字母数字与 _ . -，最长 64）'),
+      force: z.boolean().optional().describe('同名用例带断言（手写）时也强行覆盖；默认拒绝'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, name, force }) => text(JSON.stringify(await executor.simExport(scriptId, name, { force }), null, 2))
+  );
+
+  server.tool(
+    'automation_sim_run_fixture',
+    '重放已导出的用例：重建世界 → 跑 fixture 的 steps → 用导出时的写意图序列做全序列断言；versionDrift=true 说明脚本已改版，断言失败先怀疑版本漂移。不传 name 只列已有用例。需 confirmed:true。',
+    {
+      scriptId: z.string(),
+      name: z.string().optional().describe('用例名；缺省则只列出该脚本已有的用例'),
+      assertWrites: z.boolean().optional().describe('是否追加写意图全序列断言，缺省 true'),
+      failFast: z.boolean().optional().describe('首个断言失败即停'),
+      confirmed: z.literal(true),
+    },
+    async ({ scriptId, name, assertWrites, failFast }) => {
+      if (!name) return text(JSON.stringify(await executor.simListFixtures(scriptId), null, 2));
+      const r = await executor.simRunFixture(scriptId, name, { assertWrites, failFast });
+      return text(JSON.stringify({
+        ok: r.ok, passed: r.passed, failed: r.failed, total: r.total,
+        executed: r.executed, aborted: r.aborted, fixture: r.fixture,
+        steps: r.results, final: { at: r.final.at, clockNow: r.final.clockNow, writes: r.final.writes },
+      }, null, 2));
+    }
+  );
 }
 
 module.exports = { buildTools };

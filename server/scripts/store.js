@@ -15,7 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { DATA, ensureDataDir } = require('../config');
+const { DATA, FIXTURES, ensureDataDir } = require('../config');
 const context = require('./context');
 const { safeId: validateSid } = require('./inst-key'); // id 校验唯一实现在 inst-key（防三处正则漂移）
 
@@ -454,14 +454,90 @@ function rollback(id, fromVersion) {
 /* 可读日志：data/runtime/<id>/v<n>.log */
 function logFile(id, version) { return path.join(DATA, 'runtime', String(id), 'v' + Number(version) + '.log'); }
 
-function readLogs(id, version, limit = 200) {
-  /* M6：入口校验 id 与 version，避免 ../ 路径穿越跨脚本读日志。 */
-  if (!safeId(id) || !Number.isInteger(version) || version < 1) return [];
-  const file = logFile(id, version);
+/* 仿真日志独立文件（§5）：与线上运行日志分开落盘，避免「仿真通过」被误读成真实运行记录。
+ * 只由 simulate 实例的 worker 写入，会话开始时覆盖（虚拟世界本身不持久化，日志也一样）。 */
+function simLogFile(id, version) { return path.join(DATA, 'runtime', String(id), 'v' + Number(version) + '.sim.log'); }
+
+/* 仿真崩溃只读快照（§5.2）：worker 崩溃/脚本异常终止前同步落盘，供事后只看不改。
+ * 每次重新进入仿真时清掉，避免读到上一次的陈旧现场。 */
+function simCrashFile(id, version) { return path.join(DATA, 'runtime', String(id), 'v' + Number(version) + '.sim.crash.json'); }
+
+function writeSimCrash(id, version, snapshot) {
+  if (!safeId(id) || !Number.isInteger(version) || version < 1) return false;
+  const file = simCrashFile(id, version);
+  try {
+    ensureDataDir();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(snapshot), 'utf8');
+    return true;
+  } catch (e) { return false; }
+}
+
+function readSimCrash(id, version) {
+  if (!safeId(id) || !Number.isInteger(version) || version < 1) return null;
+  try { return JSON.parse(fs.readFileSync(simCrashFile(id, version), 'utf8')); } catch (e) { return null; }
+}
+
+function clearSimCrash(id, version) {
+  try { fs.unlinkSync(simCrashFile(id, version)); return true; } catch (e) { return false; }
+}
+
+/* 仿真用例（fixture，P2 sim_export）：skill/.fixtures/<脚本id>/<用例名>.json
+ * 直接放 skill 目录（可复用资产与导出落点合一，随 skill.zip 走），不再有 data/fixtures 副本。
+ * 用例名限制字符集，避免 ../ 路径穿越；只允许字母数字与 _ . -。 */
+const FIXTURE_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
+
+function fixtureDir(id) { return path.join(FIXTURES, String(id)); }
+
+function fixtureFile(id, name) {
+  if (!safeId(id) || !FIXTURE_NAME.test(String(name || ''))) return null;
+  return path.join(fixtureDir(id), String(name) + '.json');
+}
+
+function writeFixture(id, name, data) {
+  const file = fixtureFile(id, name);
+  if (!file) throw new Error('用例名非法（只允许字母数字与 _ . -，最长 64）：' + name);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+  return file;
+}
+
+function readFixture(id, name) {
+  const file = fixtureFile(id, name);
+  if (!file) return null;
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
+}
+
+function listFixtures(id) {
+  if (!safeId(id)) return [];
+  try {
+    return fs.readdirSync(fixtureDir(id))
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => {
+        const name = f.slice(0, -5);
+        const data = readFixture(id, name) || {};
+        return { name, steps: (data.steps || []).length, writes: ((data.expected || {}).writes || []).length };
+      });
+  } catch (e) { return []; }
+}
+
+function readLogLines(file, limit) {
   try {
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
     return lines.slice(-limit).map((line) => { try { return JSON.parse(line); } catch (e) { return { level: 'raw', message: line }; } });
   } catch (e) { return []; }
+}
+
+function readLogs(id, version, limit = 200) {
+  /* M6：入口校验 id 与 version，避免 ../ 路径穿越跨脚本读日志。 */
+  if (!safeId(id) || !Number.isInteger(version) || version < 1) return [];
+  return readLogLines(logFile(id, version), limit);
+}
+
+/* 读仿真日志：同样的逐行 JSON 格式，只换路径前缀。前端在仿真实例运行时切到这份日志。 */
+function readSimLogs(id, version, limit = 200) {
+  if (!safeId(id) || !Number.isInteger(version) || version < 1) return [];
+  return readLogLines(simLogFile(id, version), limit);
 }
 
 function appendLog(id, version, entry) {
@@ -531,6 +607,7 @@ module.exports = {
   safeId, newScriptId, validateFlow, kindOf,
   list, listVersions, get, submit, publish, rollback, removeVersion, removeScript, getMeta,
   channelOf, normalizeChannels, versionOfChannel, detailedVersions,
-  readLogs, appendLog, cleanupRuntimeLogs,
+  readLogs, readSimLogs, appendLog, simLogFile, simCrashFile, writeSimCrash, readSimCrash, clearSimCrash, cleanupRuntimeLogs,
+  writeFixture, readFixture, listFixtures,
   EXECUTION_HOST_MODES,
 };

@@ -16,6 +16,19 @@
 const vm = require('vm');
 const { shadowWrite, devWrite } = require('./log-text');
 
+/* 真实时钟适配器：follow 模式默认走原生定时器/Date，签名与 sim/clock.js 的 VirtualClock 一致。
+ * 虚拟化只在 meta.simulate 时由宿主注入 VirtualClock，runner-core 全部时间源统一走 clock。 */
+const realClock = {
+  isVirtual: false,
+  now: () => Date.now(),
+  elapsedMs: () => 0,
+  date: () => new Date(),
+  setTimeout: (fn, ms, ...args) => setTimeout(fn, ms, ...args),
+  clearTimeout: (id) => clearTimeout(id),
+  setInterval: (fn, ms, ...args) => setInterval(fn, ms, ...args),
+  clearInterval: (id) => clearInterval(id),
+};
+
 /* 脚本回调（订阅/定时器）同步部分的上限：inline 模式的关键安全措施，
  * 同步死循环会被 V8 timeout 中断，宿主最多卡这段时间而不是永远。
  * 可用 meta.cbTimeoutMs 覆盖（测试加速用）。 */
@@ -31,8 +44,9 @@ function signalEquals(a, b) {
   catch (e) { return false; }
 }
 
-function createCore({ emit }) {
+function createCore({ emit, clock }) {
   /* emit(msg)：宿主桥。fork 宿主 = process.send；inline 宿主 = EventEmitter。 */
+  const clk = clock || realClock;
   let script = '';
   let meta = {};
   let cbTimeoutMs = CB_TIMEOUT_MS;
@@ -40,7 +54,10 @@ function createCore({ emit }) {
   /* 运行模式/挂起/停止：由主进程通过 mode/suspend/resume/stop 消息热更新。
    * devMode 由 executor 随 run 注入（全局开发模式），与 dryRun 正交：
    * dryRun=脚本通道身份，devMode=环境写拦截；发布热切只改 dryRun，不改 devMode。 */
-  const ctxRuntime = { dryRun: true, devMode: false, stopped: false, suspended: false, suspendReason: null };
+  const ctxRuntime = { dryRun: true, devMode: false, stopped: false, suspended: false, suspendReason: null, simulate: false };
+  let runActive = false;
+  let runCount = 0;
+  const writeStats = { intent: 0, sent: 0, blocked: 0 }; // 提到闭包层，供 simState 快照读取
   const subscriptions = new Map(); // entityId -> [cb]
   const globalSubs = new Map();    // ctx.global.watch：key -> Set<cb>（返回取消订阅函数）
   const taskSubs = new Map();      // ctx.watch.task：scriptId -> Set<cb>（返回取消订阅函数）
@@ -55,7 +72,7 @@ function createCore({ emit }) {
   function request(action, data, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
       const id = ++waitSeq;
-      const timer = setTimeout(() => { waiting.delete(id); reject(new Error('runner 请求超时：' + action)); }, timeoutMs);
+      const timer = clk.setTimeout(() => { waiting.delete(id); reject(new Error('runner 请求超时：' + action)); }, timeoutMs);
       waiting.set(id, { resolve, reject, timer });
       emit({ type: 'request', id, action, data });
     });
@@ -65,7 +82,7 @@ function createCore({ emit }) {
     const w = waiting.get(msg.id);
     if (!w) return;
     waiting.delete(msg.id);
-    clearTimeout(w.timer);
+    clk.clearTimeout(w.timer);
     if (msg.ok) w.resolve(msg.result); else w.reject(new Error(msg.error || '主进程请求失败'));
   }
 
@@ -76,7 +93,7 @@ function createCore({ emit }) {
       let set = taskWaiters.get(sid);
       if (!set) { set = new Set(); taskWaiters.set(sid, set); }
       const entry = { resolve, timer: null };
-      entry.timer = setTimeout(() => {
+      entry.timer = clk.setTimeout(() => {
         set.delete(entry);
         if (!set.size) taskWaiters.delete(sid);
         resolve();
@@ -88,7 +105,7 @@ function createCore({ emit }) {
     const set = taskWaiters.get(sid);
     if (!set) return;
     for (const entry of [...set]) {
-      clearTimeout(entry.timer);
+      clk.clearTimeout(entry.timer);
       set.delete(entry);
       entry.resolve();
     }
@@ -96,7 +113,7 @@ function createCore({ emit }) {
   }
   function clearTaskWaiters() {
     for (const set of taskWaiters.values()) {
-      for (const entry of set) { clearTimeout(entry.timer); entry.resolve(); }
+      for (const entry of set) { clk.clearTimeout(entry.timer); entry.resolve(); }
     }
     taskWaiters.clear();
   }
@@ -145,7 +162,7 @@ function createCore({ emit }) {
    * 并走 guardedCall 防同步死循环。 */
   function scheduleTimer(fn, ms, rest) {
     const id = ++timerSeq;
-    const t = setTimeout(() => {
+    const t = clk.setTimeout(() => {
       timers.delete(id);
       if (ctxRuntime.stopped) return;
       guardedCall(fn, rest || []);
@@ -161,7 +178,7 @@ function createCore({ emit }) {
     timers.delete(id);
     return true;
   }
-  const cancelTimer = (id) => unregisterTimer(id, clearTimeout);
+  const cancelTimer = (id) => unregisterTimer(id, clk.clearTimeout);
 
   /* ---------------- 沙箱构造（S2 运行层加固）----------------
    * 只把 realm 内对象暴露给脚本：vm context 自带 realm 的 Math/Date/JSON/Promise 等内建，
@@ -239,6 +256,21 @@ function createCore({ emit }) {
       copyAccessors(out, v, depth); // 只读 getter（dryRun/stopped/suspended）没有 set，行为不变
       return out;
     }
+    /* simulate：把 realm 内的 Date 换成虚拟实现，否则脚本自己的 Date.now()/new Date()
+     * 与 hold 的虚拟时钟对不上。VDate 是 realm 内类，只通过 conv 包过的 nowFn 回调宿主
+     * 时钟（拿到的是数字，realm 安全），拿不到宿主逃逸链。follow 模式不注入，保持原生。 */
+    if (clk.isVirtual) {
+      const makeVDate = vm.runInContext(`(nowFn) => {
+        return class VDate extends Date {
+          constructor(...args) { if (args.length === 0) super(nowFn()); else super(...args); }
+          static now() { return nowFn(); }
+        };
+      }`, context);
+      /* 必须用箭头闭包转一手：conv 把宿主函数包成 realm 函数后是「裸调用」，
+       * 直接丢 clk.now 进去会丢 this（VirtualClock.now 读 this.startEpoch），
+       * 脚本一碰 Date.now()/new Date() 就抛 "reading 'startEpoch'"。 */
+      sandbox.Date = makeVDate(conv(() => clk.now()));
+    }
     return { sandbox, context, conv };
   }
 
@@ -271,6 +303,9 @@ function createCore({ emit }) {
   async function run() {
     ctxRuntime.dryRun = meta.dryRun !== false;
     ctxRuntime.devMode = meta.devMode === true;
+    /* 仿真是运行态属性，不写版本、不进 meta 身份：runner 收到 meta.simulate 才置位。
+     * dryRun 保持 true（影子身份），写闸靠 ctxRuntime.simulate 独立放行。 */
+    ctxRuntime.simulate = clk.isVirtual === true && meta.simulate === true;
     cbTimeoutMs = Math.max(50, Number(meta.cbTimeoutMs) || CB_TIMEOUT_MS);
 
     /* ---------------- 框架层通用能力 ----------------
@@ -285,13 +320,13 @@ function createCore({ emit }) {
       if (!sid) throw new Error('ctx.task.require 需要脚本 id');
       const raw = Number(opts && opts.timeout);
       const timeoutMs = opts && opts.timeout !== undefined && Number.isFinite(raw) && raw >= 0 ? raw : 30000;
-      const deadline = Date.now() + timeoutMs;
+      const deadline = clk.now() + timeoutMs;
       let last = null;
       for (;;) {
         if (ctxRuntime.stopped) throw new Error(`脚本已停止，取消等待依赖 ${sid}`);
         last = await request('taskStatus', { scriptId: sid });
         if (last && last.state === 'running') return last; // 一次性门闩：首次 running 后不再阻断
-        const left = deadline - Date.now();
+        const left = deadline - clk.now();
         if (left <= 0) throw new Error(`等待依赖脚本 ${sid} 超时（${timeoutMs}ms，当前状态：${last && last.state || 'unknown'}）`);
         await waitTaskChange(sid, Math.min(200, left));
       }
@@ -315,7 +350,7 @@ function createCore({ emit }) {
         },
       },
       log: (level, message, nodeId) => emit({ type: 'log', level: String(level || 'info'), message: String(message), nodeId: nodeId ? String(nodeId) : undefined }),
-      sleep: (ms) => new Promise((r) => setTimeout(r, Math.max(0, Number(ms) || 0))),
+      sleep: (ms) => new Promise((r) => clk.setTimeout(r, Math.max(0, Number(ms) || 0))),
       /* 被 ctx.call 触发时携带的入参（主进程注入 meta.callParams）；未被调用时为 null。
        * 由 buildSandbox 的 conv 转成 realm 安全对象，脚本拿不到宿主对象。 */
       params: meta.callParams === undefined ? null : meta.callParams,
@@ -334,7 +369,6 @@ function createCore({ emit }) {
 
     /* 动作注册表：业务动作仍由脚本定义，框架只负责“影子拦截 + 日志 + 计数” */
     const actionRegistry = new Map();
-    const writeStats = { intent: 0, sent: 0, blocked: 0 };
 
     ctx.actions = (table) => {
       if (!table || typeof table !== 'object') throw new Error('ctx.actions 需要传入 { name: () => {...} } 对象');
@@ -363,6 +397,20 @@ function createCore({ emit }) {
         writeStats.blocked += 1;
         emit({ type: 'log', level: 'warn', message: `[兜底] 动作已跳过（${ctxRuntime.suspendReason}）：${desc}`, nodeId });
         return false;
+      }
+      /* 仿真：身份仍是影子（dryRun=true 不变），但独立的 simulate 标志放行动作执行，
+       * 写到虚拟 HA、记写意图。代价是 runner-core 多一个标志判断，收益是脚本完全无法
+       * 区分 follow/simulate——验证保真。注意放在 suspended 闸之后、dryRun 闸之前。 */
+      if (ctxRuntime.simulate) {
+        await fn(...args);
+        writeStats.sent += 1;
+        emit({
+          type: 'simWrite', kind: 'write', op, desc,
+          nodeId: nodeId ? String(nodeId) : undefined,
+          args: JSON.parse(JSON.stringify(args)), at: clk.elapsedMs(),
+        });
+        emit({ type: 'log', level: 'warn', message: `[仿真·写意图] ${desc}（action.${op}）`, nodeId });
+        return true;
       }
       if (ctxRuntime.dryRun !== false) {
         writeStats.blocked += 1;
@@ -464,10 +512,10 @@ function createCore({ emit }) {
     const pad2 = (x) => String(x).padStart(2, '0');
     const WD = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
     ctx.time = {
-      today: () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; },
-      nowSod: () => { const d = new Date(); return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds(); },
-      weekday: () => WD[new Date().getDay()],
-      nowISO: () => new Date().toISOString(),
+      today: () => { const d = clk.date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; },
+      nowSod: () => { const d = clk.date(); return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds(); },
+      weekday: () => WD[clk.date().getDay()],
+      nowISO: () => clk.date().toISOString(),
       formatSod: (sod) => {
         const n = Math.max(0, Math.floor(Number(sod) || 0));
         return `${pad2(Math.floor(n / 3600))}:${pad2(Math.floor((n % 3600) / 60))}:${pad2(n % 60)}`;
@@ -484,8 +532,8 @@ function createCore({ emit }) {
     ctx.every = (ms, fn) => {
       const period = Math.max(0, Number(ms) || 0);
       const id = ++timerSeq;
-      const t = setInterval(() => {
-        if (ctxRuntime.stopped) { unregisterTimer(id, clearInterval); return; }
+      const t = clk.setInterval(() => {
+        if (ctxRuntime.stopped) { unregisterTimer(id, clk.clearInterval); return; }
         guardedCall(fn, []);
       }, period);
       timers.set(id, t);
@@ -582,6 +630,11 @@ function createCore({ emit }) {
           timer = null;
           reevaluate(trigger);
         });
+        /* 给虚拟时钟的定时器打标签：快照 timers[] 展示「满足计时/回落计时」，
+         * 让 AI 一眼看出脚本此刻在等什么（§7.6）。follow 模式 label 是 no-op。 */
+        if (clk.isVirtual && typeof clk.label === 'function') {
+          clk.label(id, `${conf.label || 'hold'}·${dirCn(pending || 'satisfied')}计时`);
+        }
         timer = id;
       };
       /* 异常重试/句柄补排的间隔：到点后剩余时间为 0 时给 50ms 下限，
@@ -589,7 +642,7 @@ function createCore({ emit }) {
       const retryDelay = () => {
         if (!pending) return satisfyMs;
         const delay = delayFor(pending);
-        return since > 0 ? Math.max(50, delay - (Date.now() - since)) : Math.max(50, delay);
+        return since > 0 ? Math.max(50, delay - (clk.now() - since)) : Math.max(50, delay);
       };
 
       async function reevaluate(trigger) {
@@ -627,7 +680,7 @@ function createCore({ emit }) {
         const delay = delayFor(direction);
         if (pending !== direction) {
           pending = direction;
-          since = Date.now();
+          since = clk.now();
           clearHoldTimer();
           log(`期待${desired ? '满足' : '不满足'}，${dirCn(direction)}计时 ${delay}ms（触发=${trigCn(trigger)}）`);
           if (delay === 0) { notify(trigger + ':立即', 0); return; }
@@ -636,13 +689,13 @@ function createCore({ emit }) {
         }
 
         /* 4) 同方向已计时：到点复核仍成立就切换状态并通知一次；句柄丢失则按剩余时间补排。 */
-        if (since > 0 && Date.now() - since >= delay) {
-          const waitedMs = Date.now() - since;
+        if (since > 0 && clk.now() - since >= delay) {
+          const waitedMs = clk.now() - since;
           clearHoldTimer();
           notify(trigger, waitedMs);
           return;
         }
-        if (since > 0 && !timer) arm(Math.max(1, delay - (Date.now() - since)), 'resume');
+        if (since > 0 && !timer) arm(Math.max(1, delay - (clk.now() - since)), 'resume');
       }
 
       const handle = {
@@ -675,7 +728,7 @@ function createCore({ emit }) {
             pending,
             since,
             active,
-            remaining: active ? Math.max(0, delayFor(pending) - (Date.now() - since)) : 0,
+            remaining: active ? Math.max(0, delayFor(pending) - (clk.now() - since)) : 0,
             ms: satisfyMs,
             satisfyMs,
             unsatisfyMs,
@@ -717,14 +770,14 @@ function createCore({ emit }) {
       /* setInterval 不直接暴露宿主版本：登记到 intervals 便于 stop 统一清理，
        * 且 stopped 后不再触发回调；回调走 guardedCall 防同步死循环。 */
       sandbox.setInterval = conv((fn, ms, ...rest) => {
-        const id = setInterval(() => {
+        const id = clk.setInterval(() => {
           if (ctxRuntime.stopped) return;
           guardedCall(fn, rest);
         }, Math.max(0, Number(ms) || 0));
         intervals.add(id);
         return id;
       });
-      sandbox.clearInterval = conv((id) => { clearInterval(id); intervals.delete(id); return true; });
+      sandbox.clearInterval = conv((id) => { clk.clearInterval(id); intervals.delete(id); return true; });
 
       /* M10：vm 执行超时从 meta.vmTimeoutMs（主进程按 runnerTimeoutMs 减差值派生）读取 */
       const vmTimeout = Number(meta.vmTimeoutMs) >= 1000 ? Number(meta.vmTimeoutMs) : 55000;
@@ -734,8 +787,17 @@ function createCore({ emit }) {
       emit({ type: 'log', level: 'info', message: '脚本执行完成' });
       emit({ type: 'done', ok: true });
     } catch (e) {
-      emit({ type: 'log', level: 'error', message: '脚本异常：' + (e && e.message || e) });
-      emit({ type: 'done', ok: false, error: String(e && e.message || e) });
+      /* 异常详情：跨 realm 的 Error 可能既拿不到 message 也 instanceof Array 不成立，
+       * 早期只打 e.message 会退化成「脚本异常：[object Object]」，排查等于没有线索。
+       * 这里按 message → error → JSON → String 四级降级，并附前几行栈。 */
+      const msg = e && (e.message || e.error);
+      let raw = '';
+      if (!msg) {
+        try { raw = ' :: ' + JSON.stringify(e); } catch (err) { raw = ' :: ' + String(e); }
+      }
+      const stack = e && e.stack ? ' :: ' + String(e.stack).split('\n').slice(0, 3).join(' | ') : '';
+      emit({ type: 'log', level: 'error', message: '脚本异常：' + (msg ? String(msg) : String(e)) + raw + stack });
+      emit({ type: 'done', ok: false, error: String(msg || e) });
     }
   }
 
@@ -770,7 +832,9 @@ function createCore({ emit }) {
       case 'run':
         script = msg.script || '';
         meta = msg.meta || {};
-        run();
+        runCount += 1;
+        runActive = true;
+        run().finally(() => { runActive = false; });
         return;
       case 'reply':
         resolveReply(msg);
@@ -841,7 +905,23 @@ function createCore({ emit }) {
     cleanupLocal();
   }
 
-  return { handleMessage, isStopped: () => ctxRuntime.stopped, destroy };
+  /* 仿真快照的「脚本此刻在等什么」三元组之一（§7.6）：watchers 展开订阅 key，
+   * execution 给运行状态/轮次。timers 由 clock.timerList() 提供，logs/writes/entities
+   * 由 sim session 提供，宿主侧合并成完整快照。 */
+  function simState() {
+    const watchers = [];
+    for (const key of subscriptions.keys()) watchers.push({ kind: 'entity', key });
+    for (const key of globalSubs.keys()) watchers.push({ kind: 'context', scope: 'global', key });
+    for (const key of taskSubs.keys()) watchers.push({ kind: 'task', scriptId: key });
+    return {
+      execution: { state: runActive ? 'running' : 'idle', lastNodeId: null, runCount, lastError: null },
+      watchers,
+      stats: { ...writeStats },
+      dryRun: ctxRuntime.dryRun, simulate: ctxRuntime.simulate, stopped: ctxRuntime.stopped,
+    };
+  }
+
+  return { handleMessage, isStopped: () => ctxRuntime.stopped, destroy, simState, ctxRuntime };
 }
 
 module.exports = { createCore };

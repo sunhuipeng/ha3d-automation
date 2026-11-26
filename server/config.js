@@ -9,6 +9,9 @@ const ROOT = path.resolve(__dirname, '..');
  * 脚本版本 / 上下文 / 运行日志 / HA 连接配置升级镜像不丢（与 studio 的 HA3D_STUDIO_DATA_DIR 同款约定）。 */
 const DATA = path.resolve(process.env.HA3D_AUTOMATION_DATA_DIR || path.join(ROOT, 'data'));
 const CONFIG_FILE = path.join(DATA, 'config.json');
+/* 仿真用例目录：直接落在 skill/.fixtures（跟着 skill 走——可直接复用、随 skill.zip 打包，
+ * 不再有"服务端副本"这一层）。测试/容器可用 HA3D_AUTOMATION_FIXTURE_DIR 覆盖。 */
+const FIXTURES = path.resolve(process.env.HA3D_AUTOMATION_FIXTURE_DIR || path.join(ROOT, 'skill', '.fixtures'));
 
 const DEFAULTS = {
   port: 8100,
@@ -111,4 +114,4 @@ function ensureDataDir() {
   fs.mkdirSync(path.join(DATA, 'runtime'), { recursive: true });
 }
 
-module.exports = { ROOT, DATA, DEV_MODE, getConfig, ensureDataDir, saveConfig, publicConfig };
+module.exports = { ROOT, DATA, FIXTURES, DEV_MODE, getConfig, ensureDataDir, saveConfig, publicConfig };

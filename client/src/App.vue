@@ -69,20 +69,49 @@ function channelText(ch) { return CHANNEL_TEXT[ch] || ch || '未知'; }
 /* 影子 + 正式并存才提供 diff（升级后的典型状态：正式 vN → 影子 vM） */
 const canDiff = computed(() => scripts.shadowVersion != null && scripts.productionVersion != null);
 
-/* 状态徽标文案（运行状态由 executor 内存合成，无 draft） */
+/* 状态徽标文案（运行状态由 executor 内存合成，无 draft；switching 是切模式的瞬态） */
 const STATUS_TEXT = {
-  stopped: '已停止', running: '运行中', paused: '已暂停', error: '异常', timeout: '超时',
+  stopped: '已停止', running: '运行中', paused: '已暂停', error: '异常', timeout: '超时', switching: '切换中',
 };
 function statusText(s) { return STATUS_TEXT[s] || s || '未知'; }
+
+/* 当前打开版本的运行实例（正式/影子各至多一个，按版本号锁定） */
+const currentInstance = computed(() => {
+  if (!scripts.current) return null;
+  return scripts.runningVersions.find((x) => x.version === scripts.current.version) || null;
+});
+/* 当前实例的验证方式：跟随真实 or 仿真。无实例为 null */
+const verifyMode = computed(() => (currentInstance.value ? (currentInstance.value.verifyMode || 'follow') : null));
+/* 只有影子实例在跑时才能切验证方式：正式实例固定真实下发，没有仿真概念（§2.1） */
+const canSwitchVerify = computed(() => currentChannel.value === 'shadow' && !!currentInstance.value);
+const switchBusy = ref(false);
+async function toggleVerifyMode() {
+  if (switchBusy.value) return;
+  const target = verifyMode.value === 'simulate' ? 'follow' : 'simulate';
+  switchBusy.value = true;
+  try {
+    await scripts.switchVerifyMode(scripts.current.id, target);
+    notify(target === 'simulate'
+      ? '已进入仿真：虚拟实体/虚拟时钟，不接触真实设备；发布前仍需切回影子模式真实跑一次'
+      : '已切回影子模式：影子实例恢复真实 HA 数据与真实时钟', 'warn');
+  } catch (e) { notify(e.message); }
+  finally { switchBusy.value = false; }
+}
 
 /* 左侧列表徽标：运行真相优先，并标明是正式还是影子实例在跑 */
 function listBadge(s) {
   const rvs = s.runningVersions || [];
+  const sh = rvs.find((r) => r.mode === 'shadow');
   const hasP = rvs.some((r) => r.mode === 'production');
-  const hasS = rvs.some((r) => r.mode === 'shadow');
-  if (hasP && hasS) return { cls: 'running', text: '运行中', title: '正式与影子实例都在跑' };
+  /* 仿真也是影子身份（dryRun 仍为 true），单看 mode 分不出来，必须看实例上的 verifyMode */
+  if (sh && sh.verifyMode === 'simulate') {
+    return hasP
+      ? { cls: 'sim-run', text: '仿真中', title: '影子实例在仿真世界运行（同时有正式实例在真实下发）' }
+      : { cls: 'sim-run', text: '仿真中', title: '影子实例在仿真世界运行：虚拟实体/虚拟时钟，不接触真实设备' };
+  }
+  if (hasP && sh) return { cls: 'running', text: '运行中', title: '正式与影子实例都在跑' };
   if (hasP) return { cls: 'running', text: '运行中', title: '正式实例在跑（真实下发）' };
-  if (hasS) return { cls: 'shadow-run', text: '运行中', title: '影子实例在跑（只记日志不下发）' };
+  if (sh) return { cls: 'shadow-run', text: '运行中', title: '影子实例在跑（跟随真实 HA，只记日志不下发）' };
   /* 运行真相 = runningVersions；status 由服务端实时合成，这里兜底仅防旧版服务端 */
   const eff = (rvs.length === 0 && ['running', 'paused'].includes(s.status)) ? 'stopped' : (s.status || 'stopped');
   return { cls: eff, text: statusText(eff), title: '' };
@@ -335,12 +364,25 @@ async function rollbackTo(version) {
               <span class="sid-tag" :class="{ ok: copiedId === scripts.current.id }" :title="copiedId === scripts.current.id ? '已复制' : '点击复制脚本 id'"
                 @click="copyId(scripts.current.id)">{{ copiedId === scripts.current.id ? '已复制 ✓' : scripts.current.id }}</span>
               <span class="badge" :class="scripts.current.status">{{ statusText(scripts.current.status) }}</span>
+              <span v-if="verifyMode === 'simulate'" class="badge sim-run"
+                title="当前实例运行在仿真世界：实体/上下文/时钟都是虚拟数据，设备写只记写意图，不接触真实 HA">
+                仿真验证
+              </span>
               <span v-if="scripts.current.meta?.channel === 'shadow' && scripts.current.meta?.revision > 1"
                 class="channel-badge rev" title="影子版本可原地修改：每次重新提交版本号不变，改版次数 +1">
                 改{{ scripts.current.meta.revision }}次
               </span>
             </div>
             <div class="dh-actions">
+              <!-- 验证方式切换：只对影子实例开放（正式实例固定真实下发）。切换 = 暂停→重启，
+                   不是热切换，所以按钮明确提示会重启实例 -->
+              <button v-if="canSwitchVerify" class="mode-switch-btn" :disabled="switchBusy || scripts.current.status === 'switching'"
+                :title="verifyMode === 'simulate'
+                  ? '切回跟随真实：暂停仿真实例，以真实 HA 数据与真实时钟重启影子（仿真结果不能作为上线依据）'
+                  : '进入仿真：暂停影子实例，以虚拟实体/虚拟时钟重启，可逐步注入状态验证逻辑（设备写只记意图）'"
+                @click="toggleVerifyMode">
+                {{ (switchBusy || scripts.current.status === 'switching') ? '切换中…' : (verifyMode === 'simulate' ? '⇄ 切回影子模式' : '⇄ 进入仿真') }}
+              </button>
               <button v-if="canDiff" class="diff-btn" :disabled="actionBusy"
                 :title="`对比正式 v${scripts.productionVersion} 与影子 v${scripts.shadowVersion} 的脚本变更`"
                 @click="showDiff = true">
@@ -373,7 +415,10 @@ async function rollbackTo(version) {
                 <span class="vb-ch" :class="v.channel">{{ channelText(v.channel) }}</span>
                 <span v-if="v.channel === 'shadow' && v.revision > 1" class="vb-tag" title="影子可原地修改：版本号不变，改版次数递增">改{{ v.revision }}</span>
                 <span v-if="v.channel === 'archive' && v.archivedKind === 'published'" class="vb-tag live" title="曾经上线过的版本（回滚候选）">曾上线</span>
-                <span v-if="runningOf(v)" class="vb-tag run" :title="runningOf(v).mode === 'shadow' ? '影子实例在跑（只记日志）' : '正式实例在跑（真实下发）'">运行中</span>
+                <span v-if="runningOf(v)" class="vb-tag" :class="runningOf(v).verifyMode === 'simulate' ? 'sim' : 'run'"
+                  :title="runningOf(v).verifyMode === 'simulate' ? '仿真中：虚拟实体/虚拟时钟，不接触真实设备' : (runningOf(v).mode === 'shadow' ? '影子实例在跑（跟随真实，只记日志）' : '正式实例在跑（真实下发）')">
+                  {{ runningOf(v).verifyMode === 'simulate' ? '仿真中' : '运行中' }}
+                </span>
                 <span v-if="!runningOf(v)" class="vb-status" :class="versionStatus(v).cls">{{ versionStatus(v).text }}</span>
                 <button v-if="v.channel === 'archive' && v.archivedKind === 'published'" class="vb-rb"
                   :disabled="actionBusy" title="回滚到此版本（内容作为新影子版本提交，不会自动上线）"
@@ -389,14 +434,19 @@ async function rollbackTo(version) {
             <template v-else-if="currentChannel === 'shadow'">● 影子版本：写操作只记日志、不下发（读操作正常）。这是可反复修改的工作副本——重新提交会原地覆盖本版本（版本号不变、改版次数+1），改完需重新启动才生效</template>
             <template v-else>● 归档版本：历史版本，不可修改；「曾上线」的可一键回滚为新影子版本</template>
           </div>
+          <!-- 仿真提示条：与影子提示并列，强调「世界是虚拟的、结果不能直接当上线依据」 -->
+          <div v-if="verifyMode === 'simulate'" class="mode-note sim">
+            ● 仿真实例：实体状态、上下文与时钟都来自虚拟世界，设备写只记写意图、不接触真实 HA；日志写入独立的
+            <code>.sim.log</code>。仿真只验证流程与时序——设备不响应、失败、延迟等异常分支不模拟，需切回「影子模式」用真实设备验证。仿真通过 ≠ 线上可用，发布前请切回「影子模式」实跑一次。
+          </div>
           <FlowPreview />
           <TopologyPanel />
           <ScriptViewer />
           <details class="log-box" @toggle="onLogToggle">
-            <summary><span class="panel-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行日志</span><button v-if="!followLogs" class="log-follow" @click.stop="scrollLogsToBottom">↓ 回到最新</button></summary>
+            <summary><span class="panel-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行日志<span v-if="scripts.logsSource === 'sim'" class="log-src sim" title="仿真实例的日志：写在独立的 v&lt;n&gt;.sim.log，不是真实运行记录">仿真</span></span><button v-if="!followLogs" class="log-follow" @click.stop="scrollLogsToBottom">↓ 回到最新</button></summary>
             <div ref="logBox" class="logs" @scroll="onLogScroll">
               <div v-for="(l, i) in scripts.logs" :key="i" class="log" :class="l.level">
-                <span class="ts">{{ new Date(l.ts).toLocaleTimeString() }}</span>
+                <span class="ts">{{ scripts.logsSource === 'sim' && l.at != null ? '+' + (l.at / 1000).toFixed(1) + 's' : new Date(l.ts).toLocaleTimeString() }}</span>
                 <span class="lv">{{ l.level }}</span>
                 <span class="msg">{{ l.message }}</span>
               </div>

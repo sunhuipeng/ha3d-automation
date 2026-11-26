@@ -1,9 +1,11 @@
 # MCP 工具清单
 
-共 25 个工具（15 只读 + 8 受控写 + 2 面板控制），SSE 端点 `http://localhost:8100/mcp/sse`。
+共 36 个工具（15 只读 + 19 受控写（8 脚本/版本 + 11 仿真）+ 2 面板控制），SSE 端点 `http://localhost:8100/mcp/sse`。
 所有工具经 `wrapToolActivity` 统一广播活动到前端横条。
 
 **受控写**全部要求 `confirmed: true` 显式确认；`automation_call_service` 还需服务端开启 `allowMcpCallService`（默认关闭）。
+
+仿真（`simulate`）的用法、断言 DSL、踩坑清单见 `simulation.md`，这里只列接口参数。
 
 命令行快速调用：
 
@@ -50,7 +52,9 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 
 ---
 
-## 受控写（8 个，均需 `confirmed: true`）
+## 受控写（19 个，均需 `confirmed: true`）
+
+### 脚本与版本（8 个）
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
@@ -62,6 +66,28 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 | `automation_rollback` | `scriptId`、`fromVersion`（历史版本号）、`confirmed:true` | 回滚：读历史版本（正式/归档）原文 → 提交为**新影子版本**（版本号继续递增，description 标"回滚自 vN"）。**不自动上线**，仍要走影子验证 → publish |
 | `automation_delete_version` | `scriptId`、`version`、`confirmed:true` | 只能删**归档版本**；正式版不可删（先发布新版本使其归档）、影子是工作副本不可删（直接覆盖修改）、运行中需先 stop |
 | `automation_call_service` | `domain`、`service`、`data?`、`confirmed:true` | 直接调 HA 服务。**默认关闭**（`allowMcpCallService=false`），且经动作互斥锁（同 entity+service+entityId 冲突报错） |
+
+### 仿真 / 验证方式（11 个，均需 `confirmed: true`）
+
+影子通道固定。验证是**两段固定顺序**：`simulate`（虚拟世界，验流程/时序/写意图）→ `switch_verify_mode {"mode":"follow"}` 切回影子模式并保持运行（验收门禁，`case.cjs finish` 一步完成）。仿真只覆盖本脚本，写只产生写意图；停在 simulate 不算验证通过。详见 `simulation.md`。
+
+| 工具 | 参数 | 说明 |
+|---|---|---|
+| `automation_switch_verify_mode` | `scriptId`、`mode`（`follow`/`simulate`）、`startAt?`（ISO）、`seed?`（`{entities:{eid:{state,attributes}}, context:{global,local}}`） | 唯一切换入口：暂停旧实例 → 等真正退出 → 以目标模式启动（不热切，正式实例不受影响）。已是目标模式则幂等返回 |
+| `automation_sim_inject` | `scriptId`、`payload.{entity\|context\|task\|suspend}` | 注入一次变化：`entity`（先改虚拟表再触发订阅）/ `context`（`{scope,key,value}`）/ `task`（`{scriptId,state}`）/ `suspend` |
+| `automation_sim_advance` | `scriptId`、`ms` | 快进虚拟时钟（毫秒），到点定时器按 dueAt 顺序触发；真实等待不会推进仿真 |
+| `automation_sim_run_steps` | `scriptId`、`steps[]`、`startAt?`、`seed?`、`continue?`、`failFast?` | 批量跑用例 + 逐步断言，返回 `ok/passed/failed/total/executed/aborted`、每条 `checks` 与终态。**默认每次重建世界**；`continue:true` 才续跑且与 `startAt/seed` 互斥。`failFast` 缺省收集全部失败 |
+| `automation_sim_assert` | `scriptId`、`writes?`、`noWrites?`、`state?`、`context?`、`logs?`、`expect?`、`label?`、`since?` | 对当前会话单次断言，不推进不重建。默认基准 = 上次断言以来的新增 |
+| `automation_sim_snapshot` | `scriptId`、`since?`、`include?`（logs/writes/entities/context/stats/execution/timers/watchers）、`entityScope?`（`used` 缺省 / `all`） | 同步快照；`writes` 是硬证据。崩溃后返回 `crashed/readOnly/fromCrashFile`（读 `v<n>.sim.crash.json`） |
+| `automation_sim_mark` | `scriptId`、`name?` | 标记世界数据点（实体/上下文/task），供 `sim_rewind` |
+| `automation_sim_rewind` | `scriptId`、`mark` | 回滚**数据**到标记点；虚拟时钟继续前进、脚本定时器/订阅不回退（完全重放请重建世界或跑 fixture） |
+| `automation_sim_export` | `scriptId`、`name` | 导出回归用例 `skill/.fixtures/<id>/<name>.json`（与可复用用例同目录）：startAt + seed + 驱动流水（inject/advance）+ 观测写意图 + 脚本版号/sha |
+| `automation_sim_run_fixture` | `scriptId`、`name?`、`assertWrites?`（缺省 true）、`failFast?` | 重放同一目录里的用例并做写意图全序列断言；**用例自带 assert 时自动跳过追尾断言**（游标已被消耗），要强制追加显式传 `true`。`versionDrift=true` 说明脚本已改，先怀疑版本漂移。不传 `name` 只列已有用例 |
+| `automation_sim_close` | `scriptId` | 结束仿真实例、销毁虚拟世界（不持久化）；`follow` 模式下拒绝（用 `automation_stop_script`）。**非收尾命令**：不会回 follow，收尾用 `case.cjs finish` / `switch_verify_mode {"mode":"follow"}` |
+
+`steps[]` 的 `op`：`advance` / `inject_entity` / `inject_context` / `inject_task` / `inject_params` / `inject_suspend` / `mark` / `rewind` / `snapshot` / `assert`。
+
+HTTP 等价：`POST /api/script/:id/verify-mode`（body `{mode,startAt,seed}`）、`GET /api/script/:id/logs?source=sim`（读 `v<n>.sim.log`）。
 
 ### 面板控制（无 confirmed）
 
@@ -79,7 +105,7 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 | `latestVersion` | 最新提交（可能是尚未上线的影子候选） |
 | `shadowVersion` / `shadowRevision` | 当前影子版本号 / 它被原地改过几次 |
 | `productionVersion` | 线上正式版本（真实下发的"唯一裁决者"） |
-| `runningVersion` / `runningVersions` | 实例真正在跑的版本（主实例）/ 全部实例 [{version, mode}]：正式与影子可并行各一个 |
+| `runningVersion` / `runningVersions` | 实例真正在跑的版本（主实例）/ 全部实例 [{version, mode, verifyMode}]：正式与影子可并行各一个，影子的 `verifyMode` 为 `follow` 或 `simulate` |
 | `archivedKind` | 归档分级：`published`（曾上线，回滚候选）/ `discarded`（试错废弃） |
 
 ---
@@ -96,3 +122,20 @@ get_logs                             # 正式验证（[真实写操作] 符合�
 guard_status                         # 核对引用实体与运行健康
 （线上异常）rollback → start → get_logs → publish   # 回滚也是影子验证后发布
 ```
+
+## 典型调用序列（影子仿真验证 + 回归）
+
+```
+submit_script (channel:shadow, newVersion? 仅当正式版也要验)   # 确保有影子版本
+switch_verify_mode simulate + startAt/seed                     # 进虚拟世界
+sim_snapshot (include:writes)                                  # 看启动瞬间
+sim_run_steps (steps: advance/inject_*/assert)                 # 批量用例 + 断言，默认重建
+sim_export → sim_run_fixture                                   # 导出回归资产并重放校验
+# 资产化：把用例存到 skill/.fixtures，执行走 case.cjs（见 .fixtures/README.md）
+#   node skill/tools/case.cjs save <id> <name> / run <id>/<name> / push <id>/<name> --run-fixture
+switch_verify_mode follow   →  case.cjs finish <id>             # 固定收尾：停仿真 + 以 follow 重启同一影子并校验在跑
+start_script (影子版本号) / trigger_script (channel:shadow)      # 5.3 真跑，保持运行、真实触发观察
+publish_script                                                  # 仿真 + follow 都通过、用户确认后才发布
+```
+
+> `sim_close` 不是收尾命令：只销毁虚拟世界并停实例，不会回 follow。正常收尾只走 `switch_verify_mode {"mode":"follow"}`（或 `case.cjs finish`）。
