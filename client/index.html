@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>居控中枢</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <script>
+    /* 首屏同步应用主题，避免闪一下暗/亮 */
+    try {
+      document.documentElement.setAttribute('data-theme', localStorage.getItem('automation.dark') === '1' ? 'dark' : 'light');
+    } catch (e) { document.documentElement.setAttribute('data-theme', 'light'); }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

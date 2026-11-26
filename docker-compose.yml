@@ -1,0 +1,32 @@
+services:
+  ha3d-automation:
+    build: .
+    # 用内网仓库镜像: 删掉上面的 build: .，把下面一行改成
+    # image: 192.168.31.16:4000/sunhuipeng/ha3d-automation:latest
+    # 然后 docker compose pull && docker compose up -d
+    image: ha3d-automation:latest
+    container_name: ha3d-automation
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    volumes:
+      - ./data:/data    # 脚本版本 / 上下文 / 运行日志 / HA 连接配置（config.json），升级镜像不丢
+      - /etc/localtime:/etc/localtime:ro   # 绑定主机时区：容器时钟与 NAS 一致（脚本的"现在"按本地时间算）
+    environment:
+      NODE_ENV: production
+      PORT: 8100
+      HA3D_AUTOMATION_DATA_DIR: /data
+      TZ: Asia/Shanghai   # 显式声明时区兜底（即使主机没挂 /etc/localtime 也正确）
+      # 脚本执行方式三选一：
+      #   inprocess = 单进程（最省内存，全部脚本在主进程 vm 内执行）；
+      #   fork      = 每脚本一个子进程（默认，进程级隔离最硬）；
+      #   worker    = 每脚本一个线程（OS 抢占式调度 + 强杀，内存居中）。
+      # 三种模式脚本与数据完全兼容，改这里重启容器即切换。
+      EXECUTION_MODE: inprocess
+      # HA 地址与 token 也可用环境变量覆盖（默认读 /data/config.json，token 只存服务端不下发前端）：
+      # HA_URL: http://192.168.31.16:8123
+      # HA_TOKEN: <long-lived-token>
+      # MCP 地址: http://主机IP:8100/mcp/sse （WorkBuddy 里添加这个地址即可接入 AI）
+      # HA 在宿主机上时容器内访问：Mac/Windows 用 http://host.docker.internal:8123，
+      # Linux 用 http://宿主机内网IP:8123
+    mem_limit: 256m

@@ -1,0 +1,15 @@
+node_modules
+client/node_modules
+client/dist
+data
+.git
+.gitignore
+skill/.cache
+tests
+# scripts/ 只放行构建期要用到的 skill 打包器，其余（推送镜像等本地脚本）不进上下文
+scripts/*
+!scripts/pack-skill.cjs
+*.md
+docker-compose.yml
+Dockerfile
+.dockerignore
