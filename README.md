@@ -55,6 +55,16 @@ npm start                   # http://localhost:8100
 
 开发模式：终端 A `npm start`，终端 B `npm --prefix client run dev`（Vite 5176，代理到 8100）。
 
+### Docker 部署 / 公开镜像
+
+公开镜像仓库：<https://cnb.cool/sunhuipeng/ha3d-images>（打开后点顶部「**制品**」查看全部镜像与 tag）。公开仓库无需登录即可拉取，镜像为 **amd64 + arm64** 多架构：
+
+```bash
+docker pull docker.cnb.cool/sunhuipeng/ha3d-images/ha3d-automation:latest
+```
+
+用公开镜像部署：删掉 `docker-compose.yml` 里的 `build: .`，把 `image:` 改成 `docker.cnb.cool/sunhuipeng/ha3d-images/ha3d-automation:latest`，再 `docker compose up -d`（首次自动拉取；更新用 `docker compose pull && docker compose up -d`）。端口 `8100`、数据卷 `./data`（脚本版本 / 上下文 / 日志 / HA 连接配置）、`/etc/localtime` 时区挂载与 `EXECUTION_MODE` 等环境变量沿用自带 compose，升级镜像不丢数据。
+
 ### 启动方式对比
 
 | 命令 | 用途 | 写操作（控制真实设备） | 适用场景 |
