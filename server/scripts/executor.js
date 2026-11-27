@@ -32,7 +32,7 @@ const subscriptions = new Map(); // entityId -> Set<child>
 /* ctx.global.watch：namespace -> key -> Set<entry>。读侧统一正式命名空间（不隔离），
  * 写侧仍按调用者 dryRun 落桶；脚本消息里的 scope/key 会被校验，namespace 不信任脚本。 */
 const ctxWatchers = new Map();
-/* ctx.watch.task：scriptId -> Set<观察者实例>。与 global 订阅分离，
+/* ctx.task.watch：scriptId -> Set<观察者实例>。与 global 订阅分离，
  * 状态来源为实例生命周期，不做命名空间读写。 */
 const taskWatchers = new Map();
 const MAX_CALL_DEPTH = 5;       // ctx.call 调用链深度上限，防 A→B→A 无限递归
@@ -302,7 +302,7 @@ function runningList() {
   }));
 }
 
-/* ---------- ctx.task / ctx.watch.task：依赖脚本状态裁决 ----------
+/* ---------- ctx.task（status / require / watch）：依赖脚本状态裁决 ----------
  * 只读接口一律看依赖的**正式实例**，与调用者影子/正式无关：状态查询、等待、监听
  * 都不产生设备副作用，没必要做通道隔离。写隔离仍由 ctx.write / ctx.global.set 负责。
  * 返回值保留 version/mode 供日志辨识（mode 正常恒为 production）。重启抖动业务侧防抖。 */
@@ -569,7 +569,7 @@ function handleChildMessage(entry, msg, connector) {
     if (!set) { set = new Set(); taskWatchers.set(sid, set); }
     if (msg.type === 'taskSubscribe') {
       set.add(entry);
-      observeEntry(entry, 'taskDep', sid); // 运行时拓扑：订阅依赖（ctx.watch.task / require 的等待门闩）
+      observeEntry(entry, 'taskDep', sid); // 运行时拓扑：订阅依赖（ctx.task.watch / require 的等待门闩）
       sendTaskState(entry, sid, 'subscribed'); // 注册即回放当前状态，避免等不到"从无到有"的事件
     } else {
       set.delete(entry);
@@ -1271,10 +1271,10 @@ async function simExport(sid, name, opts = {}) {
   return { ok: true, scriptId: id, name: String(name), file, steps: (payload.steps || []).length, writes: ((payload.expected || {}).writes || []).length };
 }
 
-/* 重放 fixture：默认重建世界 → 跑 steps → 按导出的写意图做一次全序列断言。
- * 用例自带 assert 步骤时不再追加全序列断言：那些 assert 已经消耗了 seq 游标，
- * 追尾断言只会看到 0 条写意图而误判（"用例自带断言"的用例请用 case.cjs run 跑全序列）。
- * versionDrift 表示导出时的影子版号与当前不同（脚本可能已改，断言失败先怀疑这个）。 */
+/* 重放 fixture：默认重建世界 → 跑 steps → 追加一条 since:0 的写意图全序列断言。
+ * since:0 使追尾断言不受用例自带 assert 消耗 seq 游标的影响：自带 assert 验各段增量，
+ * 追尾断言验全序列，两者各验各的、可以并存（旧实现直接跳过，会漏掉全序列这层校验）。
+ * versionDrift 表示导出时的影子版号/源码 sha 与当前不同（脚本可能已改，断言失败先怀疑这个）。 */
 async function simRunFixture(sid, name, opts = {}) {
   const id = String(sid || '');
   const fx = store.readFixture(id, name);
@@ -1282,8 +1282,9 @@ async function simRunFixture(sid, name, opts = {}) {
   const steps = Array.isArray(fx.steps) ? [...fx.steps] : [];
   const expected = ((fx.expected || {}).writes) || [];
   const hasOwnAsserts = steps.some((s) => s && s.op === 'assert');
-  if (opts.assertWrites !== false && !hasOwnAsserts) {
-    steps.push({ op: 'assert', label: `fixture:${name}`, writes: expected });
+  /* expected 为空且用例自带断言时追加空序列断言只会误报，此时不追尾；其余情况都追加。 */
+  if (opts.assertWrites !== false && (expected.length > 0 || !hasOwnAsserts)) {
+    steps.push({ op: 'assert', label: `fixture:${name}`, since: 0, writes: expected });
   }
   const r = await simRunSteps(id, { startAt: fx.startAt, seed: fx.seed, steps, failFast: opts.failFast });
   const curV = store.versionOfChannel(id, 'shadow');

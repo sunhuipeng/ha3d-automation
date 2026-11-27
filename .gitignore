@@ -3,3 +3,6 @@
 *.json
 /skill/.cache/
 /.work/
+/skill/.scripts/
+/skill/.work/
+/skill.zip

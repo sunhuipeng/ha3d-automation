@@ -483,7 +483,8 @@ function clearSimCrash(id, version) {
 }
 
 /* 仿真用例（fixture，P2 sim_export）：skill/.fixtures/<脚本id>/<用例名>.json
- * 直接放 skill 目录（可复用资产与导出落点合一，随 skill.zip 走），不再有 data/fixtures 副本。
+ * 直接放 skill 目录（可复用资产与导出落点合一），不再有 data/fixtures 副本；
+ * pack-skill 打包默认跳过 .fixtures/.scripts，要分发请手动拷贝。
  * 用例名限制字符集，避免 ../ 路径穿越；只允许字母数字与 _ . -。 */
 const FIXTURE_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
 
@@ -528,6 +529,39 @@ function readLogLines(file, limit) {
   } catch (e) { return []; }
 }
 
+/* 带游标的日志分页（前端上翻加载更早）：before = { ts, ord }，ord 是同一毫秒内的序号——
+ * 高频脚本一毫秒会落多条日志，只用 ts 当游标会漏掉同毫秒兄弟行，必须二元组一起比。
+ * 追加写不动历史行、超限截断只砍头部，所以 (ts, ord) 游标天然稳定（offset 行号会被追加推走）。
+ * 返回 { logs, hasMore, cursor }：cursor 指向本页第一条，前端原样传回 before 续翻。 */
+function pageLogLines(file, limit, before) {
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const parsed = lines.map((line) => { try { return JSON.parse(line); } catch (e) { return { level: 'raw', message: line }; } });
+    let lastTs;
+    let ord = 0;
+    for (const e of parsed) {
+      ord = (e.ts != null && e.ts === lastTs) ? ord + 1 : 0;
+      if (e.ts != null) lastTs = e.ts;
+      e._ord = ord;
+    }
+    let list = parsed;
+    if (before && Number.isFinite(before.ts)) {
+      const bOrd = Math.max(0, Number(before.ord) || 0);
+      /* 残行（level:raw 无 ts）按位置原样保留：比 before 早的部分参与分页 */
+      list = parsed.filter((e) => e.ts == null
+        || e.ts < before.ts
+        || (e.ts === before.ts && e._ord < bOrd));
+    }
+    const page = list.slice(-limit);
+    const first = page[0];
+    return {
+      logs: page,
+      hasMore: list.length > page.length,
+      cursor: (first && first.ts != null) ? { ts: first.ts, ord: first._ord || 0 } : null,
+    };
+  } catch (e) { return { logs: [], hasMore: false, cursor: null }; }
+}
+
 function readLogs(id, version, limit = 200) {
   /* M6：入口校验 id 与 version，避免 ../ 路径穿越跨脚本读日志。 */
   if (!safeId(id) || !Number.isInteger(version) || version < 1) return [];
@@ -538,6 +572,15 @@ function readLogs(id, version, limit = 200) {
 function readSimLogs(id, version, limit = 200) {
   if (!safeId(id) || !Number.isInteger(version) || version < 1) return [];
   return readLogLines(simLogFile(id, version), limit);
+}
+
+/* 分页读取（HTTP 路由用）：sim=true 读仿真日志；before 为空时等价 readLogs 但带 hasMore */
+function readLogPage(id, version, { sim = false, limit = 100, before = null } = {}) {
+  if (!safeId(id) || !Number.isInteger(version) || version < 1) {
+    return { logs: [], hasMore: false, cursor: null };
+  }
+  const file = sim ? simLogFile(id, version) : logFile(id, version);
+  return pageLogLines(file, limit, before);
 }
 
 function appendLog(id, version, entry) {
@@ -607,7 +650,7 @@ module.exports = {
   safeId, newScriptId, validateFlow, kindOf,
   list, listVersions, get, submit, publish, rollback, removeVersion, removeScript, getMeta,
   channelOf, normalizeChannels, versionOfChannel, detailedVersions,
-  readLogs, readSimLogs, appendLog, simLogFile, simCrashFile, writeSimCrash, readSimCrash, clearSimCrash, cleanupRuntimeLogs,
+  readLogs, readSimLogs, readLogPage, appendLog, simLogFile, simCrashFile, writeSimCrash, readSimCrash, clearSimCrash, cleanupRuntimeLogs,
   writeFixture, readFixture, listFixtures,
   EXECUTION_HOST_MODES,
 };

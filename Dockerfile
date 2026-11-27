@@ -22,6 +22,9 @@ COPY client/package.json client/package-lock.json ./client/
 RUN npm --prefix client ci --no-audit --no-fund
 
 COPY client ./client
+# App.vue 直接 import 根 package.json 取版本号（../../package.json）：
+# 不带这个文件 Vite 会报 "Could not resolve ../../package.json from src/App.vue"
+COPY package.json ./
 # Vite 构建本身就带 minify
 RUN npm --prefix client run build
 

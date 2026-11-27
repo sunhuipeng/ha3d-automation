@@ -98,6 +98,22 @@ function reply(id, ok, result, error) {
   parentPort.postMessage({ type: 'simReply', id, ok, result, error });
 }
 
+/* 仿真控制消息表驱动：type -> (msg, session, core) => 结果（同步值或 Promise 统一）。
+ * 新增 sim 消息只需在表里加一行，不再复制「查 session → 调方法 → reply」的样板。 */
+const SIM_HANDLERS = {
+  simInject: (msg, s) => s.inject(msg.payload),
+  simAdvance: (msg, s) => s.advance(msg.ms),
+  simRunSteps: (msg, s, c) => s.runSteps(msg.steps || [], {
+    failFast: msg.failFast === true,
+    coreState: () => (c ? c.simState() : {}),
+  }),
+  simSnapshot: (msg, s, c) => s.snapshot({ ...(msg.opts || {}), coreState: () => (c ? c.simState() : {}) }),
+  simAssert: (msg, s, c) => s.assertNow(msg.step || {}, { since: msg.since, coreState: () => (c ? c.simState() : {}) }),
+  simMark: (msg, s) => s.mark(msg.name),
+  simRewind: (msg, s) => s.rewind(msg.mark),
+  simExport: (msg, s) => s.exportCase(),
+};
+
 parentPort.on('message', (msg) => {
   if (!msg || typeof msg !== 'object') return;
   if (msg.type === 'run') {
@@ -127,65 +143,16 @@ parentPort.on('message', (msg) => {
     core.handleMessage(msg);
     return;
   }
-  if (msg.type === 'simInject') {
+  const handler = SIM_HANDLERS[msg.type];
+  if (handler) {
     if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
-    try { return reply(msg.id, true, session.inject(msg.payload)); }
-    catch (e) { return reply(msg.id, false, null, e && e.message || String(e)); }
-  }
-  if (msg.type === 'simAdvance') {
-    if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
+    const s = session;   // 捕获当下引用：等待期间 simClose 置空也不影响本次应答
+    const c = core;
     Promise.resolve()
-      .then(() => session.advance(msg.ms))
+      .then(() => handler(msg, s, c))
       .then((result) => reply(msg.id, true, result))
       .catch((e) => reply(msg.id, false, null, e && e.message || String(e)));
     return;
-  }
-  if (msg.type === 'simRunSteps') {
-    if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
-    Promise.resolve()
-      .then(() => {
-        const c = core;
-        return session.runSteps(msg.steps || [], {
-          failFast: msg.failFast === true,
-          coreState: () => (c ? c.simState() : {}),
-        });
-      })
-      .then((result) => reply(msg.id, true, result))
-      .catch((e) => reply(msg.id, false, null, e && e.message || String(e)));
-    return;
-  }
-  if (msg.type === 'simSnapshot') {
-    if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
-    try {
-      const c = core;
-      return reply(msg.id, true, session.snapshot({
-        ...(msg.opts || {}), coreState: () => (c ? c.simState() : {}),
-      }));
-    } catch (e) { return reply(msg.id, false, null, e && e.message || String(e)); }
-  }
-  if (msg.type === 'simAssert') {
-    if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
-    try {
-      const c = core;
-      return reply(msg.id, true, session.assertNow(msg.step || {}, {
-        since: msg.since, coreState: () => (c ? c.simState() : {}),
-      }));
-    } catch (e) { return reply(msg.id, false, null, e && e.message || String(e)); }
-  }
-  if (msg.type === 'simMark') {
-    if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
-    try { return reply(msg.id, true, session.mark(msg.name)); }
-    catch (e) { return reply(msg.id, false, null, e && e.message || String(e)); }
-  }
-  if (msg.type === 'simRewind') {
-    if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
-    try { return reply(msg.id, true, session.rewind(msg.mark)); }
-    catch (e) { return reply(msg.id, false, null, e && e.message || String(e)); }
-  }
-  if (msg.type === 'simExport') {
-    if (!session) return reply(msg.id, false, null, '当前不是仿真实例');
-    try { return reply(msg.id, true, session.exportCase()); }
-    catch (e) { return reply(msg.id, false, null, e && e.message || String(e)); }
   }
   if (msg.type === 'simClose') {
     intentionalStop = true;

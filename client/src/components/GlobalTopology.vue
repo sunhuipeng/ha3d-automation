@@ -11,6 +11,8 @@ import {
   forceLink, forceManyBody, forceCollide, forceX, forceY,
 } from 'd3-force';
 import TopoNode from './TopoNode.vue';
+import LiveValueTip from './LiveValueTip.vue';
+import { useLiveTip } from '../lib/live-tip';
 import { useScriptStore } from '../stores/scripts';
 import {
   KIND, REL, collideR, arrowMarker, edgePath, dedupeLinks, pinSimNode, toFlowNodes, settleSync,
@@ -39,7 +41,8 @@ const posCache = new Map();
 let simNodes = [];
 let simLinks = [];
 let linkDefs = [];   // { source:id, target:id, rel }
-let nodeDefs = new Map(); // id -> { kind, label, sub }
+let nodeDefs = new Map(); // id -> { kind, label, sub, owners? }
+let scriptNameMap = {};   // sid -> 脚本名（buildGraph 刷新；hover 分组展示用）
 let componentCenters = new Map(); // nodeId -> {x,y}：所属连通分量的目标中心
 let compKeyByNode = new Map();    // nodeId -> 分量稳定 key（成员脚本 id 排序拼接，刷新后保持选中）
 let compList = [];                // [{ key, label, nodeCount }] 供子图筛选下拉使用
@@ -126,16 +129,18 @@ function buildGraph(json) {
       if (!defs.has(id)) defs.set(id, { id, kind: 'entity', label: friendly(e, labelMap), sub: String(e) });
       links.push({ source: sId, target: id, rel: 'write' });
     }
-    for (const c of g.contextReads || []) {
+    /* 上下文节点补 owners（方案 A）：local 上下文的值存在 scriptId:mode 命名空间下，
+     * 全局图节点不区分脚本，hover 取值时需要知道查哪个脚本的桶；global 虽与脚本无关，也一并记录。
+     * 同一 key 被多个脚本读/写时 owners 累积，hover 分组展示各脚本的值。 */
+    const ctxNode = (c, sid) => {
       const id = nodeId('context', c);
-      if (!defs.has(id)) defs.set(id, { id, kind: 'context', label: String(c), sub: '上下文' });
-      links.push({ source: id, target: sId, rel: 'contextRead' });
-    }
-    for (const c of g.contexts || []) {
-      const id = nodeId('context', c);
-      if (!defs.has(id)) defs.set(id, { id, kind: 'context', label: String(c), sub: '上下文' });
-      links.push({ source: sId, target: id, rel: 'contextWrite' });
-    }
+      const ex = defs.get(id);
+      if (!ex) defs.set(id, { id, kind: 'context', label: String(c), sub: '上下文', owners: [sid] });
+      else if (!ex.owners.includes(sid)) ex.owners.push(sid);
+      return id;
+    };
+    for (const c of g.contextReads || []) links.push({ source: ctxNode(c, sid), target: sId, rel: 'contextRead' });
+    for (const c of g.contexts || []) links.push({ source: sId, target: ctxNode(c, sid), rel: 'contextWrite' });
     /* 脚本间显式关系：call=控制流 A→B（调起执行）；taskDep=状态流 B→A（B 的状态被 A 消费）。
      * 方向沿用全图"数据流"口径，同一对脚本可同时有双向两条边（颜色不同可区分） */
     for (const t of g.calls || []) {
@@ -150,6 +155,7 @@ function buildGraph(json) {
   /* 去掉孤立脚本？保留——脚本本身是图的主角，即使暂无观测也显示 */
   nodeDefs = defs;
   linkDefs = dedupeLinks(links);
+  scriptNameMap = scriptNames; // hover 取值分组时展示脚本名
 }
 
 function runSimulation(first) {
@@ -255,8 +261,22 @@ watch(selectedComp, async () => {
   fitView({ padding: 0.15, duration: 300 });
 });
 
-function onNodeEnter({ node }) { hovered.value = node.id; renderEdges(); }
-function onNodeLeave() { hovered.value = null; renderEdges(); }
+/* ---------- hover：连线高亮（原有）+ 实时取值浮层（方案 A）----------
+ * 实体取 data.sub（entity_id）；上下文取 data.label（scope.key）：
+ * global 单请求读正式桶；local 按 owners 分组并行查各脚本的命名空间（多脚本同 key 时分组展示）。
+ * hover 期间 3s 轮询；拖动开始即隐藏，避免浮层跟着节点跑。 */
+const { tip, open, move, hide } = useLiveTip({ pollMs: 3000 });
+function onNodeEnter({ node, event }) {
+  hovered.value = node.id;
+  renderEdges();
+  const d = node.data || {};
+  if (d.kind === 'entity') open(event, { kind: 'entity', id: d.sub });
+  else if (d.kind === 'context') {
+    open(event, { kind: 'context', id: d.label, scriptIds: d.owners?.length ? d.owners : [''], groupLabels: scriptNameMap });
+  }
+}
+function onNodeLeave() { hovered.value = null; renderEdges(); hide(); }
+function onNodeMove({ event }) { move(event); }
 
 onMounted(load);
 /* 事件联动刷新（不加定时轮询）：左侧列表由 WS 广播驱动，启动/停止/发布/删除脚本时
@@ -321,8 +341,8 @@ function fmtTime(ts) {
         :nodes-connectable="false" :elements-selectable="false" :nodes-focusable="false"
         :edges-updatable="false" :zoom-on-double-click="false" :zoom-on-scroll="true"
         :pan-on-scroll="false" fit-view-on-init :min-zoom="0.12" :max-zoom="2"
-        @node-drag="onNodeDrag" @node-drag-stop="onNodeDragStop"
-        @node-mouse-enter="onNodeEnter" @node-mouse-leave="onNodeLeave"
+        @node-drag="onNodeDrag" @node-drag-stop="onNodeDragStop" @node-drag-start="hide"
+        @node-mouse-enter="onNodeEnter" @node-mouse-leave="onNodeLeave" @node-mouse-move="onNodeMove"
       >
         <template #node-gt="p">
           <TopoNode :data="p.data" />
@@ -332,6 +352,7 @@ function fmtTime(ts) {
         </template>
         <Background :gap="20" :size="1.4" pattern-color="var(--vf-dot, #d5dae2)" />
       </VueFlow>
+      <LiveValueTip :tip="tip" />
     </div>
   </div>
 </template>

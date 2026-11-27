@@ -102,26 +102,20 @@ async function cmdRun(args) {
   if (args.includes('--fail-fast')) payload.failFast = true;
 
   console.log(`▶ ${label}（${c.scriptId}，${c.steps.length} 步${reuse ? '，续跑现有会话' : '，重建世界'}）`);
+
+  /* 全序列写意图断言与 sim_run_fixture 同一机制：追加一条 since:0 的 assert 步骤。
+   * since:0 不受 steps 内自带 assert 消耗 seq 游标的影响，直接对全程写意图收口。 */
+  const expected = ((c.expected || {}).writes) || [];
+  if (expected.length) {
+    payload.steps = [...payload.steps, {
+      op: 'assert', label: `expected:全序列(${expected.length}条)`, since: 0, writes: expected,
+    }];
+  }
+
   const out = await callToolText('automation_sim_run_steps', payload, { clientName: 'ha3d-case' });
   const d = JSON.parse(out);
   report(d);
-  let ok = d.ok;
-
-  /* steps 里的 assert 会各自消耗 seq 游标，所以"全序列写意图"要单独用 sim_assert + since:0 验一遍。 */
-  const expected = ((c.expected || {}).writes) || [];
-  if (expected.length) {
-    const aOut = await callToolText('automation_sim_assert', {
-      scriptId: c.scriptId, since: 0, writes: expected, label: `expected:全序列(${expected.length}条)`, confirmed: true,
-    }, { clientName: 'ha3d-case' });
-    const a = JSON.parse(aOut);
-    console.log(`  全序列断言：${a.ok ? 'PASS' : 'FAIL'} ${a.label || ''}`);
-    for (const chk of (a.checks || []).filter((x) => !x.pass)) {
-      console.log(`    ✗ ${chk.kind}: ${chk.message || ''}`);
-      console.log(`      expected=${short(chk.expected)}`);
-      console.log(`      actual  =${short(chk.actual)}`);
-    }
-    if (!a.ok) ok = false;
-  }
+  const ok = d.ok;
 
   if (!ok) process.exitCode = 1;
 }

@@ -11,7 +11,7 @@
 
 | | `follow`（影子模式，默认） | `simulate`（仿真） |
 |---|---|---|
-| 实体状态 | 真实 HA 当前值 | 虚拟实体表（种子 + 注入，`callService` 会回写并派发 `state` 形成闭环） |
+| 实体状态 | 真实 HA 当前值 | 虚拟实体表（种子 + 注入，`callService` 会回写并派发 `state` 形成闭环；**未进种子的实体** `callService` 时也会自动建表回写，但 `getState`/`listEntities` 读不到——判据要读的实体必须放种子） |
 | 时钟 | 真实时间 | 虚拟时钟，只有 `advance` 才前进（不推进就永远不走） |
 | `ctx.write` | 只记 `[影子·拦截写操作]`，不进流程 | 记**写意图**（`service` + `write` 两条），驱动流程继续 |
 | 外部动作 | 不真实下发 | 不真实下发，`ctx.actions` 里的 HA 调用由 host 在微任务内应答 |
@@ -21,7 +21,7 @@
 
 **职责边界（硬规则）**
 - 仿真里**不造假失败**。需要看"设备没响应脚本怎么办"，把实例手动切到 `follow` 用真实设备跑。
-- 仿真只覆盖本脚本，不联动其他脚本；依赖脚本的状态用 `inject_task` 造。
+- 仿真只覆盖本脚本，不联动其他脚本；依赖脚本的状态用 `inject_task` 造（各接口具体口径见 §4.4）。
 - 仿真通过 ≠ 线上可用。`publish` 前必须在 `follow` 下用真实设备跑一轮（`publish` 守卫照旧）。
 
 ---
@@ -84,13 +84,13 @@ node skill/tools/mcp-call.cjs automation_sim_snapshot '{"scriptId":"<id>","since
 
 节奏建议：**每次只推进到下一个判据边界前后**（如 2999 / 3000ms），先看 `writes` 再下结论。
 
-### 4.2 批量用例（推荐，一次跑完 + 断言）
+### 4.2 批量用例（推荐，一次跑完 + 断言）—— case.json DSL 完整说明
 
 ```bash
 node skill/tools/mcp-call.cjs automation_sim_run_steps "$(cat case.json)"
 ```
 
-`case.json` 形如：
+一个完整用例（先验启动静默，再验 3 秒窗口边界两边的写意图）：
 
 ```json
 {
@@ -109,7 +109,85 @@ node skill/tools/mcp-call.cjs automation_sim_run_steps "$(cat case.json)"
 }
 ```
 
-返回体读四个数：`ok` / `passed` / `failed` / `total`，再看 `steps[].checks` 里失败的 `expected` 与 `actual`，最后看 `final.writes` 的时间点。
+#### 顶层字段
+
+| 字段 | 必填 | 含义与用法 |
+|---|---|---|
+| `scriptId` | ✅ | 目标脚本 id；目标必须已有影子版本（正式版不可仿真，见 §2 前置条件 2） |
+| `startAt` | — | 虚拟时钟起点，ISO 带时区。缺省 = 当前真实时刻。时间型脚本建议取**业务窗口边界**（如 `input_datetime` 的开启时刻），别随手取当前时间 |
+| `seed` | — | 初始虚拟世界。`seed.entities`：`entity_id → {state, attributes?, friendly_name?}`，entity_id 必须真实存在、枚举大小写照抄（`Off`/`off`/`unavailable` 不能猜）；`seed.context`：`{global:{}, local:{}}` 预置上下文 |
+| `steps` | ✅ | 驱动 + 断言流水，按序逐条执行，op 见下表 |
+| `continue` | — | 缺省 `false`：**每次重建虚拟世界**（`startAt/seed` 生效，用例可独立重跑）；`true`：在当前会话续跑，此时**不能再传 `startAt/seed`**（二者互斥，服务端会报错） |
+| `failFast` | — | 缺省 `false`：断言失败**不中断**，收集全部失败点一次看完；`true`：首个失败的 assert 即停 |
+| `confirmed` | ✅ | MCP 写操作安全确认，恒为 `true` |
+
+#### steps[] 的 op 一览（每条形如 `{op, ...参数}`）
+
+- 未知 `op` 报错并**中断整次执行**（返回 `aborted:true`，后面步骤不再跑）；非断言步骤抛异常同样中断。断言失败默认只收集、不中断（`failFast:true` 才停）。
+
+| op | 字段 | 含义与用法 |
+|---|---|---|
+| `advance` | `ms` | 推进虚拟时钟，到点定时器按 dueAt 顺序触发。**时钟只有 advance 才前进**，不推进就永远不走；`ms` 是虚拟毫秒。节奏：每次只推进到下一个判据边界前后（2999 / 3000） |
+| `inject_entity` | `entityId`、`state?`、`attributes?`、`friendly_name?` | 注入一次实体变化：**先改虚拟表再触发订阅回调**（脚本 `ctx.watch` 会收到"状态变了"）。`state` 枚举大小写照抄真实值 |
+| `inject_context` | `scope?`（global/local，缺省 global）、`key`、`value` | 写虚拟上下文桶并派发 context 事件，用于预置/模拟其他脚本写入的共享键 |
+| `inject_task` | `scriptId`、`state`（`running/stopped/error/paused`） | 造"依赖脚本"的任务态。仿真不联动其他脚本，依赖其状态只能这样造 |
+| `inject_params` | `params` | 覆盖触发参数。**仅在下一次进入 simulate 时生效**，运行中注入只在快照可见并记 warn 日志 |
+| `inject_suspend` | `suspend?`（缺省 `true`） | 模拟实例挂起；传 `false` 表示恢复 |
+| `snapshot` | `since?`、`include?`、`entityScope?` | 用例中途留证据（字段同 §3 `sim_snapshot`），结果挂在 `results[i].snapshot` |
+| `mark` | `name?`（缺省 `m<序号>`） | 给世界**数据**打标记（实体 / 上下文 / task） |
+| `rewind` | `mark`（或 `name`） | 世界数据回滚到标记点。**时钟与脚本内部状态（定时器、keepAlive、已执行的续体）不回退**——要完全重放请重建世界或用 4.3 fixture 重放 |
+| `assert` | 见下表 | 断言。断言完成后游标推进，下一段断言只看新增 |
+
+#### assert 字段（各字段之间 AND）
+
+`writes/noWrites` 看写意图（**硬证据**），`state/context/logs` 是辅证。除注明外，都只看「**上次 assert 之后新增**」的增量（游标语义见文末）。
+
+| 字段 | 形态 | 语义 |
+|---|---|---|
+| `label` | 字符串 | 断言名（也可 `name`），失败排查时 human-readable |
+| `writes` | `[{kind?,op?,nodeId?,desc?,args?}]` | **全序列等长 + 逐条部分匹配**：条数必须相等，每条只比"给出了的字段"，`args` 一旦给出必须**完全相等** |
+| `noWrites` | `true` 或 `["op1","op2"]` | `true` = 本段不允许任何写意图；数组 = 不允许这些 op |
+| `state` | `[{entityId, state?, attributes?}]` | 虚拟实体当前值。`state` 宽松比较（String 化后相等即过），`attributes` 深比较 |
+| `context` | `[{scope?, key, value}]` | 虚拟上下文当前值，`value` 深比较；`scope` 缺省 global |
+| `logs` | `["子串"]` 或 `[{level?, message?}]` | 本段日志里**出现过**即通过；字符串 = 包含匹配，对象 = `level` 相等且 `message` 包含 |
+| `expect` | 路径 DSL（下） | 任意路径断言。`writes/logs` 沿用增量基准，`entities/context/stats/timers/watchers/execution/tasks/clockNow/at/seq` 看**当前世界全量**；要看全量写/日志用 `allWrites/allLogs` |
+
+#### expect 路径 DSL（无 eval，安全路径解析）
+
+- 单条：`{ "path": "...", "<算子>": 值 }`；顶层直接给数组 = 全部满足（AND）。
+- 组合器：`all` / `any` / `not`，可嵌套。
+- 算子：`eq` / `ne` / `gt` / `gte` / `lt` / `lte` / `match`（正则）/ `includes` / `exists` / `type`。
+
+```json
+[
+  { "path": "writes[0].op", "eq": "heatOn" },
+  { "path": "writes.length", "gte": 2 },
+  { "path": "logs[-1].message", "includes": "开水器开起啦" },
+  { "path": "context.global[\"waterHeater.avoiding\"]", "eq": true },
+  { "path": "entities[\"sensor.p\"].state", "type": "string" },
+  { "any": [ { "path": "stats.sent", "gt": 0 }, { "path": "timers.length", "eq": 0 } ] }
+]
+```
+
+path 常用位置：`writes[i].kind/op/nodeId/args/at`、`writes.length`、`logs[-1].message`（负数 = 倒数第 N 条）、`context.global["x.y"]`、`entities["sensor.p"].state`、`stats.sent`、`timers.length`、`execution.state`、`tasks["<scriptId>"]`。
+
+#### 两条计数陷阱（必记）
+
+1. 一次 `ctx.write(...)` 产生**两条**写意图：`kind:'service'` + `kind:'write'`。断言 `writes` 数量要 ×2，或者只按 `op` 部分匹配。
+2. `ctx.global.set` / `ctx.local.set` 也会产生写意图：`kind:'context', op:'contextSet'`。断言序列里漏了它必失败。
+
+#### 游标语义
+
+`writes` / `logs` / `expect` 里的 `writes/logs` 默认只看「上次断言之后新增」，避免上一段证据重复计入（每个 assert 结束时游标推进到当前 seq）。要重看全量：单独调 `sim_assert` 时传 `since:0`；用例内的 assert 只能用增量（多个 assert 就是天然分段）。
+
+#### 返回体怎么读
+
+```json
+{ "ok": true, "total": 3, "passed": 3, "failed": 0, "executed": 7, "aborted": false, "results": [...], "final": {...} }
+```
+
+- `ok` = 全部通过且未中断；`total/passed/failed` 只数 assert；`executed` 是实际执行的步骤数（中断时会小于 steps 长度）；`aborted=true` 表示中途抛异常/未知 op。
+- 失败排查顺序：先看 `results[i].checks[]` 里 `pass:false` 的 `expected` vs `actual`（附中文 message），再对照 `final.writes` 的 `at`（虚拟毫秒）核对时间点。
 
 ### 4.3 归档 → 重放（把这次跑通变成回归资产）
 
@@ -130,59 +208,33 @@ node skill/tools/case.cjs push <id>/<name> --run-fixture      # 走服务端 sim
 - `fixture.versionDrift=true` → 脚本已改（版号或 sha 变），断言失败先怀疑版本漂移，而不是逻辑回归。手写用例记得填 `scriptVersion`，否则会误报漂移。
 - 用例格式、收录门槛、索引表见 `skill/.fixtures/README.md`。
 
----
+### 4.4 跨脚本联动在仿真里的口径（ctx.call / ctx.task.*）
 
-## 5. `steps[]` 字段速查
+仿真只覆盖本脚本，不联动其他脚本（硬规则）。涉及另一个脚本时，各接口的仿真实现与验证边界：
 
-| `op` | 字段 | 说明 |
+| 接口 | 仿真实现 | 能验证 / 验不了 |
 |---|---|---|
-| `advance` | `ms` | 推进虚拟时钟（走 `advance()` 包装，会记入 tape 供导出） |
-| `inject_entity` | `entityId`、`state?`、`attributes?`、`friendly_name?` | 改虚拟实体并触发订阅回调（先改表再触发） |
-| `inject_context` | `scope?`（global/local）、`key`、`value` | 写虚拟上下文桶 |
-| `inject_task` | `scriptId`、`state`（running/stopped/error/paused） | 造依赖脚本状态（本脚本不联动其他脚本） |
-| `inject_params` | `params` | 覆盖触发参数 |
-| `inject_suspend` | `suspend?`（缺省 true） | 模拟实例挂起 |
-| `snapshot` | `since?`、`include?`、`entityScope?` | 用例中途留证据 |
-| `mark` / `rewind` | `name` | 世界数据标记 / 回滚（时钟不回退） |
-| `assert` | 见 §6 | 断言；游标 = 自上次断言以来新增 |
+| `ctx.call` | 仿真宿主直接回 **mock 回执** `{id, version:0, mode:'shadow', started:true, mocked:true}`——只证明"调用链路走到了" | ✅ 调用后的后续逻辑；❌ 被调脚本真的执行、其内部动作（那是它自己的仿真/影子的事） |
+| `ctx.task.status` | 读虚拟任务表；**没注入过的脚本默认 `stopped`**，返回结构与真实模式一致（`version:0, mode:'production'`） | ✅ 依赖各状态分支的读侧反应 |
+| `ctx.task.require` | **完全可验证**：轮询定时器走虚拟时钟（只有 `advance` 才走）；`inject_task` 派发 `taskState` 会**提前唤醒**等待门闩 | ✅ `inject_task {state:'running'}` 验放行；不注入 + `advance` 推过 timeout 验超时抛错/降级（timeout 是虚拟时间） |
+| `ctx.task.watch` | 可用，但**注册无回放**：真实模式注册即回放当前状态，仿真里 `taskSubscribe` 被忽略，回调只在 `inject_task` 派发 `taskState` 时触发 | ⚠️ 脚本若依赖"注册即知道依赖当前状态"，仿真里要**补一条 `inject_task`**（状态与真实当前一致） |
 
-**重建规则**：`sim_run_steps` 默认**每次重建虚拟世界**（用例可独立重跑，`startAt/seed` 生效）；`continue:true` 才在当前会话续跑（此时**不能**再传 `startAt/seed`，二者互斥）。
+验证示例（依赖等待 + 超时降级）：
 
----
-
-## 6. 断言写法（写意图是硬证据，其余是辅证）
-
-| 字段 | 形态 | 说明 |
-|---|---|---|
-| `writes` | `[{kind?,op?,nodeId?,desc?,args?}]` | **全序列等长 + 逐条部分匹配**：字段给了才比，`args` 要完全相等 |
-| `noWrites` | `true` 或 `["op1","op2"]` | `true` = 不允许任何写；数组 = 不允许这些 op |
-| `state` | `[{entityId,state?,attributes?}]` | 虚拟实体终值 |
-| `context` | `[{scope?,key,value}]` | 虚拟上下文终值（`value` 深比较） |
-| `logs` | `["子串"]` 或 `[{level?,message?}]` | 日志出现（`message` 按包含匹配） |
-| `expect` | 路径 DSL | 见下 |
-
-**`expect` DSL**（无 eval，安全路径解析）：
 ```json
 [
-  { "path": "writes[0].op", "eq": "heatOn" },
-  { "path": "writes.length", "gte": 2 },
-  { "path": "logs[-1].message", "includes": "开水器开起啦" },
-  { "path": "context.global[\"waterHeater.avoiding\"]", "eq": true },
-  { "path": "entities[\"sensor.p\"].state", "type": "string" },
-  { "any": [ { "path": "stats.sent", "gt": 0 }, { "path": "timers.length", "eq": 0 } ] }
+  { "op": "advance", "ms": 30000 },
+  { "op": "assert", "label": "require 30s 超时 → 降级分支", "logs": ["等待依赖脚本"] },
+  { "op": "inject_task", "scriptId": "<依赖id>", "state": "running" },
+  { "op": "assert", "label": "依赖就绪 → 正常分支", "writes": [{ "op": "<放行后的写>" }] }
 ]
 ```
-算子：`eq/ne/gt/gte/lt/lte/match/includes/exists/type`；组合：`all` / `any` / `not`；数组 = 全部满足（AND）。
 
-**两条计数陷阱（必记）**
-1. 一次 `ctx.write(...)` 产生**两条**写意图：`kind:'service'` + `kind:'write'`。断言 `writes` 数量要 ×2，或者只按 `op` 部分匹配。
-2. `ctx.global.set` / `ctx.local.set` 也会产生写意图：`kind:'context', op:'contextSet'`。断言序列里漏了它必失败。
-
-**游标语义**：`writes` / `logs` / `expect` 中的 `writes/logs` 默认只看「上次断言之后新增」，避免上一段证据重复计入；要重看全量用 `since:0`（`sim_assert`）。
+要点：`inject_task` 写虚拟表并派发 `taskState`，同时作用于 `require` 的等待门闩与 `watch` 回调；`version:0` / `mode:'production'` 是仿真回执的固定值，断言别写死真实版本号。
 
 ---
 
-## 7. 关键坑与排查
+## 5. 关键坑与排查
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -200,7 +252,7 @@ node skill/tools/case.cjs push <id>/<name> --run-fixture      # 走服务端 sim
 
 ---
 
-## 8. 收尾：切回 follow 并让影子继续跑（固定动作，不是可选清理）
+## 6. 收尾：切回 follow 并让影子继续跑（固定动作，不是可选清理）
 
 仿真只是临时状态。跑完必须回到有真实数据的影子模式，并且**让同一个影子版本保持运行**，否则 5.3 的真实验收没有发生：
 

@@ -13,6 +13,8 @@ const WORKER_PATH = path.join(__dirname, 'worker-runner.js');
 
 /* env：调用方传 childEnv()（剔除 HA_TOKEN），与 fork 的敏感信息剥离策略一致。
  * resourceLimits：堆上限兜底，堆炸弹只废自己的线程而不吃满宿主内存。 */
+/* send 与 ChildProcess.send 同语义：失败要让调用方看见（executor 侧需要兜底的地方
+ * 都已自带 try/catch），静默吞掉会让 sim 回执丢失、只能靠 10s 超时兜底才发现。 */
 function createWorkerChild({ env } = {}) {
   const w = new Worker(WORKER_PATH, {
     env: env || undefined,
@@ -20,7 +22,7 @@ function createWorkerChild({ env } = {}) {
     stderr: true,
     resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 32 },
   });
-  w.send = (msg) => { try { w.postMessage(msg); } catch (e) {} };
+  w.send = (msg) => { w.postMessage(msg); return true; };
   w.kill = () => { try { w.terminate(); } catch (e) {} return true; };
   w.worker = true;
   return w;

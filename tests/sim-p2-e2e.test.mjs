@@ -193,6 +193,42 @@ test('P2：mark/rewind 让同一会话换个输入再验一次（时钟不回退
   executor.stop(sid, 'test-cleanup', rec.version);
 });
 
+/* 回归：自带 assert 的用例重放时不再跳过全序列断言——追尾断言用 since:0 绕开游标消耗，
+ * 分段断言与全序列校验并存（旧实现直接跳过，会漏掉全序列这层校验）。 */
+test('P2：自带 assert 的用例重放时也追加 since:0 全序列断言', async () => {
+  const sid = 'p2-own-asserts';
+  const rec = submit(sid, powerScript());
+  await executor.switchVerifyMode(sid, 'simulate', { startAt: START, seed: SEED });
+  await ready(sid);
+
+  const dir = path.join(tmpRoot, 'fixtures', sid);
+  fs.mkdirSync(dir, { recursive: true });
+  const manual = {
+    scriptId: sid,
+    name: 'own-asserts',
+    startAt: START,
+    seed: SEED,
+    steps: [
+      { op: 'inject_entity', entityId: 'sensor.power', state: '1200' },
+      { op: 'advance', ms: 3000 },
+      /* 自带断言用 expect DSL（看世界终值），不消耗写意图条数口径 */
+      { op: 'assert', label: '分段：防抖后已写入', expect: { path: 'context.global.avoiding', eq: true } },
+    ],
+    expected: { writes: [
+      { kind: 'write', op: 'setFlag', nodeId: 'n_write', args: [true] },
+      { kind: 'context', op: 'contextSet', args: ['avoiding', true] },
+    ] },
+  };
+  fs.writeFileSync(path.join(dir, 'own-asserts.json'), JSON.stringify(manual), 'utf8');
+
+  const run = await executor.simRunFixture(sid, 'own-asserts');
+  assert.equal(run.ok, true, JSON.stringify(run.results));
+  assert.equal(run.total, 2, '分段断言 + 追加的全序列断言都要跑');
+
+  await executor.switchVerifyMode(sid, 'follow');
+  executor.stop(sid, 'test-cleanup', rec.version);
+});
+
 /* 回归：用例目录与资产库合并后（skill/.fixtures 既是导出落点又是手写用例的家），
  * 导出不能静默覆盖带断言的手写用例——导出的 fixture 没有断言，覆盖等于把资产降级。 */
 test('P2：导出同名手写用例默认拒绝，force 才覆盖', async () => {

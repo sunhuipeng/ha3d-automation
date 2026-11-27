@@ -410,7 +410,9 @@ function buildTools(server, ctx) {
   );
 
   /* ---------------- 影子双模式验证：仿真控制（SIMULATION-DESIGN §8）----------------
-   * 不新增"仿真通道"：影子通道固定，验证方式 follow/simulate 二选一，切换走暂停→启动。
+   * 不新增"仿真通道"：影子通道固定，验证方式 follow/simulate 二选一。
+   * 标准流程（skill SKILL.md 第5步）：5.1 simulate 验流程 → 5.2 切回 follow（固定收尾，
+   * sim_close 不算收尾）→ 5.3 follow 真跑验收，两段都过才允许 publish。
    * 仿真只覆盖本脚本流程与逻辑，不联动其他脚本；WS 广播只发状态，不注入当真实事件。 */
   server.tool(
     'automation_switch_verify_mode',
@@ -446,7 +448,8 @@ function buildTools(server, ctx) {
         context: z.object({ scope: z.enum(['global', 'local']).optional(), key: z.string(), value: z.any() }).optional(),
         task: z.object({ scriptId: z.string(), state: z.enum(['running', 'stopped', 'error', 'paused']) }).optional(),
         suspend: z.boolean().optional(),
-      }).describe('注入内容，可组合多个字段'),
+        params: z.any().optional().describe('运行中注入仅记入快照供 AI 观察，下一次进入 simulate 才生效'),
+      }).passthrough().describe('注入内容，可组合多个字段'),
       confirmed: z.literal(true),
     },
     async ({ scriptId, payload }) => {
@@ -475,7 +478,7 @@ function buildTools(server, ctx) {
     {
       scriptId: z.string().describe('脚本 id'),
       steps: z.array(z.object({ op: z.enum(['advance', 'inject_entity', 'inject_context', 'inject_task', 'inject_params', 'inject_suspend', 'mark', 'rewind', 'snapshot', 'assert']) }).passthrough())
-        .min(1).describe('步骤数组，见各 op 字段：advance.ms / inject_*.entityId|state|scope|key|value|scriptId|params|suspend / mark.name / rewind.mark / assert.writes|noWrites|state|context|logs|expect'),
+        .min(1).describe('步骤数组，见各 op 字段：advance.ms / inject_*.entityId|state|scope|key|value|scriptId|params|suspend / mark.name / rewind.mark / assert.writes|noWrites|state|context|logs|expect|since（覆盖增量基准，since:0=全序列）'),
       startAt: z.string().optional().describe('给定则用该 ISO 起点重建世界（如 2026-11-26T20:29:55+08:00）'),
       seed: z.object({}).passthrough().optional().describe('随重建一起生效的种子：{ entities, context }'),
       continue: z.boolean().optional().describe('true = 在当前仿真会话上续跑（保留世界状态）；缺省 false = 每次重建'),
@@ -573,7 +576,7 @@ function buildTools(server, ctx) {
 
   server.tool(
     'automation_sim_export',
-    '把当前仿真会话导成回归用例并落盘（skill/.fixtures/<脚本id>/<name>.json，与可复用用例同目录、随 skill.zip 走）：起始时刻 + 初始种子 + 驱动流水（所有 inject/advance）+ 观测到的写意图序列 + 脚本版号。导出后可用 sim_run_fixture 一键重放。需 confirmed:true。',
+    '把当前仿真会话导成回归用例并落盘（skill/.fixtures/<脚本id>/<name>.json，与可复用用例同目录；注意 .fixtures/.scripts 默认不进 skill.zip，要分发请手动拷贝）：起始时刻 + 初始种子 + 驱动流水（所有 inject/advance）+ 观测到的写意图序列 + 脚本版号。导出后可用 sim_run_fixture 一键重放。需 confirmed:true。',
     {
       scriptId: z.string(),
       name: z.string().describe('用例名（字母数字与 _ . -，最长 64）'),
@@ -585,7 +588,7 @@ function buildTools(server, ctx) {
 
   server.tool(
     'automation_sim_run_fixture',
-    '重放已导出的用例：重建世界 → 跑 fixture 的 steps → 用导出时的写意图序列做全序列断言；versionDrift=true 说明脚本已改版，断言失败先怀疑版本漂移。不传 name 只列已有用例。需 confirmed:true。',
+    '重放已导出的用例：重建世界 → 跑 fixture 的 steps → 追加一条 since:0 写意图全序列断言（用例自带 assert 也不跳过，两者各验各的）；versionDrift=true 说明脚本版号或源码 sha 已变，断言失败先怀疑版本漂移。不传 name 只列已有用例。需 confirmed:true。',
     {
       scriptId: z.string(),
       name: z.string().optional().describe('用例名；缺省则只列出该脚本已有的用例'),

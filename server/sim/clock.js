@@ -128,4 +128,4 @@ class VirtualClock {
   }
 }
 
-module.exports = { VirtualClock, DEFAULT_MAX_STEPS, DEFAULT_MAX_SAME_TICK };
+module.exports = { VirtualClock };

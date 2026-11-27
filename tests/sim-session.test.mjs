@@ -149,3 +149,46 @@ test('仿真宿主：toggle 翻转实体并派发 state_changed', async () => {
   await session.request({ id: 2, action: 'callService', data: { domain: 'input_boolean', service: 'toggle', data: { entity_id: 'water_heater.x' } } });
   assert.equal(session.snapshot({ include: ['entities'], entityScope: 'all' }).entities['water_heater.x'].state, 'off', 'on → off');
 });
+
+/* 回归 B1：未进种子的实体 callService 必须自动建表并派发 state，否则 watch 它的
+ * 分支永远等不到 state_changed（只记写意图等于静默挂死）。 */
+test('仿真宿主：callService 对未知实体自动建表并派发 state', async () => {
+  const { session, dispatched } = makeSession();
+  const before = dispatched.length;
+  const r = await session.request({ id: 1, action: 'callService', data: { domain: 'switch', service: 'turn_on', data: { entity_id: 'switch.auto_mode' } } });
+  assert.equal(r.ok, true);
+  const states = dispatched.slice(before).filter((m) => m.type === 'state');
+  assert.equal(states.length, 1, '未知实体也要派发一次 state');
+  assert.equal(states[0].entityId, 'switch.auto_mode');
+  assert.equal(states[0].state.state, 'on');
+  assert.equal(states[0].prev.state, null, '新建实体初始态为 null');
+  const snap = session.snapshot({ include: ['entities'] });
+  assert.equal(snap.entities['switch.auto_mode'].state, 'on', '自动建的实体脚本已用过，默认快照可见');
+
+  /* toggle 在新建实体上（初始 null → on）同样成立 */
+  await session.request({ id: 2, action: 'callService', data: { domain: 'switch', service: 'toggle', data: { entity_id: 'switch.fresh' } } });
+  assert.equal(session.snapshot({ include: ['entities'] }).entities['switch.fresh'].state, 'on', 'null → on');
+});
+
+/* 回归 B3：mark 自动名不得静默覆盖同名手动标记。 */
+test('仿真会话：mark 自动名跳过已占用的名字', () => {
+  const { session } = makeSession();
+  const m1 = session.mark('m1');
+  assert.equal(m1.mark, 'm1');
+  session.mark('m2');                 // size=2
+  const auto = session.mark();        // size+1=3，但若逻辑是 m3 应正常；再造 m3 撞名场景：
+  assert.equal(auto.mark, 'm3');
+  const m3 = session.mark('m3');      // 手动覆盖 m3（同名重建是显式行为，允许）
+  assert.equal(m3.mark, 'm3');
+  const auto2 = session.mark();       // 下一个自动名必须避开 m3
+  assert.equal(auto2.mark, 'm4');
+});
+
+/* 回归 B2 语义层：inject 的 params 分支可从会话层触达（MCP schema 层另有 passthrough 校验）。 */
+test('仿真注入：params 只提示不生效，记入控制日志', () => {
+  const { session, logs } = makeSession();
+  const r = session.inject({ params: { foo: 'bar' } });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.applied, [{ kind: 'params', value: { foo: 'bar' } }]);
+  assert.ok(logs.some((m) => /params/.test(m.message)));
+});

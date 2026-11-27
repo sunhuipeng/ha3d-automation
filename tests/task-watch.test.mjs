@@ -1,5 +1,5 @@
 'use strict';
-/* ctx.task / ctx.watch.task 测试：
+/* ctx.task / ctx.task.watch 测试：
  * ① runner 层用 mock 宿主验证 scriptId、状态订阅回放、require 门闩/超时/stop 中断；
  * ② executor 层用真实 fork + mock connector 验证影子优先、影子实例未起回退正式、
  *    正式观察者看不见影子实例（通道规则由主进程裁决）。全程不连接真实 HA。 */
@@ -64,9 +64,9 @@ test('ctx.scriptId / ctx.task.status：取到 executor 注入的权威 sid，状
   assert.deepEqual(actions, [{ action: 'taskStatus', scriptId: 'dep' }]);
 });
 
-test('ctx.watch.task：注册即回放，回调收到 (state, info)，off() 注销', async () => {
+test('ctx.task.watch：注册即回放，回调收到 (state, info)，off() 注销', async () => {
   const { text, hostMsgs } = await runWithMockHost(`
-    const off = ctx.watch.task('dep', (state, info) => {
+    const off = ctx.task.watch('dep', (state, info) => {
       ctx.log('info', 'WATCH:' + state + ':' + info.reason);
     });
     await ctx.sleep(80);
@@ -75,7 +75,7 @@ test('ctx.watch.task：注册即回放，回调收到 (state, info)，off() 注�
   `, {
     onSubscribe: (msg, child) => child.send({ type: 'taskState', scriptId: msg.scriptId, state: 'running', info: { reason: 'replay' } }),
   });
-  assert.match(text, /WATCH:running:replay/, '函数子接口须跨 realm 可见，且回调收到 info');
+  assert.match(text, /WATCH:running:replay/, 'ctx.task.watch 须跨 realm 可见，且回调收到 info');
   assert.match(text, /OFF:true/);
   assert.ok(hostMsgs.some((m) => m.type === 'taskSubscribe' && m.scriptId === 'dep'), '应发出订阅消息');
   assert.ok(hostMsgs.some((m) => m.type === 'taskUnsubscribe' && m.scriptId === 'dep'), 'off() 应发出注销消息');
@@ -140,7 +140,7 @@ const connector = {
 };
 const WATCH_SCRIPT = `
   ctx.log('info', 'SID:' + ctx.scriptId);
-  const off = ctx.watch.task('taskdep', (state, info) => {
+  const off = ctx.task.watch('taskdep', (state, info) => {
     ctx.log('info', 'WATCH:' + state + ':' + info.mode + ':' + (info.reason || ''));
   });
   const st0 = await ctx.task.status('taskdep');

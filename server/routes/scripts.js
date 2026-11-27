@@ -5,6 +5,7 @@ const express = require('express');
 const { store, executor, connector, hub } = require('../lib/runtime');
 const { computeDiff } = require('../lib/diff');
 const topology = require('../scripts/topology');
+const context = require('../scripts/context');
 
 /* 拓扑展示补充（单脚本图 / 全局图共用）：从 HA 连接器的全量实体缓存取 friendly_name，
  * 不额外请求 HA。只作用于接口返回，不污染内存观测数据——HA 侧重命名后下一次刷新即可反映；
@@ -154,6 +155,42 @@ module.exports = function scriptRoutes() {
    * 脚本没跑过则为空对象 {}，不是错误。 */
   r.get('/script/:id/topology', (req, res) => res.json(topologyForDisplay(req.params.id)));
 
+  /* 实时取值：拓扑列表 hover 时按需拉取，每次请求都读当下内存/文件缓存，不做任何缓存。
+   * kind=entity → HA 实体当前状态（三态：present / missing / unknown，unknown 表示 HA 未就绪）；
+   * kind=context → 上下文当前值。global 读正式桶（与脚本内 ctx.global.get 口径一致，影子也读正式），
+   * local 按 scriptId + 当前展示通道取对应命名空间。 */
+  r.get('/topology/live', (req, res) => {
+    try {
+      const kind = String(req.query.kind || '');
+      const id = String(req.query.id || '');
+      const scriptId = String(req.query.scriptId || '');
+      const mode = req.query.mode === 'shadow' ? 'shadow' : 'production';
+      if (kind === 'entity') {
+        if (!/^[a-z0-9_]+\.[a-z0-9_]+$/i.test(id)) return res.status(400).json({ error: '实体 id 非法' });
+        const status = connector.entityStatus(id); // present / missing / unknown(HA 未就绪)
+        const st = connector.getState(id);
+        return res.json({
+          kind, id, status, at: new Date().toISOString(),
+          state: st ? st.state : null,
+          attributes: st ? st.attributes : null,
+        });
+      }
+      if (kind === 'context') {
+        const dot = id.indexOf('.');
+        const scope = dot > 0 ? id.slice(0, dot) : 'global';
+        const key = dot > 0 ? id.slice(dot + 1) : id;
+        if (scope !== 'global' && scope !== 'local') return res.status(400).json({ error: '上下文作用域非法' });
+        if (scope === 'local' && !scriptId) return res.status(400).json({ error: 'local 上下文需要 scriptId' });
+        const value = context.get(scope, scope === 'local' ? scriptId : null, key, mode !== 'production', undefined);
+        return res.json({
+          kind, id, scope, key, at: new Date().toISOString(),
+          exists: value !== undefined, value: value === undefined ? null : value,
+        });
+      }
+      return res.status(400).json({ error: '未知取值类型（kind=entity|context）' });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+  });
+
   /* 脚本提交统一走 MCP automation_submit_script（skill/tools/submit.cjs），
    * 不再提供 REST POST /api/scripts；校验与写盘逻辑只在 MCP 工具一处维护。 */
   r.post('/script/:id/start', (req, res) => {
@@ -245,11 +282,16 @@ module.exports = function scriptRoutes() {
   r.get('/script/:id/logs', (req, res) => {
     const v = req.query.version ? Number(req.query.version) : (store.listVersions(req.params.id).slice(-1)[0]);
     /* 默认只返回最近 100 行，避免打开面板时全量拉取；可用 ?limit= 覆盖。
-     * source=sim 读仿真独立日志（v<n>.sim.log），前端在仿真实例运行时自动切换。 */
+     * source=sim 读仿真独立日志（v<n>.sim.log），前端在仿真实例运行时自动切换。
+     * before=ts:ord 游标翻页：前端上翻到顶时带上上一页首条的游标，取更早的一页；
+     * (ts, ord) 二元组是因为同一毫秒会有多条日志，只比 ts 会漏同毫秒兄弟行。 */
     const source = req.query.source === 'sim' ? 'sim' : 'real';
     const limit = Number(req.query.limit) || 100;
-    const logs = source === 'sim' ? store.readSimLogs(req.params.id, v, limit) : store.readLogs(req.params.id, v, limit);
-    res.json({ scriptId: req.params.id, version: v || null, source, logs });
+    let before = null;
+    const m = /^(-?\d+):(\d+)$/.exec(String(req.query.before || ''));
+    if (m) before = { ts: Number(m[1]), ord: Number(m[2]) };
+    const page = store.readLogPage(req.params.id, v, { sim: source === 'sim', limit, before });
+    res.json({ scriptId: req.params.id, version: v || null, source, ...page });
   });
 
   /* 全局运行拓扑：只汇总正式通道；前端全局视图手动拉取，不定时刷新 */

@@ -59,9 +59,16 @@ function createSimHost(world) {
           kind: 'service', op: `${d.domain}.${d.service}`,
           desc: `${d.domain}.${d.service}${eid ? ' ' + eid : ''}`, args: [d.data],
         });
-        /* 按 service 回写虚拟表（§3.2：可配延迟，P0 同步回写）。turn_on/off 常见形态 */
-        if (eid && world.entities.has(String(eid))) {
-          const ent = world.entities.get(String(eid));
+        /* 按 service 回写虚拟表（§3.2：可配延迟，P0 同步回写）。turn_on/off 常见形态。
+         * 未知实体自动建表：脚本显式调用服务即视为"要观测它"，只记写意图不建实体的话，
+         * state_changed 永远不派发，watch 该实体的分支会静默挂死（宁可世界多一个空实体）。 */
+        const eidKey = String(eid || '');
+        if (eidKey) {
+          let ent = world.entities.get(eidKey);
+          if (!ent) {
+            ent = { state: null, attributes: {}, friendly_name: undefined, touched: false, used: false };
+            world.entities.set(eidKey, ent);
+          }
           ent.used = true; // 脚本对它有动作，快照里必须能看到
           const svc = String(d.service || '');
           let next = null;

@@ -60,7 +60,7 @@ function createCore({ emit, clock }) {
   const writeStats = { intent: 0, sent: 0, blocked: 0 }; // 提到闭包层，供 simState 快照读取
   const subscriptions = new Map(); // entityId -> [cb]
   const globalSubs = new Map();    // ctx.global.watch：key -> Set<cb>（返回取消订阅函数）
-  const taskSubs = new Map();      // ctx.watch.task：scriptId -> Set<cb>（返回取消订阅函数）
+  const taskSubs = new Map();      // ctx.task.watch：scriptId -> Set<cb>（返回取消订阅函数）
   const taskWaiters = new Map();   // ctx.task.require：scriptId -> Set<{resolve,timer}>（状态变化提前唤醒）
   const timers = new Map();        // ctx.after 定时器：id -> timeout（stop 时统一清理）
   const intervals = new Set();     // sandbox.setInterval 建立的循环定时器（stop 时统一 clear）
@@ -217,7 +217,7 @@ function createCore({ emit, clock }) {
 
     /* 宿主对象/函数的可枚举属性统一搬进 realm 对应物：accessor 连 setter 一起搬，
      * 否则 h.value = x 这类回写会落到只有 getter 的 realm 对象上被静默丢弃。
-     * 函数子接口（ctx.watch.task）与对象属性共用一条路径，避免两处漏改。 */
+     * 函数身上挂的属性（如 hold 句柄）与对象属性共用一条路径，避免两处漏改。 */
     function copyAccessors(target, src, depth) {
       for (const k of Object.keys(src)) {
         const d = Object.getOwnPropertyDescriptor(src, k);
@@ -239,7 +239,7 @@ function createCore({ emit, clock }) {
         if (memo.has(v)) return memo.get(v);
         const w = tools.wrapFn(v);
         memo.set(v, w);
-        /* wrapFn 只返回裸函数，不复制自身属性；ctx.watch.task 这类子接口靠这里搬进 realm */
+        /* wrapFn 只返回裸函数，不复制自身属性；函数身上挂的属性靠这里搬进 realm */
         copyAccessors(w, v, depth);
         return w;
       }
@@ -332,6 +332,24 @@ function createCore({ emit, clock }) {
       }
     };
 
+    /* ctx.task.watch(scriptId, cb)：订阅另一个脚本的运行状态（软通知，业务侧自行兜底重启抖动）。
+     * 与 status/require 同属 task.* 家族：查一次 / 等到 running / 订阅变化。
+     * 回调签名 (state, info)，info = { scriptId, version, mode, reason }；
+     * 注册时主进程立即回放当前状态；返回 off() 取消订阅。 */
+    const taskWatch = (scriptId, cb) => {
+      const sid = String(scriptId == null ? '' : scriptId);
+      if (!sid || typeof cb !== 'function') throw new Error('ctx.task.watch 需要脚本 id 与回调函数');
+      let set = taskSubs.get(sid);
+      if (!set) { set = new Set(); taskSubs.set(sid, set); }
+      const first = set.size === 0;
+      set.add(cb);
+      if (first) emit({ type: 'taskSubscribe', scriptId: sid });
+      return makeOff(set, cb, () => {
+        taskSubs.delete(sid);
+        emit({ type: 'taskUnsubscribe', scriptId: sid });
+      });
+    };
+
     const ctx = {
       scriptId: String(meta.sid || meta.id || ''),
       global: contextApi('global'),
@@ -354,9 +372,10 @@ function createCore({ emit, clock }) {
       /* 被 ctx.call 触发时携带的入参（主进程注入 meta.callParams）；未被调用时为 null。
        * 由 buildSandbox 的 conv 转成 realm 安全对象，脚本拿不到宿主对象。 */
       params: meta.callParams === undefined ? null : meta.callParams,
-      /* 依赖脚本状态：status 查一次；require 一直等到 running（默认 30s 超时）。
-       * 返回 { scriptId, version, mode, state, info }；重启抖动由业务侧用防抖兜底。 */
-      task: { status: taskStatus, require: taskRequire },
+      /* 依赖脚本状态：status 查一次；require 一直等到 running（默认 30s 超时）；
+       * watch 订阅变化（软通知，注册即回放当前状态）。
+       * status/require 返回 { scriptId, version, mode, state, info }；重启抖动由业务侧用防抖兜底。 */
+      task: { status: taskStatus, require: taskRequire, watch: taskWatch },
       /* 显式联动：触发另一个脚本/场景的正式或影子版本（跟随调用者模式）。
        * 只等"启动回执"，不等被调脚本跑完；目标类型/防重入/防递归全在主进程执行器裁决。 */
       call: (scriptId, params) => {
@@ -486,26 +505,11 @@ function createCore({ emit, clock }) {
       try { await fn(); return true; } finally { locks.delete(key); }
     };
 
-    /* 批量订阅实体变化（转发 ctx.ha.change，签名一致） */
+    /* 批量订阅实体变化（转发 ctx.ha.change，签名一致）。
+     * ctx.watch 只管 HA 实体；依赖脚本的查/等/订统一在 ctx.task.*（status/require/watch）。 */
     ctx.watch = (entityIds, cb) => {
       const list = Array.isArray(entityIds) ? entityIds : [entityIds];
       for (const eid of list) if (eid) ctx.ha.change(eid, cb);
-    };
-    /* ctx.watch.task(scriptId, cb)：订阅另一个脚本的运行状态（软通知，业务侧自行兜底重启抖动）。
-     * 回调签名 (state, info)，info = { scriptId, version, mode, reason }；
-     * 注册时主进程立即回放当前状态；返回 off() 取消订阅。 */
-    ctx.watch.task = (scriptId, cb) => {
-      const sid = String(scriptId == null ? '' : scriptId);
-      if (!sid || typeof cb !== 'function') throw new Error('ctx.watch.task 需要脚本 id 与回调函数');
-      let set = taskSubs.get(sid);
-      if (!set) { set = new Set(); taskSubs.set(sid, set); }
-      const first = set.size === 0;
-      set.add(cb);
-      if (first) emit({ type: 'taskSubscribe', scriptId: sid });
-      return makeOff(set, cb, () => {
-        taskSubs.delete(sid);
-        emit({ type: 'taskUnsubscribe', scriptId: sid });
-      });
     };
 
     /* 时间工具：sod = 当日秒数，与 HA input_datetime 的 timestamp 属性同口径 */

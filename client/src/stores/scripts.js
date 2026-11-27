@@ -17,6 +17,10 @@ export const useScriptStore = defineStore('scripts', {
     runningVersions: [], // 实例真正在跑的列表 [{version, mode}]：正式与影子可各有一个（运行态唯一真相源）
     logs: [],
     logsSource: 'real',  // 'real' = v<n>.log；'sim' = v<n>.sim.log（仿真实例运行时）
+    logsCursor: null,    // { ts, ord } 已加载最早一条的游标（同一毫秒内的序号），null = 没有更早
+    logsHasMore: false,  // 日志文件里是否还有比游标更早的行
+    logsLoadingOlder: false,
+    followLogs: true,    // 跟随最新：贴底时自动滚到最新并允许裁剪旧行；上翻看历史时暂停
     nodeStates: {},      // nodeId -> state（运行时投影，不写回 flow.json）
   }),
   getters: {
@@ -62,7 +66,8 @@ export const useScriptStore = defineStore('scripts', {
     },
     /* 打开脚本面板只拉最近 100 行（后端仍支持 ?limit= 覆盖）；实时日志由 WS 增量追加。
      * source='sim' 读仿真独立日志（v<n>.sim.log）——仿真实例运行时不该给用户看真实日志，
-     * 否则会把虚拟世界里的行为误当成真实运行记录。 */
+     * 否则会把虚拟世界里的行为误当成真实运行记录。
+     * 翻页历史会整体重置：显式刷新/切换日志源 = 回到「最新 100 行」视角。 */
     async loadLogs(id, version, limit = 100, source = 'real') {
       const q = new URLSearchParams({ limit: String(limit) });
       if (version) q.set('version', version);
@@ -70,6 +75,31 @@ export const useScriptStore = defineStore('scripts', {
       const r = await fetch(`/api/script/${id}/logs?${q}`).then((x) => x.json());
       this.logs = r.logs || [];
       this.logsSource = r.source || source;
+      this.logsHasMore = !!r.hasMore;
+      this.logsCursor = r.cursor || null;
+      this.logsLoadingOlder = false;
+    },
+    /* 上翻到顶加载更早一页：带 (ts, ord) 游标请求，结果 unshift 到头部。
+     * 返回是否真的加到了行（App.vue 据此决定要不要补偿滚动位置）。
+     * 响应到达时若已切脚本/版本或日志源已变，丢弃结果避免串台。 */
+    async loadOlderLogs(id, version, limit = 100, source = 'real') {
+      if (!this.logsHasMore || this.logsLoadingOlder || !this.logsCursor) return false;
+      this.logsLoadingOlder = true;
+      try {
+        const q = new URLSearchParams({ limit: String(limit), before: `${this.logsCursor.ts}:${this.logsCursor.ord}` });
+        if (version) q.set('version', version);
+        if (source === 'sim') q.set('source', 'sim');
+        const r = await fetch(`/api/script/${id}/logs?${q}`).then((x) => x.json());
+        if (this.current && (this.current.id !== id || this.current.version !== version)) return false;
+        if ((r.source || source) !== this.logsSource) return false;
+        const older = r.logs || [];
+        if (older.length) this.logs.unshift(...older);
+        this.logsHasMore = !!r.hasMore;
+        this.logsCursor = r.cursor || null;
+        return older.length > 0;
+      } finally {
+        this.logsLoadingOlder = false;
+      }
     },
     /* 当前场景该读哪份日志：只有「当前打开版本的实例正在仿真」时才读 sim */
     logsSourceForCurrent() {
@@ -168,7 +198,10 @@ export const useScriptStore = defineStore('scripts', {
       const isSim = entry.sim === true;
       if (this.logsSource === 'sim' ? !isSim : isSim) return;
       this.logs.push(entry);
-      if (this.logs.length > 500) this.logs.splice(0, this.logs.length - 500);
+      /* 裁剪只在跟随最新时进行：用户上翻看历史时从头部 splice 会把刚加载的更早日志吃掉。
+       * 非跟随兜底 5000 条，防高频脚本长时间上翻导致内存无限膨胀。 */
+      if (this.followLogs && this.logs.length > 500) this.logs.splice(0, this.logs.length - 500);
+      else if (!this.followLogs && this.logs.length > 5000) this.logs.splice(0, this.logs.length - 5000);
     },
     /* WS 状态事件：runningVersions 是唯一真相源。
      * 先增删条目、再派生 running（顺序错了停止事件会因 stale 条目卡在"运行中"）；

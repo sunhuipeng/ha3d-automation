@@ -63,7 +63,7 @@ flow 是脚本执行逻辑的**投影**：让人一眼看懂「谁触发、按�
 
 ### 画布与运行态的联动（只读联动，随产品固化）
 
-画布是**只读投影**：禁止拖拽 / 连线 / 选中 / 删除，仅允许缩放平移；没有画布编辑类 MCP 工具，flow.json 是唯一数据源，改图只能改文件重新提交。
+画布是**只读投影**：禁止 连线 / 删除，没有画布编辑类 MCP 工具，flow.json 是唯一数据源，改图只能改文件重新提交。
 
 节点与运行代码之间有两条**只读联动**，全部由 nodeId 驱动，脚本侧不需要任何额外工作：
 
@@ -112,7 +112,7 @@ flow 是脚本执行逻辑的**投影**：让人一眼看懂「谁触发、按�
 | `id` / `version` | 脚本标识与版本号（正整数，store 分配，只增不减） |
 | `revision` | 该版本被原地修改的次数（1 = 只提交过一次；影子反复改时递增） |
 | `name` / `description` | 展示名与版本说明（建议写清本版本改动） |
-| `icon` | **新脚本首次提交必填**，迭代可省略（自动继承上一版）：脚本图标 SVG 源码字符串；列表/详情展示。绘制规范见下方 §icon |
+| `icon` | **新脚本首次提交必填**，迭代可省略（自动继承上一版）：脚本图标 SVG 源码字符串；列表/详情展示。**统一用 MDI 图标库**，选图与适配规范见下方 §icon |
 | `sha256` | script.js 摘要，完整性校验（影子覆盖后会变） |
 | `channel` | `shadow` / `production` / `archive`，**每通道至多 1 个版本** |
 | `kind` | 业务种类，**同时决定运行模型**：`automation`=常驻自动化（默认，无一次性看门狗、由 start 管理）/ `script`=一次性动作脚本 / `scene`=场景（后两者跑完即退、有看门狗、可 trigger/ctx.call）。不传继承上一版，全新默认 `automation`。历史字段 `longRunning` 已退役，不再参与推断 |
@@ -127,28 +127,46 @@ flow 是脚本执行逻辑的**投影**：让人一眼看懂「谁触发、按�
 
 icon 是存进 meta.json 的 **SVG 源码字符串**（MCP 参数 `icon` / submit.cjs 参数 `--icon <icon.svg>`，本地源文件存 `icons/<scriptId>.svg`）。前端脚本列表左侧与详情页标题旁直接渲染。
 
+**首选方案：统一使用 MDI（Material Design Icons）图标库，禁止手绘**。Home 平台前端已接入 MDI，两边用同一套图标风格天然一致；服务端校验只查完整性/大小/危险内容、不限制 viewBox，MDI 原生 24×24 SVG 直接可提交。
+
+**取图与适配流程**（推荐直接用 `skill/tools/mdi-icon.cjs`，一条命令完成验证+取图+适配）：
+
+1. **选名**：在 https://pictogrammers.com/library/mdi/ 按业务语义挑图标，或用工具按关键词搜索（7447 个图标）：`node skill/tools/mdi-icon.cjs search boiler`。常用推荐名：热水器 `water-boiler`、大功率 `flash`、厨房 `pot-steam`、倒计时 `timer-outline`、空调 `air-conditioner`、夜灯 `weather-night`、灯光场景 `lightbulb-outline`、守护 `shield-check`、播报 `bullhorn`、门禁 `door-open`；
+2. **验证存在（提交前必做）**：Agent 凭印象猜的 slug 可能不存在（如 `lightning` 实际叫 `flash`），必须先验证：`node skill/tools/mdi-icon.cjs check water-boiler flash`——逐个输出 `OK`/`MISS`，有 MISS 时换名重来；
+3. **取源码并适配**：`node skill/tools/mdi-icon.cjs get water-boiler > icons/<scriptId>.svg`——工具自动完成两处适配：根节点补 `fill="currentColor"`（MDI 原文无着色属性，默认黑，暗色主题下不可见；补上后图标随前端主题亮/暗与运行态 live 绿自动着色）、去掉 `id` 属性；输出可直接作为 icon 提交；
+4. **提交**：`--icon icons/<scriptId>.svg`（MCP 参数 `icon` 直接传源码字符串）。
+
+不用工具时的手动流程：`curl -s https://cdn.jsdelivr.net/npm/@mdi/svg@7/svg/<名称>.svg`（或 unpkg 同路径）拿到单文件 SVG → 手动补 `fill="currentColor"` → 用 CDN GET 200/404 或站点页面确认名称真实存在 → 再提交。
+
+适配后示例（`water-boiler`）：
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M8 2C6.89 2 6 2.89 6 4V16C6 17.11 6.89 18 8 18H9V20H6V22H9C10.11 22 11 21.11 11 20V18H13V20C13 21.11 13.89 22 15 22H18V20H15V18H16C17.11 18 18 17.11 18 16V4C18 2.89 17.11 2 16 2H8M12 4.97A2 2 0 0 1 14 6.97A2 2 0 0 1 12 8.97A2 2 0 0 1 10 6.97A2 2 0 0 1 12 4.97M10 14.5H14V16H10V14.5Z" /></svg>
+```
+
 **硬规则**（违反任一条会被服务端拒绝提交）：
 
 1. 完整的单根 `<svg>…</svg>` 字符串，**≤ 8KB**；
-2. `viewBox="0 0 64 64"`（等比缩放，前端按 20~22px 展示）；
-3. 线条图形一律 `stroke="currentColor"` + `fill="none"`（实心点可用 `fill="currentColor"`），**禁止写死颜色**——`currentColor` 让图标随前端主题（亮/暗）与运行态（live 绿）自动着色；
-4. **禁止** `<script>`、`<iframe>`、`<foreignObject>`、`<use>`、`<image>`、`on*` 事件属性、`javascript:`、`data:text/html`——服务端 `validIcon` 与前端 `safeIcon` 双重拦截；
-5. 笔画粗细 `stroke-width="4"` 左右（20px 下仍清晰），圆角端点 `stroke-linecap="round"` + `stroke-linejoin="round"`。
+2. 着色用 `fill="currentColor"`（或线条图标 `stroke="currentColor"` + `fill="none"`），**禁止写死颜色**；
+3. **禁止** `<script>`、`<iframe>`、`<foreignObject>`、`<use>`、`<image>`、`on*` 事件属性、`javascript:`、`data:text/html`——服务端 `validIcon` 与前端 `safeIcon` 双重拦截（MDI 原文不含这些，天然合规）。
 
-**设计约定**：
+**手绘兜底**（仅当 MDI 找不到合适隐喻时才用，此时保留旧规范）：
 
-- 一个脚本一个业务隐喻，一眼能认出管什么：热水器=水滴+波纹、大功率规避=闪电、厨房=锅+声波、倒计时=秒表、空调=机身+风叶波纹、夜灯=月牙+星、灯光场景=灯泡、守护=盾牌+对勾（参考 `examples/icons/`）；
-- 元素 2~4 个为宜，宁简勿繁：图标最终只有 20px 大，细节多必糊；
-- 主体居中占满画布（留 4~8px 边距），重心居中不偏头；
-- 只有业务语义变化时才更新 icon（改了 icon 记得随版本重新提交）。
-
-**模板**（起手直接抄，改中间图形即可）：
+- `viewBox="0 0 64 64"`（前端按 20~22px 等比缩放展示）；
+- 线条一律 `stroke="currentColor"` + `fill="none"`，笔画 `stroke-width="4"` 左右（20px 下仍清晰），圆角端点 `stroke-linecap="round"` + `stroke-linejoin="round"`；
+- 元素 2~4 个为宜（图标最终只有 20px 大，细节多必糊），主体居中占满画布（留 4~8px 边距）：
 
 ```svg
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
   <!-- 业务隐喻图形：2~4 个元素，居中占满 -->
 </svg>
 ```
+
+**通用约定**：
+
+- 一个脚本一个业务隐喻，一眼能认出管什么（优先按上面 MDI 推荐名选，保证与 Home 端一致）；
+- **MDI（fill、24 网格）与手绘（stroke、64 网格）两种格式同时兼容**：全链路已验证——automation 服务端 `validIcon`/前端 `safeIcon` 格式无关（只查完整性/大小/危险内容）；Home 侧 `/actions` 双写 `icon`+`svg` 原样透传，`safeSvgHtml` 净化不碰 fill/stroke/viewBox，注入 CSS 只设尺寸不强制线条风格，`currentColor` 在两端都随主题着色。混排时建议优先选 MDI `*-outline` 系列，与既有线性图标风格更统一；
+- 只有业务语义变化时才更新 icon（改了 icon 记得随版本重新提交）。
 
 ## 相关数据文件
 

@@ -304,7 +304,13 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
    * 用途：同一段脚本逻辑要从不同输入分支再跑一次时，不必重开会话。
    * 明确边界：定时器、keepAlive、已执行过的续体都不会倒退——需要完全重放请用 sim_run_steps 重建。 */
   function mark(name) {
-    const key = String(name || `m${world.marks.size + 1}`);
+    /* 自动名要防撞：手动建过 m1/m2 之后，size+1 可能撞上已有名字并静默覆盖（实测踩过）。 */
+    let key = String(name || '');
+    if (!key) {
+      let n = world.marks.size + 1;
+      while (world.marks.has(`m${n}`)) n += 1;
+      key = `m${n}`;
+    }
     const snapshotData = {
       at: clock.elapsedMs(), seq: world.seq,
       entities: new Map([...world.entities].map(([k, v]) => [k, clone(v)])),
@@ -427,13 +433,14 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
     const failFast = opts.failFast === true;
     const results = [];
     let cursor = world.assertCursor;   // 跨调用共享：上一次 sim_assert / assert 消耗到哪
-    let executed = 0;
+    let executed = 0;                  // 已尝试执行的步数（含执行失败的那步，见循环内自增时机）
     const fromAt = clock.elapsedMs();
 
     for (let i = 0; i < list.length; i += 1) {
       const step = list[i] || {};
       const op = String(step.op || '');
       const rec = { index: i, op };
+      executed += 1; // 无论成败都算"跑过"：失败步不出现在 executed 会让进度统计说谎
       try {
         switch (op) {
           case 'advance': {
@@ -472,7 +479,9 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
             rec.rewind = rewind(step.mark || step.name);
             break;
           case 'assert': {
-            const verdict = assertStep(step, cursor, coreState);
+            /* since 可覆盖本次断言的增量基准（如 since:0 = 全序列），不影响后续步的游标推进。 */
+            const useCursor = step.since === undefined ? cursor : Math.max(0, Number(step.since) || 0);
+            const verdict = assertStep(step, useCursor, coreState);
             rec.label = verdict.name;
             rec.passed = verdict.passed;
             rec.checks = verdict.checks;
@@ -490,7 +499,6 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
         results.push(rec);
         break;
       }
-      executed += 1;
       results.push(rec);
       if (op === 'assert') { cursor = world.seq; world.assertCursor = cursor; } // 断言消耗本段增量
       if (failFast && Array.isArray(rec.failed) && rec.failed.length) break;
@@ -591,10 +599,9 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
   function destroy() { clock.destroy(); }
 
   return {
-    world, clock, host, request, inject, advance, runSteps, snapshot, destroy,
+    clock, request, inject, advance, runSteps, snapshot, destroy,
     recordLog, recordWrite, assertNow, mark, rewind, exportCase,
-    marks: () => [...world.marks.keys()],
   };
 }
 
-module.exports = { createSimSession, seedEntities };
+module.exports = { createSimSession };

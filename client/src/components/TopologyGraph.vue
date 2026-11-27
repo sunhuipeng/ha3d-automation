@@ -11,6 +11,8 @@ import {
   forceLink, forceManyBody, forceCollide, forceX, forceY,
 } from 'd3-force';
 import TopoNode from './TopoNode.vue';
+import LiveValueTip from './LiveValueTip.vue';
+import { useLiveTip } from '../lib/live-tip';
 import {
   REL, collideR, arrowMarker, edgePath, dedupeLinks, pinSimNode, toFlowNodes, settleSync,
 } from '../lib/topo';
@@ -139,6 +141,18 @@ function publishNodes() {
 function onNodeDrag({ node }) { pinSimNode(simNodes, posCache, node); }
 function onNodeDragStop({ node }) { pinSimNode(simNodes, posCache, node); }
 
+/* ---------- hover 实时取值 ----------
+ * 实体取 data.sub（entity_id），上下文取 data.label（scope.key），脚本节点无值不请求。
+ * 每次 enter 都请求 + hover 期间 3s 轮询；拖动开始即隐藏（避免浮层跟着节点跑）。 */
+const { tip, open, move, hide } = useLiveTip({ pollMs: 3000 });
+function onNodeEnter({ node, event }) {
+  const d = node.data || {};
+  if (d.kind !== 'entity' && d.kind !== 'context') return;
+  open(event, { kind: d.kind, id: d.kind === 'entity' ? d.sub : d.label, scriptId: props.scriptId, mode: props.mode });
+}
+function onNodeLeave() { hide(); }
+function onNodeMove({ event }) { move(event); }
+
 watch(() => props.group, rebuild, { immediate: true });
 
 const hasData = computed(() => nodes.value.length > 0);
@@ -153,7 +167,8 @@ const hasData = computed(() => nodes.value.length > 0);
       :nodes-connectable="false" :elements-selectable="false" :nodes-focusable="false"
       :edges-updatable="false" :zoom-on-double-click="false" :zoom-on-scroll="false"
       :pan-on-scroll="false" fit-view-on-init :min-zoom="0.12" :max-zoom="2"
-      @node-drag="onNodeDrag" @node-drag-stop="onNodeDragStop"
+      @node-drag="onNodeDrag" @node-drag-stop="onNodeDragStop" @node-drag-start="hide"
+      @node-mouse-enter="onNodeEnter" @node-mouse-leave="onNodeLeave" @node-mouse-move="onNodeMove"
     >
       <template #node-topo="p">
         <TopoNode :data="p.data" />
@@ -163,6 +178,7 @@ const hasData = computed(() => nodes.value.length > 0);
       </template>
       <Background :gap="20" :size="1.4" pattern-color="var(--vf-dot, #d5dae2)" />
     </VueFlow>
+    <LiveValueTip :tip="tip" />
   </div>
 </template>
 

@@ -100,6 +100,8 @@ button { cursor: pointer; font-family: inherit; font-size: inherit; }
 .dev-banner { padding: 7px 20px; font-size: 13px; color: var(--log-warn); background: color-mix(in srgb, var(--log-warn) 10%, transparent); border-bottom: 1px solid color-mix(in srgb, var(--log-warn) 30%, transparent); }
 .brand { font-size: 16px; font-weight: 600; display: flex; align-items: center; }
 .brand .logo { width: 22px; height: 22px; display: block; margin-right: 7px; flex: none; }
+/* 版本徽章：跟随主题（badge 变量），弱化于标题，不抢视觉 */
+.brand .version { margin-left: 7px; padding: 1px 6px; border-radius: 5px; background: var(--badge-bg); color: var(--badge-fg); font-size: 11px; font-weight: 500; letter-spacing: .2px; }
 .status { color: var(--muted); display: flex; align-items: center; gap: 6px; }
 .sep { opacity: .4; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #888; display: inline-block; }
@@ -404,6 +406,7 @@ details[open] > summary .panel-chev { transform: rotate(90deg); }
 .log-follow:hover { filter: brightness(1.1); }
 .logs { background: var(--code-bg); border-top: 1px solid var(--line); border-radius: 0 0 6px 6px; padding: 8px; max-height: 260px; overflow-y: auto; font-family: 'SF Mono', Menlo, monospace; font-size: 12px; }
 .log { display: flex; gap: 10px; padding: 3px 0; }
+.log-more { text-align: center; color: var(--hint); font-size: 11px; padding: 4px 0 2px; }
 .log .ts { color: var(--log-ts); }
 .log .lv { width: 48px; color: var(--muted); }
 .log.error .lv, .log.error .msg { color: var(--err-fg); }

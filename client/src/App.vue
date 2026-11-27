@@ -14,6 +14,10 @@ import DiffViewer from './components/DiffViewer.vue';
 import DeleteScriptModal from './components/DeleteScriptModal.vue';
 import ConfirmDialog from './components/ConfirmDialog.vue';
 import { copyText } from './lib/clipboard';
+/* 版本号直取项目根 package.json（Vite 原生支持 JSON 导入），不手写、不会与包版本漂移 */
+import rootPkg from '../../package.json';
+
+const appVersion = rootPkg.version || '';
 
 const app = useAppStore();
 const scripts = useScriptStore();
@@ -173,24 +177,34 @@ onMounted(() => {
   scripts.load();
 });
 
-/* 运行日志：默认跟随最新；上翻查看历史时暂停跟随，可一键回到底部 */
+/* 运行日志：默认跟随最新；上翻查看历史时暂停跟随，可一键回到底部。
+ * 跟随状态放 store（pushLog 裁剪依赖它：上翻看历史时不吃头部行）。 */
 const logBox = ref(null);
-const followLogs = ref(true);
 function scrollLogsToBottom() {
   const el = logBox.value;
   if (!el) return;
   el.scrollTop = el.scrollHeight;
-  followLogs.value = true;
+  scripts.followLogs = true;
 }
-function onLogScroll() {
+async function onLogScroll() {
   const el = logBox.value;
   if (!el) return;
-  followLogs.value = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  scripts.followLogs = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  /* 顶部 40px 内且还有更早的：加载上一页。prepend 会把内容顶下去，
+   * 必须按加载前后 scrollHeight 差值补偿 scrollTop，否则视口会跳。 */
+  if (el.scrollTop < 40 && scripts.logsHasMore && !scripts.logsLoadingOlder && scripts.current) {
+    const before = el.scrollHeight;
+    const loaded = await scripts.loadOlderLogs(scripts.current.id, scripts.current.version, 100, scripts.logsSource);
+    if (!loaded) return;
+    await nextTick();
+    if (logBox.value !== el) return; // 期间切换了脚本/版本，DOM 已换，不补
+    el.scrollTop += el.scrollHeight - before;
+  }
 }
 watch([() => scripts.current?.id, () => scripts.current?.version, () => scripts.logs.length],
   ([id, version], [oldId, oldVersion]) => {
-    if (id !== oldId || version !== oldVersion) followLogs.value = true; // 切换脚本/版本重新跟随最新
-    if (followLogs.value) nextTick(scrollLogsToBottom);
+    if (id !== oldId || version !== oldVersion) scripts.followLogs = true; // 切换脚本/版本重新跟随最新
+    if (scripts.followLogs) nextTick(scrollLogsToBottom);
   });
 function onLogToggle(e) {
   if (e.target.open) nextTick(scrollLogsToBottom); // details 展开时先落到底
@@ -274,7 +288,7 @@ async function rollbackTo(version) {
   <div class="app">
     <header class="top">
       <div class="brand">
-        <img class="logo" src="/favicon.svg" alt="居控中枢">居控中枢
+        <img class="logo" src="/favicon.svg" alt="居控中枢">居控中枢<span v-if="appVersion" class="version" title="项目版本（根 package.json）">v{{ appVersion }}</span>
       </div>
       <div class="status">
         <span class="dot" :class="app.haStatus"></span> HA {{ haLabel }}
@@ -443,8 +457,10 @@ async function rollbackTo(version) {
           <TopologyPanel />
           <ScriptViewer />
           <details class="log-box" @toggle="onLogToggle">
-            <summary><span class="panel-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行日志<span v-if="scripts.logsSource === 'sim'" class="log-src sim" title="仿真实例的日志：写在独立的 v&lt;n&gt;.sim.log，不是真实运行记录">仿真</span></span><button v-if="!followLogs" class="log-follow" @click.stop="scrollLogsToBottom">↓ 回到最新</button></summary>
+            <summary><span class="panel-title"><span class="panel-chev"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>运行日志<span v-if="scripts.logsSource === 'sim'" class="log-src sim" title="仿真实例的日志：写在独立的 v&lt;n&gt;.sim.log，不是真实运行记录">仿真</span></span><button v-if="!scripts.followLogs" class="log-follow" @click.stop="scrollLogsToBottom">↓ 回到最新</button></summary>
             <div ref="logBox" class="logs" @scroll="onLogScroll">
+              <div v-if="scripts.logsLoadingOlder" class="log-more">加载更早…</div>
+              <div v-else-if="!scripts.logsHasMore && scripts.logs.length" class="log-more">没有更早的日志</div>
               <div v-for="(l, i) in scripts.logs" :key="i" class="log" :class="l.level">
                 <span class="ts">{{ scripts.logsSource === 'sim' && l.at != null ? '+' + (l.at / 1000).toFixed(1) + 's' : new Date(l.ts).toLocaleTimeString() }}</span>
                 <span class="lv">{{ l.level }}</span>

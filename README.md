@@ -15,6 +15,36 @@
 - 前端：Vue 3 + Pinia + Vite
 - 持久化：JSON 文件（`data/scripts/<id>/v<n>/`），不引数据库
 
+## 解决什么痛点
+
+**1. HA 原生自动化 / 脚本写不了复杂逻辑**
+
+HA 的自动化和脚本靠 YAML 配置表达，逻辑一旦复杂（多条件裁决、跨设备联动、滑动窗口防抖、异常兜底、脚本间依赖）就力不从心——通常被迫拆成多个子自动化互相配合，靠 `input_boolean` 等辅助实体在中间传状态：状态散落在各处、触发时序难保证、谁也说不清某个时刻整个系统处于什么状态，改一处要逐个检查所有相关自动化。
+
+本项目把复杂逻辑收敛为**一个 JavaScript 脚本**：`ctx` 框架内置状态机、持续确认（`ctx.hold`）、防抖/冷却、跨脚本依赖（`ctx.task.*`）与上下文存储（`ctx.global/local`），复杂裁决写在一处、一个脚本一个职责，改动即新版本。
+
+**2. Node-RED 逐个拖节点，接线复杂、维护成本高**
+
+Node-RED 用拖拽连线表达自动化：节点即逻辑、连线即流程。逻辑一复杂，画布上几十个节点互相缠绕，改需求要顺着线捋半天；连线数据是私有格式，没有版本 diff、难做代码复用、更难做自动回归；`function` 节点里的代码同样游离在版本管理之外。
+
+本项目**去掉"画布即逻辑"**：执行真相是带版本号的脚本源码，`flow.json` 只是从脚本反推的只读投影（前端画布可视化用）。改逻辑 = 改代码 + 升版本，git 友好、可 diff、可复用、可测试（`npm test` 全量回归）。
+
+## 核心亮点：三模式验证链
+
+每个脚本从开发到上线走一条固定的验证链，**先快后真、设备零风险**：
+
+| 模式 | 干什么 | 关键特性 |
+|---|---|---|
+| **仿真 simulate** | **秒级验证逻辑正确性**：在虚拟世界里跑（虚拟实体表 + 虚拟时钟），时钟快进、实体注入、逐条断言写意图 | 不碰任何真实设备；一次 `advance` 快进 30 秒，几分钟跑完整套回归用例；断言失败直接给出 expected/actual |
+| **影子 shadow** | **跟随日常家居真实验证**：挂在真实 HA 上照常监听实体变动、做真实裁决，**写操作只记日志不下发** | 验证期不干扰任何设备；真实环境、真实数据、真实时序下看日志反馈，确认逻辑在实战里也正确 |
+| **正式 production** | **线上正常使用**：写操作真实下发控制设备 | 只有影子验证通过、**用户显式确认后**才允许发布；发布前后版本共存可回滚 |
+
+固定顺序：**仿真（验流程/时序/写意图）→ 影子（真实环境验日志）→ 发布正式（接管设备）**。顺序不能倒、不能跳；写错一个阈值，最坏结果只是影子日志里多一行错误记录，而不是家里灯乱闪。
+
+配套兜底：服务重启按运行意图清单自动恢复；HA 断线自动挂起写操作、重连续跑；引用实体被删自动暂停、恢复后自动继续。
+
+
+
 ## 快速开始
 
 ```bash
@@ -34,22 +64,59 @@ npm start                   # http://localhost:8100
 | `npm run watch` | 服务端代码热重启（`node --watch`） | ✅ 同 `npm start` | 改 `server/` 源码时的开发辅助；正式 HA 已在线上托管时同样建议配合 `HA3D_DEV_MODE=true` 用 |
 | `npm --prefix client run dev` | 前端 Vite 热更新（5176，代理 8100） | —（不跑服务端） | 改 `client/` 前端源码时与上面任一服务端命令配合使用 |
 
-**全局开发模式（`npm run start:dev`，即 `HA3D_DEV_MODE=true`）与 `npm start` 的行为差异**：
-
-1. **恢复不过滤**：进程启动按运行意图清单恢复时，正式实例也照常恢复——但实例保持真实通道身份，**设备写被 devMode 闸拦截**只记日志不下发，本地启动不会真正控制设备；
-2. **写全拦截**：手动启动（含正式版本）实例身份不变（正式就是正式），所有 HA 写调用经 devMode 闸只记日志不下发，启动日志有「开发模式」标注；读操作照常，能用真实数据调试；
-3. **publish 允许**：发布正常执行（通道切为正式、实例可恢复），设备写仍被 devMode 闸拦住——本地可以走完整「提交影子 → 发布」流程验证；
-4. **UI 横幅**：面板 header 下方显示警示横幅，防止误以为本地面板在控制设备。
-
-配置（HA 地址 / token / 超时参数，支持环境变量覆盖 `PORT` / `HA_URL` / `HA_TOKEN` / `RUNNER_TIMEOUT_MS` / `ACTION_COOLDOWN_MS` / `MAX_RESTARTS` / `ALLOW_MCP_CALL_SERVICE` / `EXECUTION_MODE`）写在 `data/config.json`（已 gitignore）；未配置 token 时进入 demo 模式，链路仍可跑通。HA token 只在服务端，绝不下发前端 / MCP 输出。
-
-`EXECUTION_MODE`：`fork`（默认，每脚本一个子进程，进程级隔离最硬）、`inprocess`（全部脚本在主进程内 vm 执行，最省内存；脚本回调有 V8 timeout 防同步死循环）或 `worker`（每脚本一个 worker 线程，OS 抢占式公平调度 + `terminate()` 可强杀 vm timeout 拦不住的异步续体，内存居中）。三种模式脚本与数据完全兼容，改配置重启即切换。选型口诀：信脚本用 `inprocess`，不信用 `fork`，省内存又要隔离用 `worker`。
-
-**脚本级宿主覆盖**：提交时传 `hostMode`（submit_script 参数 / submit.cjs `--host-mode=`），可让个别脚本脱离全局模式单独指定宿主（三值对称：全局 inprocess 时给重脚本覆盖 `fork` 独享子进程，全局 fork 时给轻脚本覆盖 `inprocess` 省内存）。跟随版本持久化、影子迭代自动继承；影子实例恒为独立 worker 不受覆盖影响。优先级：影子强制 fork > 脚本级 `hostMode` > 全局 `EXECUTION_MODE`。发布迁移：目标宿主为 fork 时同宿主热切换零中断，否则 stop+start 重建到目标宿主。
 
 ## MCP 接入
 
 SSE 地址：`http://localhost:8100/mcp/sse`（25 个工具：15 只读 + 8 受控写 + 2 面板控制，写操作需 `confirmed: true`，其中 `automation_call_service` 默认关闭，需开启 `allowMcpCallService`）。工具清单与调用示例见 [skill/SKILL.md](skill/SKILL.md) 与 `skill/tools/mcp-call.cjs`。
+
+## 开放 HTTP 接口（跨项目联动）
+
+除 MCP 外，服务端还暴露两个最小只读/触发面 HTTP 接口，供外部平台（当前消费方：[ha-3d-home](../ha-3d-home) 通过 `server/automation-proxy.js` 代理）联动本项目的脚本能力。**任何平台都可以直接调用**，无需鉴权（默认只监听内网，请勿裸暴露公网）：
+
+### GET /api/actions — 动作与场景候选列表（只读）
+
+列出可被外部展示/勾选的一次性脚本与场景（`kind=script/scene`，不含长驻 automation），含影子候选（本地开发迁移项多为影子，便于先配好展示项）。不返回脚本正文、运行实例等管理信息，是跨项目的最小只读面。
+
+```jsonc
+// 响应
+{
+  "items": [
+    {
+      "id": "goodnight-scene",
+      "name": "晚安模式",
+      "kind": "scene",
+      "description": "关闭全部灯光并锁门",
+      "icon": "<svg ...>...</svg>",   // 与 svg 字段同源双写
+      "svg": "<svg ...>...</svg>",
+      "productionVersion": 3,          // 无正式版为 null
+      "shadowVersion": 5,              // 无影子版为 null
+      "triggerable": true              // 是否有正式版（触发接口只认正式版）
+    }
+  ]
+}
+```
+
+### POST /api/script/:id/trigger — 一次性触发执行
+
+触发指定脚本立即执行一次。缺省只认**正式版本**；`body.channel = "shadow"` 可触发影子版本（写操作被执行器硬拦截只记日志，不改 HA 实体）。只认短脚本（非长驻），长脚本返回 400。
+
+```jsonc
+// 请求体（可选）
+{ "channel": "shadow" }
+
+// 成功响应
+{ "ok": true, "id": "goodnight-scene", "version": 3, "mode": "production", "devMode": false }
+
+// 失败响应（400）
+{ "error": "脚本 id 非法" }
+```
+
+### 调用注意
+
+- **无需鉴权**：接口设计为内网互信；生产部署请通过防火墙/反代限制来源，或置于有鉴权的网关之后。
+- **错误口径**：失败统一 `{ "error": "消息" }`，HTTP 状态 400（参数/脚本问题）或 5xx（服务内部问题）。
+- **设备写安全链不变**：trigger 触发的执行与其他入口完全同源——影子通道写操作硬拦截，dev 模式下设备写另由 devMode 闸拦截，外部平台无法绕过三模式验证链。
+- **Home 项目的代理方式参考**：ha-3d-home 不直连本服务，而是服务端代理（`/api/automation/actions` → `/api/actions`，`/api/automation/trigger/:id` → `/api/script/:id/trigger`），上游地址由 `HA3D_AUTOMATION_URL` 配置（默认 `http://127.0.0.1:8100`），内网地址不出服务端。其他平台可按需同样代理或直连。
 
 ## 文档
 
@@ -61,7 +128,6 @@ SSE 地址：`http://localhost:8100/mcp/sse`（25 个工具：15 只读 + 8 受�
 | [skill/references/ctx-api.md](skill/references/ctx-api.md) | ctx 接口与参数完整参考 |
 | [skill/references/file-specs.md](skill/references/file-specs.md) | script.js / flow.json / meta.json 规范 |
 | [skill/tools/](skill/tools/) | 服务操作工具（mcp-call.cjs 通用 MCP 调用器 / submit.cjs 提交并校验 flow / sync-cache.cjs 同步本地脚本缓存） |
-| `skill/.cache/` | 本地脚本镜像（`sync-cache.cjs` 生成，服务端最新版的只读副本 + `_index.md` 实体索引，已 gitignore） |
 
 ## 测试
 

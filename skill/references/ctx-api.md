@@ -104,6 +104,7 @@ const r = await ctx.call(scriptId, params?);   // 触发另一个短脚本/场�
 |---|---|
 | 等待语义 | 只等启动回执，**不等**被调脚本执行完；失败时 reject（用 `try/catch` 接） |
 | 影子 mock | **影子实例的 ctx.call 不真实拉起被调脚本**（影子硬隔离延伸）：只做与正式路径一致的校验（目标存在影子版 / 非常驻 / params 可序列化），打 `[联动][影子] …已 mock` 日志并回 `mocked:true` 回执，脚本逻辑可继续；影子 mock 不检查 busy/restartable。要验证被调方真实执行，需正式调用或单独触发 |
+| 仿真 | 仿真里 `ctx.call` 同样只回 mock 回执（`started:true, mocked:true, version:0`）：只证明调用链路走到了，被调脚本不执行。验证口径见 `references/simulation.md` §4.4 |
 | `params` | 必须可 JSON 序列化；被调脚本用 `ctx.params` 读取（未被调用时为 `null`） |
 | 版本 | 正式调用拉起目标正式版；影子调用回执里的 version 是目标影子版本号（仅校验用，未执行） |
 | 目标类型 | 只允许一次性脚本/场景（`kind=script/scene`）；常驻自动化（`kind=automation`）不可调用 |
@@ -112,15 +113,15 @@ const r = await ctx.call(scriptId, params?);   // 触发另一个短脚本/场�
 
 示例：`await ctx.call('ngvgq6ln', { minutes: 30 });` ——被调脚本开头 `const min = ctx.params?.minutes ?? 30;`。
 
-## ctx.scriptId / ctx.task / ctx.watch.task — 依赖脚本运行状态
+## ctx.scriptId / ctx.task — 依赖脚本运行状态（status / require / watch）
 
-任意脚本都能读到自己的 id，也能查询/等待/订阅**另一个脚本实例**的运行状态。没有配置式的 `dependsOn` 声明，依赖关系完全写在脚本里。
+任意脚本都能读到自己的 id，也能查询/等待/订阅**另一个脚本实例**的运行状态。三种消费方式统一在 `ctx.task.*` 下：查一次 / 等到 running / 订阅变化。没有配置式的 `dependsOn` 声明，依赖关系完全写在脚本里。
 
 ```js
 ctx.scriptId                                   // 字符串：executor 注入的权威脚本 id
 const st = await ctx.task.status('depId');      // 查一次，不等待
 const dep = await ctx.task.require('depId', { timeout: 30000 }); // 等到 running
-const off = ctx.watch.task('depId', (state, info) => { ... });   // 订阅状态变化
+const off = ctx.task.watch('depId', (state, info) => { ... });   // 订阅状态变化
 off();                                         // 注销
 ```
 
@@ -135,6 +136,8 @@ off();                                         // 注销
 
 **通道规则（读不隔离）**：状态查询、等待、监听一律看依赖的**正式实例**，与调用者影子/正式无关。影子实例在跑也不算依赖就绪；没有正式实例时返回 `stopped`。这些接口全是只读，不产生设备副作用，所以不做通道隔离；`mode` 正常恒为 `production`，只用于日志辨识。依赖不健康时的写操作短路由业务脚本自己负责。
 
+**仿真口径**：仿真里这些接口的支撑方式与真实模式有差异——`status` 读虚拟任务表（默认 `stopped`）、`require` 用 `inject_task` 造状态并可 `advance` 验超时、`watch` **注册无回放**（需补一条 `inject_task`）。详见 `references/simulation.md` §4.4。
+
 `ctx.task.require` 语义：
 
 - 一次性门闩：等到**第一次** `running` 就 resolve，之后依赖重启/停止不再阻断当前脚本；
@@ -142,7 +145,7 @@ off();                                         // 注销
 - 脚本收到 `stop` 时立即中断等待并抛错，不会挂住 stop 流程；
 - 查不到实例时返回的 `state` 是 `stopped`（版本 meta 为异常时是 `error`），不会自动启动依赖。
 
-`ctx.watch.task(scriptId, cb)` 语义：
+`ctx.task.watch(scriptId, cb)` 语义：
 
 - 回调 `(state, info)`；**注册时主进程立即回放一次当前状态**，否则依赖早已启动时永远等不到"从无到有"；
 - `off()` 幂等，返回是否成功注销；实例停止时订阅自动摘除；
@@ -154,7 +157,7 @@ off();                                         // 注销
 ```js
 const dep = await ctx.task.require('hppowersense', { timeout: 30000 });
 ctx.log('info', `依赖已就绪：v${dep.version}（${dep.mode}）`);
-ctx.watch.task('hppowersense', (state, info) => {
+ctx.task.watch('hppowersense', (state, info) => {
   if (state !== 'running') ctx.log('warn', '依赖异常，暂停业务裁决：' + info.reason);
 });
 ```

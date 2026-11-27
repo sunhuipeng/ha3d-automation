@@ -144,7 +144,25 @@ test('runSteps：非法 op 抛错中断，aborted=true，保留已完成步骤',
   ]);
   assert.equal(r.ok, false);
   assert.equal(r.aborted, true);
-  assert.equal(r.executed, 1);
+  assert.equal(r.executed, 2, '失败的那步也是"跑过"的，计入 executed');
   assert.equal(r.results.length, 2);
   assert.match(r.results[1].error, /未知的 step op/);
+});
+
+test('runSteps：assert 支持 since 覆盖增量基准（since:0 = 全序列）', async () => {
+  const { session } = makeSession();
+  session.clock.setTimeout(() => session.recordWrite({ kind: 'write', op: 'a', nodeId: 'n1', args: [1] }), 1000);
+  session.clock.setTimeout(() => session.recordWrite({ kind: 'write', op: 'b', nodeId: 'n2', args: [2] }), 3000);
+  const r = await session.runSteps([
+    { op: 'advance', ms: 1000 },
+    { op: 'assert', label: 'first', writes: [{ op: 'a', nodeId: 'n1', args: [1] }] },
+    { op: 'advance', ms: 2000 },
+    /* 自带 assert 消耗了游标，since:0 仍能看到全部两条（sim_run_fixture 追尾断言走这条路） */
+    { op: 'assert', label: 'full', since: 0, writes: [{ op: 'a', nodeId: 'n1', args: [1] }, { op: 'b', nodeId: 'n2', args: [2] }] },
+    /* 后续断言不受 since 影响，游标仍在"全序列断言消耗点"上 */
+    { op: 'assert', label: 'after', noWrites: true },
+  ]);
+  assert.equal(r.ok, true, JSON.stringify(r.results));
+  assert.equal(r.total, 3);
+  assert.equal(r.passed, 3);
 });

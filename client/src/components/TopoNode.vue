@@ -11,8 +11,8 @@ defineProps({
 <template>
   <div class="gt-node" :class="[data.kind, { stopped: data.status === 'stopped', remote: !!data.remote }]" :style="{ '--nc': KIND[data.kind]?.color || '#888' }">
     <div class="gt-node-head"><span class="gt-ic">{{ KIND[data.kind]?.icon }}</span>{{ KIND[data.kind]?.label }}<span v-if="data.status === 'stopped'" class="gt-stopped-tag">已停止</span></div>
-    <div class="gt-node-label" :title="data.label">{{ data.label }}</div>
-    <div v-if="data.sub && data.sub !== data.label" class="gt-node-sub" :title="data.sub">{{ data.sub }}</div>
+    <div class="gt-node-label">{{ data.label }}</div>
+    <div v-if="data.sub && data.sub !== data.label" class="gt-node-sub">{{ data.sub }}</div>
     <Handle type="target" :position="Position.Top" id="c" class="gt-handle" />
     <Handle type="source" :position="Position.Top" id="c" class="gt-handle" />
   </div>

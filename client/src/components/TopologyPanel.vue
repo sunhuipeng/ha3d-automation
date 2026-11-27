@@ -6,6 +6,8 @@
 import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import { useScriptStore } from '../stores/scripts';
 import TopologyGraph from './TopologyGraph.vue';
+import LiveValueTip from './LiveValueTip.vue';
+import { useLiveTip } from '../lib/live-tip';
 
 const store = useScriptStore();
 const detailsEl = ref(null);
@@ -117,6 +119,10 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onVisibility);
 });
 
+/* ---------- hover 实时取值 ----------
+ * 每次鼠标进入条目都重新请求，不缓存；公共 useLiveTip 驱动（列表不加轮询，靠 5s 面板刷新）。 */
+const { tip, open, move, hide } = useLiveTip();
+
 watch(() => store.current?.id, () => {
   data.value = null;
   load(false);
@@ -149,21 +155,24 @@ watch(() => store.current?.id, () => {
           <div class="tb-section">
             <div class="tb-head"><span class="tb-dot read"></span>依赖实体（读取 / 订阅）<span class="tb-count">{{ group.reads?.length || 0 }}</span></div>
             <div v-if="group.reads?.length" class="tb-items">
-              <code v-for="e in group.reads" :key="e" class="tb-item read">{{ entityLabel(e) }}</code>
+              <code v-for="e in group.reads" :key="e" class="tb-item read"
+                @mouseenter="open($event, { kind: 'entity', id: e, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ entityLabel(e) }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测</div>
           </div>
           <div class="tb-section">
             <div class="tb-head"><span class="tb-dot ctx-read"></span>读取上下文（get / watch）<span class="tb-count">{{ group.contextReads?.length || 0 }}</span></div>
             <div v-if="group.contextReads?.length" class="tb-items">
-              <code v-for="c in group.contextReads" :key="c" class="tb-item ctx-read">{{ c }}</code>
+              <code v-for="c in group.contextReads" :key="c" class="tb-item ctx-read"
+                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ c }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测</div>
           </div>
           <div class="tb-section">
             <div class="tb-head"><span class="tb-dot write"></span>修改实体（HA 服务调用）<span class="tb-count">{{ group.writes?.length || 0 }}</span></div>
             <div v-if="group.writes?.length" class="tb-items">
-              <code v-for="e in group.writes" :key="e" class="tb-item write">{{ entityLabel(e) }}</code>
+              <code v-for="e in group.writes" :key="e" class="tb-item write"
+                @mouseenter="open($event, { kind: 'entity', id: e, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ entityLabel(e) }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测（影子模式写操作被拦截，不会出现在此）</div>
             <div v-if="group.services?.length" class="tb-services">
@@ -173,7 +182,8 @@ watch(() => store.current?.id, () => {
           <div class="tb-section">
             <div class="tb-head"><span class="tb-dot ctx"></span>写入上下文<span class="tb-count">{{ group.contexts?.length || 0 }}</span></div>
             <div v-if="group.contexts?.length" class="tb-items">
-              <code v-for="c in group.contexts" :key="c" class="tb-item ctx">{{ c }}</code>
+              <code v-for="c in group.contexts" :key="c" class="tb-item ctx"
+                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ c }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测</div>
           </div>
@@ -195,6 +205,8 @@ watch(() => store.current?.id, () => {
       </template>
       <div v-else class="tb-empty">该脚本尚未运行，暂无拓扑观测数据</div>
     </div>
+    <!-- hover 实时取值浮层：公共组件，fixed 定位不受 details 折叠/滚动裁剪 -->
+    <LiveValueTip :tip="tip" />
   </details>
 </template>
 
@@ -230,6 +242,9 @@ watch(() => store.current?.id, () => {
 .tb-count { color: var(--hint); font-weight: 400; }
 .tb-items { display: flex; flex-wrap: wrap; gap: 6px; }
 .tb-item { font-size: 11px; line-height: 1.5; padding: 3px 8px; border-radius: 5px; background: var(--surface); border: 1px solid var(--line); word-break: break-all; }
+/* 实体/上下文条目可 hover 实时取值：给出可交互提示；浮层由公共组件 LiveValueTip 渲染 */
+.tb-item[class*="read"], .tb-item.write, .tb-item.ctx { cursor: help; }
+.tb-item:hover { border-color: var(--accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent); }
 .tb-item.read { color: #378ADD; }
 .tb-item.ctx-read { color: #7F77DD; }
 .tb-item.write { color: #D85A30; }
