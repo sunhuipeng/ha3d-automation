@@ -14,18 +14,21 @@ const { EventEmitter } = require('events');
 const { createCore } = require('./runner-core');
 
 /* 主进程全局兜底（幂等）：inline 模式下脚本 fire-and-forget 的 reject 若无全局处理
- * 会让服务进程崩掉，比 fork 模式（只崩一个子进程）严重得多，必须只记日志。 */
+ * 会让服务进程崩掉，比 fork 模式（只崩一个子进程）严重得多，必须只记日志。
+ * 幂等判定用本模块自己的标记（Symbol.for 全局注册表），不看 listenerCount——
+ * 之前用 listenerCount===0 判断，若其他模块也挂过全局 handler，这里会误判"已安装"
+ * 而跳过，兜底是否生效取决于别人的实现（审计 3.7：跨模块隐式耦合）。 */
+const GUARDS_INSTALLED = Symbol.for('ha3d.automation.inline.globalGuards');
+
 function installGlobalGuards() {
-  if (process.listenerCount('unhandledRejection') === 0) {
-    process.on('unhandledRejection', (e) => {
-      console.error('[inline-runner] 未捕获的 Promise 拒绝：', e && e.message || e);
-    });
-  }
-  if (process.listenerCount('uncaughtException') === 0) {
-    process.on('uncaughtException', (e) => {
-      console.error('[inline-runner] 未捕获异常：', e && e.message || e);
-    });
-  }
+  if (process[GUARDS_INSTALLED]) return;
+  process[GUARDS_INSTALLED] = true;
+  process.on('unhandledRejection', (e) => {
+    console.error('[inline-runner] 未捕获的 Promise 拒绝：', e && e.message || e);
+  });
+  process.on('uncaughtException', (e) => {
+    console.error('[inline-runner] 未捕获异常：', e && e.message || e);
+  });
 }
 
 /* 返回与 child_process.ChildProcess 同形状的句柄（继承 EventEmitter，

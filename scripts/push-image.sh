@@ -4,8 +4,8 @@
 # 本脚本不含任何默认值：所有发布配置必须由环境变量显式传入，缺任一项即报错退出。
 # 配置集中在 package.json 的 npm scripts 里，一眼能看清推到哪里 / 什么架构 / 是否升版。
 # 正常入口：
-#   npm run push:image:arm64   # 内网 arm64 + 自动升 patch
-#   npm run push:image:public  # 公网 CNB 多架构 + 不升版本
+#   npm run image:nas        # 内网仓库 arm64 + 自动升 patch
+#   npm run image:public     # 公网 CNB 多架构 + 不升版本
 #
 # 必需环境变量（缺一报错）:
 #   REGISTRY   仓库域名，如 192.168.31.16:4000 / docker.cnb.cool
@@ -33,7 +33,7 @@ for key in "${required[@]}"; do
 done
 if [ ${#missing[@]} -gt 0 ]; then
   echo "[push-image] 缺少必需环境变量: ${missing[*]}" >&2
-  echo "            脚本不含默认值，请通过 package.json 的 npm run push:image:* 调用，" >&2
+  echo "            脚本不含默认值，请通过 package.json 的 npm run image:nas / image:public 调用，" >&2
   echo "            或显式传入: ${required[*]}" >&2
   exit 1
 fi

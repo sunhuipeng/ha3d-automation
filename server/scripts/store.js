@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const { DATA, FIXTURES, ensureDataDir } = require('../config');
 const context = require('./context');
 const { safeId: validateSid } = require('./inst-key'); // id 校验唯一实现在 inst-key（防三处正则漂移）
+const simLog = require('./sim-log'); // sim.log 唯一读写实现（主进程侧经这里，worker 侧直 require）
 
 const SCRIPTS_DIR = path.join(DATA, 'scripts');
 const CHANNELS = ['shadow', 'production', 'archive'];
@@ -462,16 +463,8 @@ function simLogFile(id, version) { return path.join(DATA, 'runtime', String(id),
  * 每次重新进入仿真时清掉，避免读到上一次的陈旧现场。 */
 function simCrashFile(id, version) { return path.join(DATA, 'runtime', String(id), 'v' + Number(version) + '.sim.crash.json'); }
 
-function writeSimCrash(id, version, snapshot) {
-  if (!safeId(id) || !Number.isInteger(version) || version < 1) return false;
-  const file = simCrashFile(id, version);
-  try {
-    ensureDataDir();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(snapshot), 'utf8');
-    return true;
-  } catch (e) { return false; }
-}
+/* 崩溃快照的实际写入在 worker 侧（worker-runner 的 writeCrashSnapshot，脚本异常终止前同步落盘）；
+ * 主进程只负责 readSimCrash / clearSimCrash 的读取与清理。 */
 
 function readSimCrash(id, version) {
   if (!safeId(id) || !Number.isInteger(version) || version < 1) return null;
@@ -595,14 +588,11 @@ function appendLog(id, version, entry) {
  * 文件生命周期统一由主进程 start(simulate) 时 clearSimLog 清空，worker 改为追加写。 */
 function clearSimLog(id, version) {
   if (!safeId(id) || !Number.isInteger(version) || version < 1) return;
-  try { fs.writeFileSync(simLogFile(id, version), ''); } catch (e) { /* 无旧文件也属正常 */ }
+  simLog.clear(simLogFile(id, version)); // 读写契约统一在 sim-log.js（审计 3.6）
 }
 function appendSimLog(id, version, entry) {
   if (!safeId(id) || !Number.isInteger(version) || version < 1) return;
-  const file = simLogFile(id, version);
-  ensureDataDir();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, JSON.stringify({ ts: Date.now(), ...entry }) + '\n');
+  simLog.appendLine(simLogFile(id, version), entry);
 }
 
 /* 运行时日志定时清理（data/runtime/<id>/v<n>.log 为 JSON 行追加文件，天然只增不减）：
@@ -665,7 +655,7 @@ module.exports = {
   safeId, newScriptId, validateFlow, kindOf,
   list, listVersions, get, submit, publish, rollback, removeVersion, removeScript, getMeta,
   channelOf, normalizeChannels, versionOfChannel, detailedVersions,
-  readLogs, readSimLogs, readLogPage, appendLog, clearSimLog, appendSimLog, simLogFile, simCrashFile, writeSimCrash, readSimCrash, clearSimCrash, cleanupRuntimeLogs,
+  readLogs, readSimLogs, readLogPage, appendLog, clearSimLog, appendSimLog, simLogFile, simCrashFile, readSimCrash, clearSimCrash, cleanupRuntimeLogs,
   writeFixture, readFixture, listFixtures,
   EXECUTION_HOST_MODES,
 };

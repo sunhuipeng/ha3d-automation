@@ -33,7 +33,7 @@
 ### 1.2 能力一览
 
 - **脚本托管**：三种执行模式（`EXECUTION_MODE`：`fork` 每脚本独立子进程 / `inprocess` 单进程 vm 执行省内存 / `worker` 每脚本一个线程，OS 抢占式调度 + 强杀）；**影子脚本强制独立 worker**（每次新建、用完即毁）——未验证代码独享 worker 线程隔离，失控只影响自己，正式脚本才按 `EXECUTION_MODE` 走省资源宿主；realm 沙箱 + AST 静态校验（含无界同步循环拦截），版本仓库、影子/正式双通道灰度
-- **MCP 接入**：25 个工具（15 只读 + 8 受控写 + 2 面板控制），SSE 端点供 Agent 直接读写脚本与 HA 实体
+- **MCP 接入**：37 个工具（16 只读 + 8 受控写 + 11 仿真 + 2 面板控制），SSE 端点供 Agent 直接读写脚本与 HA 实体
 - **兜底体系**：服务重启按运行意图清单自动恢复；HA 断线挂起写操作、重连自动继续；引用实体被删自动暂停、恢复后自动继续
 - **前端面板**：Vue 3 可视化管理脚本、版本、日志与运行状态
 
@@ -84,7 +84,7 @@ npm start                       # http://localhost:8100
 
 ### 2.3 Docker 部署（完整 compose 示例）
 
-仓库自带 `docker-compose.yml`，单容器、数据走卷。下面是一份**完整示例**，与仓库版本一致，注释说明了每一项；不需要的项直接删掉即可：
+仓库自带 `docker-compose.yml`（本地 build 形态：`build: .` + 本地镜像名）。下面是一份**完整示例**——把镜像行换成公开仓库地址、去掉 `build:` 后即可直接用，其余各项与仓库版本一致，注释说明了每一项；不需要的项直接删掉即可：
 
 ```yaml
 services:
@@ -155,7 +155,7 @@ docker pull docker.cnb.cool/sunhuipeng/ha3d-images/ha3d-automation:latest
 
 ## 四、MCP 接入
 
-SSE 地址：`http://localhost:8100/mcp/sse`（25 个工具：15 只读 + 8 受控写 + 2 面板控制，写操作需 `confirmed: true`，其中 `automation_call_service` 默认关闭，需开启 `allowMcpCallService`）。工具清单与调用示例见 [skill/SKILL.md](skill/SKILL.md) 与 `skill/tools/mcp-call.cjs`。
+SSE 地址：`http://localhost:8100/mcp/sse`（37 个工具：16 只读 + 8 受控写 + 11 仿真 + 2 面板控制，写操作需 `confirmed: true`，其中 `automation_call_service` 默认关闭，需开启 `allowMcpCallService`）。工具清单与调用示例见 [skill/SKILL.md](skill/SKILL.md) 与 `skill/tools/mcp-call.cjs`。
 
 ---
 
@@ -219,8 +219,7 @@ SSE 地址：`http://localhost:8100/mcp/sse`（25 个工具：15 只读 + 8 受�
 | [skill/SKILL.md](skill/SKILL.md) | 脚本开发流程与硬规则（可直接导入 AI Agent） |
 | [skill/references/ctx-api.md](skill/references/ctx-api.md) | ctx 接口与参数完整参考 |
 | [skill/references/file-specs.md](skill/references/file-specs.md) | script.js / flow.json / meta.json 规范 |
-| [skill/tools/](skill/tools/) | 服务操作工具（mcp-call.cjs 通用 MCP 调用器 / submit.cjs 提交并校验 flow / sync-cache.cjs 同步本地脚本缓存） |
-| [SCRIPT-SCENE-TAKEOVER.md](SCRIPT-SCENE-TAKEOVER.md) | HA 原生脚本 / 场景接管方案与实施进度 |
+| [skill/tools/](skill/tools/) | 服务操作工具（mcp-call.cjs 通用 MCP 调用器 / submit.cjs 提交并校验 flow / sync-cache.cjs 同步本地脚本缓存 / case.cjs 用例维护 / mdi-icon.cjs MDI 图标取源；公共实现在 lib/） |
 
 测试：
 

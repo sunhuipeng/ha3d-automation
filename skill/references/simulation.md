@@ -1,6 +1,6 @@
 # 仿真验证（simulate）使用手册
 
-> 设计依据：项目根 `SIMULATION-DESIGN.md`（§5 工具 / §7 断言 / §14 实现进度与实战记录）。
+> 设计依据：服务端实现见 `server/scripts/sim-control.js`（控制面）与 `server/sim/`（虚拟世界会话、虚拟时钟）；本文档是仿真用法与口径的唯一现行说明。
 > 一句话：**仿真只是影子验证的第一段，不是流程终点**——`simulate` 用虚拟世界验流程/时序/写意图，跑完必须 `switch_verify_mode {"mode":"follow"}` 切回影子模式并让同一个影子版本真跑（`case.cjs finish <scriptId>` 一步完成），两段都过才允许 `publish`。
 
 ---
@@ -16,7 +16,7 @@
 | `ctx.write` | 只记 `[影子·拦截写操作]`，不进流程 | 记**写意图**（`service` + `write` 两条），驱动流程继续 |
 | 外部动作 | 不真实下发 | 不真实下发，`ctx.actions` 里的 HA 调用由 host 在微任务内应答 |
 | 能验证 | 判据读得对不对、真实设备有没有动、真实回调时序 | 分支是否走到、防抖/冷却时长是否准、写序列与顺序对不对 |
-| 不能验证 | 需等待真实时间，慢且不可控 | **设备不响应 / 失败 / 延迟等异常分支**（决策见报告 §14.7，不做 `loopback`） |
+| 不能验证 | 需等待真实时间，慢且不可控 | **设备不响应 / 失败 / 延迟等异常分支**（刻意不做 `loopback`：仿真只验正常分支，异常分支交给 follow 真跑） |
 | 流程位置 | 5.3 验收门禁；也是仿真结束后的落点 | 5.1 第一段；跑完必须回 follow，不能停在这里 |
 
 **职责边界（硬规则）**
@@ -41,7 +41,7 @@
 
 ---
 
-## 3. 工具一览（11 个仿真工具 + 1 个切换入口，全部需 `confirmed:true`）
+## 3. 工具一览（11 个仿真工具，含唯一切换入口 `automation_switch_verify_mode`，全部需 `confirmed:true`）
 
 | 工具 | 关键参数 | 用途 |
 |---|---|---|
@@ -203,7 +203,7 @@ node skill/tools/case.cjs push <id>/<name> --run-fixture      # 走服务端 sim
 底层 MCP 等价：`automation_sim_export {"scriptId","name"}` → 落 `skill/.fixtures/<id>/<name>.json`；`automation_sim_run_fixture {"scriptId","name"}` → 读同一份并重建世界重放。
 
 - fixture = **起始时刻 + 初始种子 + 驱动流水（全部 inject/advance）+ 观测到的写意图序列 + 脚本版号/sha**，不含中间断言。
-- `sim_run_fixture` 默认在末尾追加一条「写意图全序列」断言；**用例自带 `assert` 时自动跳过**（那些断言已把游标消耗掉，追尾断言只会看到 0 条而误判），改由用例自身断言判定；要强制追加传 `assertWrites:true`，要关闭传 `false`。
+- `sim_run_fixture` 默认在末尾追加一条「写意图全序列」断言（`since:0`，不受用例自带 assert 游标影响，两者各验各的、可并存）；**仅当用例的 `expected.writes` 为空且用例自带 `assert` 步骤时不追加**（空期望 + 自带断言，追尾空序列断言只会误报）。`assertWrites:false` 显式关闭追尾断言；注意 `assertWrites:true` 在上述例外场景下也追加不了（空期望 + 自带断言恒不追加）——需要全序列校验时用 `case.cjs run`（见下条）。
 - 手写用例要全序列校验，用 `case.cjs run`：它在 `run_steps` 之后追加一次 `sim_assert {since:0, writes: expected.writes}`。
 - `fixture.versionDrift=true` → 脚本已改（版号或 sha 变），断言失败先怀疑版本漂移，而不是逻辑回归。手写用例记得填 `scriptVersion`，否则会误报漂移。
 - 用例格式、收录门槛、索引表见 `skill/.fixtures/README.md`。

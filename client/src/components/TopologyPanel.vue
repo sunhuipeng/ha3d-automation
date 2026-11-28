@@ -156,7 +156,7 @@ watch(() => store.current?.id, () => {
             <div class="tb-head"><span class="tb-dot read"></span>依赖实体（读取 / 订阅）<span class="tb-count">{{ group.reads?.length || 0 }}</span></div>
             <div v-if="group.reads?.length" class="tb-items">
               <code v-for="e in group.reads" :key="e" class="tb-item read"
-                @mouseenter="open($event, { kind: 'entity', id: e, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ entityLabel(e) }}</code>
+                @mouseenter="open($event, { kind: 'entity', id: e, scriptId: store.current?.id, mode: mode })" @mousemove="move" @mouseleave="hide">{{ entityLabel(e) }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测</div>
           </div>
@@ -164,7 +164,7 @@ watch(() => store.current?.id, () => {
             <div class="tb-head"><span class="tb-dot ctx-read"></span>读取上下文（get / watch）<span class="tb-count">{{ group.contextReads?.length || 0 }}</span></div>
             <div v-if="group.contextReads?.length" class="tb-items">
               <code v-for="c in group.contextReads" :key="c" class="tb-item ctx-read"
-                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ c }}</code>
+                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode })" @mousemove="move" @mouseleave="hide">{{ c }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测</div>
           </div>
@@ -172,7 +172,7 @@ watch(() => store.current?.id, () => {
             <div class="tb-head"><span class="tb-dot write"></span>修改实体（HA 服务调用）<span class="tb-count">{{ group.writes?.length || 0 }}</span></div>
             <div v-if="group.writes?.length" class="tb-items">
               <code v-for="e in group.writes" :key="e" class="tb-item write"
-                @mouseenter="open($event, { kind: 'entity', id: e, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ entityLabel(e) }}</code>
+                @mouseenter="open($event, { kind: 'entity', id: e, scriptId: store.current?.id, mode: mode })" @mousemove="move" @mouseleave="hide">{{ entityLabel(e) }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测（影子模式写操作被拦截，不会出现在此）</div>
             <div v-if="group.services?.length" class="tb-services">
@@ -183,7 +183,7 @@ watch(() => store.current?.id, () => {
             <div class="tb-head"><span class="tb-dot ctx"></span>写入上下文<span class="tb-count">{{ group.contexts?.length || 0 }}</span></div>
             <div v-if="group.contexts?.length" class="tb-items">
               <code v-for="c in group.contexts" :key="c" class="tb-item ctx"
-                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode.value })" @mousemove="move" @mouseleave="hide">{{ c }}</code>
+                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode })" @mousemove="move" @mouseleave="hide">{{ c }}</code>
             </div>
             <div v-else class="tb-empty">暂无观测</div>
           </div>

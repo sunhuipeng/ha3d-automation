@@ -20,13 +20,11 @@
 const fs = require('fs');
 const path = require('path');
 const { DATA, ensureDataDir } = require('../config');
+/* 键格式与 executor 共用 inst-key.js（审计 F4：此前两处独立实现，改动一侧会静默断恢复链） */
 const { instKey, parseKey, safeId } = require('./inst-key');
 
 const STATE_FILE = path.join(DATA, 'runtime', 'desired-running.json');
 const TMP_FILE = STATE_FILE + '.tmp';
-
-/* 键格式与 executor 共用 inst-key.js（审计 F4：此前两处独立实现，改动一侧会静默断恢复链） */
-const entryKey = instKey;
 
 function read() {
   let obj;
@@ -41,7 +39,7 @@ function read() {
     /* v2 键形如 sid#v3；v1 键就是 sid —— 用值里的 scriptId/键名补齐 */
     const sid = val.scriptId || parseKey(key).sid;
     if (!safeId(sid)) continue;
-    entries[entryKey(sid, v)] = { scriptId: sid, version: v, startedAt: Number(val.startedAt) || Date.now() };
+    entries[instKey(sid, v)] = { scriptId: sid, version: v, startedAt: Number(val.startedAt) || Date.now() };
   }
   return entries;
 }
@@ -60,7 +58,7 @@ function mark(id, version, startedAt) {
   /* 与 store.safeId 同口径，防止 ../ 之类的 id 污染清单键 */
   if (!safeId(sid) || !Number.isInteger(v) || v < 1) return;
   const entries = read();
-  entries[entryKey(sid, v)] = { scriptId: sid, version: v, startedAt: Number(startedAt) || Date.now() };
+  entries[instKey(sid, v)] = { scriptId: sid, version: v, startedAt: Number(startedAt) || Date.now() };
   write(entries);
 }
 
@@ -74,7 +72,7 @@ function clear(id, version) {
       if (val.scriptId === sid) { delete entries[key]; changed = true; }
     }
   } else {
-    const key = entryKey(sid, version);
+    const key = instKey(sid, version);
     if (key in entries) { delete entries[key]; changed = true; }
   }
   if (changed) write(entries);
@@ -84,8 +82,8 @@ function clear(id, version) {
 function has(id, version) {
   const sid = String(id || '');
   const entries = read();
-  if (version != null) return entryKey(sid, version) in entries;
+  if (version != null) return instKey(sid, version) in entries;
   return Object.values(entries).some((e) => e.scriptId === sid);
 }
 
-module.exports = { entryKey, read, mark, clear, has };
+module.exports = { read, mark, clear, has };

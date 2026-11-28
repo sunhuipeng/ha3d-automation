@@ -5,7 +5,7 @@
  * now() = 起始 epoch + 已推进的虚拟毫秒；date() 返回 new Date(now())，
  * 与项目 ctx.time.nowSod() 的本地时区口径天然一致（同一宿主进程 TZ）。
  *
- * advance(ms) 算法（SIMULATION-DESIGN §4）：
+ * advance(ms) 算法：
  *   target = elapsed + ms；循环取 dueAt <= target 的最早定时器（dueAt + 序号排序）；
  *   elapsed = max(elapsed, dueAt)；移除并执行回调；回调内新排的定时器入队；
  *   每轮 await 微任务 + setImmediate 排空；步数与同刻触发双上限防 0ms 死循环。

@@ -4,6 +4,7 @@
 const express = require('express');
 const { store, executor, connector, hub } = require('../lib/runtime');
 const { computeDiff } = require('../lib/diff');
+const { scriptDetail } = require('../lib/script-detail');
 const topology = require('../scripts/topology');
 const context = require('../scripts/context');
 
@@ -40,7 +41,7 @@ function topologyForDisplay(sid) {
  * 该脚本会从全局图消失一段时间，跑起来后重新长出。 */
 function topologyForGlobalDisplay() {
   const all = topology.all();
-  const names = new Map(store.list().map((s) => [String(s.id), s.name || String(s.id)]));
+  const names = scriptNamesMap();
   const scripts = {};
   const ids = new Set();
   for (const [sid, byMode] of Object.entries(all.scripts || {})) {
@@ -54,14 +55,14 @@ function topologyForGlobalDisplay() {
     const prodRun = executor.runningVersions(sid).find((r) => r.mode === 'production');
     scripts[sid] = {
       ...group,
-      name: names.get(sid) || sid,
+      name: names[sid] || sid,
       running: !!prodRun && Number(prodRun.version) === Number(group.version),
     };
     for (const id of [...(group.reads || []), ...(group.writes || [])]) ids.add(String(id));
   }
   return { updatedAt: all.updatedAt, scripts,
     entityLabels: entityLabelsFor(ids),
-    scriptNames: Object.fromEntries(names) };
+    scriptNames: names };
 }
 
 module.exports = function scriptRoutes() {
@@ -131,23 +132,10 @@ module.exports = function scriptRoutes() {
   });
 
   r.get('/script/:id', (req, res) => {
-    const rec = store.get(req.params.id, req.query.version ? Number(req.query.version) : undefined);
-    if (!rec) return res.status(404).json({ error: '脚本版本不存在' });
-    // script 正文只用于前端只读源码预览；执行仍以服务端落盘的 script.js 为准
-    res.json({
-      ...rec,
-      /* meta.json 已不存 status：运行状态由 executor 内存合成。
-       * status 是版本级（当前打开版本的徽章）；scriptStatus 是脚本级（左侧列表徽章口径，
-       * 任一实例在跑 → running，无实例但最近异常退出 → error）——两者口径不同，
-       * 前端回填列表必须用 scriptStatus，用版本级会把脚本级 error 徽标遮蔽成 stopped。 */
-      status: executor.versionRuntimeStatus(rec.id, rec.version),
-      scriptStatus: executor.scriptRuntimeStatus(rec.id),
-      running: executor.isRunning(rec.id),
-      runningVersion: executor.runningVersion(rec.id),
-      runningVersions: executor.runningVersions(rec.id),
-      /* 便于前端标注"这个版本是工作副本，可直接改" */
-      mutable: store.channelOf(rec.meta) === 'shadow',
-    });
+    /* 详情组装与 MCP automation_get_script_status 共用 scriptDetail（审计 3.3） */
+    const d = scriptDetail(req.params.id, { version: req.query.version ? Number(req.query.version) : undefined });
+    if (!d) return res.status(404).json({ error: '脚本版本不存在' });
+    res.json(d);
   });
 
   /* 运行时拓扑：executor 在真实拦截点观测到的实体读写与上下文写入，
@@ -196,7 +184,7 @@ module.exports = function scriptRoutes() {
   r.post('/script/:id/start', (req, res) => {
     try {
       executor.start(req.params.id, req.body && req.body.version, connector);
-      hub.broadcast({ type: 'refresh', what: 'scripts' });
+      executor.broadcastRefresh(['scripts']);
       res.json({ ok: true, running: true });
     } catch (e) { res.status(400).json({ error: e.message }); }
   });
@@ -216,7 +204,7 @@ module.exports = function scriptRoutes() {
     /* body.version 可选：给则只停该版本实例，不给停全部（正式+影子） */
     const v = req.body && req.body.version ? Number(req.body.version) : undefined;
     const ok = executor.stop(req.params.id, 'manual', v);
-    hub.broadcast({ type: 'refresh', what: 'scripts' });
+    executor.broadcastRefresh(['scripts']);
     res.json({ ok, running: executor.isRunning(req.params.id), runningVersions: executor.runningVersions(req.params.id) });
   });
 

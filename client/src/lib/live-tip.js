@@ -1,4 +1,4 @@
-import { ref } from 'vue';
+import { ref, getCurrentScope, onScopeDispose } from 'vue';
 
 /* 拓扑条目 hover 实时取值（列表 / 单脚本图 / 全局图三处共用）。
  * 口径：
@@ -9,8 +9,6 @@ import { ref } from 'vue';
  * open 的 opts: { kind: 'entity'|'context', id, scriptId?, scriptIds?, mode?, title?, groupLabels? }
  * - 实体与 global 上下文的值与脚本无关 → 单请求；
  * - local 上下文的值存在 scriptId:mode 命名空间下 → scriptIds（owners）每个脚本各查一次，分组展示。 */
-
-const POLL_DEFAULT = 3000;
 
 export function useLiveTip({ pollMs = 0 } = {}) {
   const tip = ref({ show: false, x: 0, y: 0, style: {}, loading: false, title: '', groups: [], note: '' });
@@ -121,7 +119,7 @@ export function useLiveTip({ pollMs = 0 } = {}) {
     if (pollMs > 0) {
       timer = setInterval(() => {
         if (!document.hidden && tip.value.show && current) loadCurrent();
-      }, pollMs || POLL_DEFAULT);
+      }, pollMs);
     }
   }
 
@@ -138,6 +136,10 @@ export function useLiveTip({ pollMs = 0 } = {}) {
     current = null;
     tip.value.show = false;
   }
+
+  /* 审计 4.13：组件卸载（v-if 切视图）不经过 hide，轮询定时器会继续请求并写已卸载组件。
+   * useLiveTip 都在 setup 里调用：借用当前作用域注册 dispose 清理，组件卸载即停轮询。 */
+  if (getCurrentScope()) onScopeDispose(hide);
 
   return { tip, open, move, hide };
 }

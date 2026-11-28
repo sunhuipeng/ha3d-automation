@@ -9,9 +9,10 @@
  *   - apk add 需要联网到 Alpine 官方源，国内经常几十秒，且与 COPY skill 同层，skill 一改就重下；
  *   - 只用 Node 内置 zlib（deflateRawSync / crc32），既不装 apk 包也不加 npm 依赖。
  *
- * 行为与旧命令等价（`cd skill && zip -qr skill.zip . -x ".cache/*"`）：
+ * 源自旧命令（`cd skill && zip -qr skill.zip . -x ".cache/*"`），排除项比旧命令更严：
  *   - 条目相对 srcDir 根，不套一层目录（解压即得 skill 内容）；
- *   - 跳过 .cache/、.git/、.DS_Store；
+ *   - 跳过隐藏工作目录（.cache/.fixtures/.scripts/.work/.notes/.git）与 .DS_Store 共 7 项
+ *     （旧命令只排除 .cache，AI 工作目录本就不该进分发包）；
  *   - 文件名用 '/' 分隔并置 UTF-8 标志位（bit 11），中文名不乱码；
  *   - 条目按路径排序，同样的输入产出同样的字节序，便于比对。
  */

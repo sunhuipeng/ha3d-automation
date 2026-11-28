@@ -39,7 +39,13 @@ async function save() {
     if (r.error) throw new Error(r.error);
     hasToken.value = !!r.config.hasToken;
     form.value.token = '';
-    ok.value = '已保存，HA 正在重连…';
+    /* 被环境变量覆盖的字段保存不生效（env 优先于 config.json），显式提示而不是静默回显旧值 */
+    if (Array.isArray(r.overridden) && r.overridden.length) {
+      const names = { haUrl: 'HA 地址', token: 'Token', runnerTimeoutMs: '运行超时', actionCooldownMs: '动作冷却', maxRestarts: '最大重启', allowMcpCallService: 'MCP 直调服务', executionMode: '执行方式' };
+      ok.value = '已保存，但以下字段被环境变量覆盖、未生效：' + r.overridden.map((o) => `${names[o.key] || o.key}（${o.env}）`).join('、');
+    } else {
+      ok.value = '已保存，HA 正在重连…';
+    }
   } catch (e) { err.value = e.message; }
   finally { saving.value = false; }
 }

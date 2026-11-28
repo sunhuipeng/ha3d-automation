@@ -2,7 +2,7 @@
 /* 仿真宿主桥：在 worker 线程内应答 runner-core 的 request（getState/listEntities/
  * contextGet/contextSet/callService/callScript/taskStatus）。
  *
- * 关键约束（SIMULATION-DESIGN §4）：必须在同步或微任务内应答——所有方法同步返回，
+ * 关键约束：必须在同步或微任务内应答——所有方法同步返回，
  * 由调用方用 Promise.resolve 包一层回 core.handleMessage({type:'reply'})，绝不用宏任务
  * 假装 HA 延迟，否则 advance 快进会误触发 request 的 10s 超时。
  *

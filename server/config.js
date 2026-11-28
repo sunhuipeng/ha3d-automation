@@ -36,9 +36,24 @@ function readFileConfig() {
   try {
     return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
   } catch (e) {
+    /* 审计 4.6：区分"没有配置文件"（正常）与"文件损坏"（必须留痕）——
+     * 损坏时静默返回 {} 会让 saveConfig 用空对象写回，token/HA 地址无提示丢失。 */
+    if (e.code !== 'ENOENT') console.error('[config] data/config.json 读取/解析失败，按空配置处理：', e.message);
     return {};
   }
 }
+
+/* 可写字段的同名环境变量（审计 4.5）：env 优先于 config.json——用户经 UI 保存这些字段
+ * 时不生效且无提示，路由用这张表生成 overridden 警告回传给前端。 */
+const ENV_OVERRIDES = {
+  haUrl: 'HA_URL',
+  token: 'HA_TOKEN',
+  runnerTimeoutMs: 'RUNNER_TIMEOUT_MS',
+  actionCooldownMs: 'ACTION_COOLDOWN_MS',
+  maxRestarts: 'MAX_RESTARTS',
+  allowMcpCallService: 'ALLOW_MCP_CALL_SERVICE',
+  executionMode: 'EXECUTION_MODE',
+};
 
 const EXECUTION_MODES = ['fork', 'inprocess', 'worker'];
 
@@ -115,4 +130,4 @@ function ensureDataDir() {
   fs.mkdirSync(path.join(DATA, 'runtime'), { recursive: true });
 }
 
-module.exports = { ROOT, DATA, FIXTURES, DEV_MODE, getConfig, ensureDataDir, saveConfig, publicConfig };
+module.exports = { ROOT, DATA, FIXTURES, DEV_MODE, getConfig, ensureDataDir, saveConfig, publicConfig, ENV_OVERRIDES };

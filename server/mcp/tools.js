@@ -9,11 +9,8 @@ const { text, fail, wrapToolActivity } = require('./helpers');
 const store = require('../scripts/store');
 const context = require('../scripts/context');
 const { validateScript } = require('../scripts/validate');
-const { getConfig } = require('../config');
-/* 版本号唯一真相：服务端读根 package.json（与镜像 tag 同源，push-image.sh 用同一字段打 tag）。
- * 前端也在构建期 import 同一文件，线上 MCP 返回的版本可与本地仓库 package.json 直接比对，
- * 用来判断 skill 文档 / clone 下来的源码是否与线上部署同版本。 */
-const PKG_VERSION = require('../../package.json').version;
+const { systemSnapshot } = require('../lib/system-info');
+const { scriptDetail } = require('../lib/script-detail');
 
 function buildTools(server, ctx) {
   const { connector, executor } = ctx;
@@ -25,20 +22,7 @@ function buildTools(server, ctx) {
     '查询线上系统版本与运行信息（纯只读、无副作用、不需确认）。version 取自服务端 package.json，与镜像 tag 同源——可与本地仓库 package.json 对比，判断 skill 文档/clone 源码是否与线上同版本；devMode=true 时所有 HA 写只记日志不下发，务必据此判读行为。不返回 HA token 等任何敏感配置。',
     {},
     async () => {
-      const cfg = getConfig();
-      return text(JSON.stringify({
-        version: PKG_VERSION,
-        devMode: cfg.devMode === true,
-        executionMode: cfg.executionMode,
-        haStatus: connector.status,
-        demo: connector.demo === true,
-        scripts: store.list().length,
-        running: executor.runningList().length,
-        node: process.version,
-        platform: process.platform + '/' + process.arch,
-        uptimeSeconds: Math.floor(process.uptime()),
-        ts: Date.now(),
-      }, null, 2));
+      return text(JSON.stringify(systemSnapshot({ connector, executor }), null, 2));
     }
   );
 
@@ -101,20 +85,10 @@ function buildTools(server, ctx) {
     '查询某脚本版本的元数据、运行状态与最近日志。返回 channel（shadow/production/archive）、mutable（是否可改）、runningVersion（实例真正在跑的版本）。',
     { scriptId: z.string(), version: z.number().int().positive().optional(), logLimit: z.number().int().min(1).max(1000).optional() },
     async ({ scriptId, version, logLimit }) => {
-      const rec = store.get(scriptId, version);
-      if (!rec) return fail('脚本版本不存在：' + scriptId + (version ? ' v' + version : ''));
-      const logs = store.readLogs(scriptId, rec.version, logLimit || 100);
-      const channel = store.channelOf(rec.meta);
-      return text(JSON.stringify({
-        id: rec.id, version: rec.version, meta: rec.meta, flow: rec.flow,
-        channel, mutable: channel === 'shadow',
-        /* status=版本级（该版本实例的运行状态）；scriptStatus=脚本级（列表徽章口径） */
-        status: executor.versionRuntimeStatus(scriptId, rec.version),
-        scriptStatus: executor.scriptRuntimeStatus(scriptId),
-        running: executor.isRunning(scriptId), runningVersion: executor.runningVersion(scriptId),
-        runningVersions: executor.runningVersions(scriptId),
-        logs,
-      }, null, 2));
+      /* 详情组装与 REST /api/script/:id 共用 scriptDetail（审计 3.3） */
+      const d = scriptDetail(scriptId, { version, logLimit: logLimit || 100 });
+      if (!d) return fail('脚本版本不存在：' + scriptId + (version ? ' v' + version : ''));
+      return text(JSON.stringify(d, null, 2));
     }
   );
 
@@ -242,7 +216,7 @@ function buildTools(server, ctx) {
     '提交脚本（script.js + flow.json + meta.json）。**影子可反复修改**：当前已有影子版本时，默认原地覆盖该版本（版本号不变、revision+1），不会新增版本号；只有传入 newVersion:true 或当前没有影子时才分配新版本号。正式版/归档版内容不可改（会被拦截），想改正式内容必须提交新影子再发布。需 confirmed:true。**每次提交必须传贴切的中文 name（展示名，可随功能演进更新），严禁用唯一 id 充当名字。**',
     {
       scriptId: z.string().optional().describe('脚本 id（纯字母数字短码）。新建脚本可不传，服务端自动生成；更新已有脚本时传 list_scripts 返回的 id'),
-      name: z.string().optional().describe('脚本展示名：**每次提交必须传**一个贴切的中文业务名（如「空调运行关门预警」），可随功能演进更新；**严禁用唯一 id（如 s3acdoor）充当名字**。'),
+      name: z.string().optional().describe('脚本展示名：新建脚本必须传一个贴切的中文业务名（如「空调运行关门预警」）；已有脚本迭代时可省略（自动继承上一版），但建议随功能演进更新保持贴切。**严禁用唯一 id（如 s3acdoor）充当名字**——不传且无上一版时服务端会回退成 id 当名字。'),
       script: z.string().describe('JavaScript 源码，只能用 ctx 白名单 API'),
       flow: z.object({
         version: z.number().optional(),
@@ -304,7 +278,7 @@ function buildTools(server, ctx) {
     { scriptId: z.string(), version: z.number().int().positive().optional(), confirmed: z.literal(true) },
     async ({ scriptId, version }) => {
       const ok = executor.stop(scriptId, 'manual', version);
-      ctx.hub.broadcast({ type: 'refresh', what: 'scripts' });
+      executor.broadcastRefresh(['scripts']);
       return ok
         ? text(JSON.stringify({ ok: true, scriptId, stoppedVersion: version ?? 'all', runningVersions: executor.runningVersions(scriptId) }))
         : fail('脚本未在运行：' + scriptId);
@@ -436,7 +410,7 @@ function buildTools(server, ctx) {
     }
   );
 
-  /* ---------------- 影子双模式验证：仿真控制（SIMULATION-DESIGN §8）----------------
+  /* ---------------- 影子双模式验证：仿真控制----------------
    * 不新增"仿真通道"：影子通道固定，验证方式 follow/simulate 二选一。
    * 标准流程（skill SKILL.md 第5步）：5.1 simulate 验流程 → 5.2 切回 follow（固定收尾，
    * sim_close 不算收尾）→ 5.3 follow 真跑验收，两段都过才允许 publish。
@@ -615,7 +589,7 @@ function buildTools(server, ctx) {
 
   server.tool(
     'automation_sim_run_fixture',
-    '重放已导出的用例：重建世界 → 跑 fixture 的 steps → 追加一条 since:0 写意图全序列断言（用例自带 assert 也不跳过，两者各验各的）；versionDrift=true 说明脚本版号或源码 sha 已变，断言失败先怀疑版本漂移。不传 name 只列已有用例。需 confirmed:true。',
+    '重放已导出的用例：重建世界 → 跑 fixture 的 steps → 默认追加一条 since:0 写意图全序列断言（与用例自带 assert 并存、各验各的；仅当 expected.writes 为空且用例自带 assert 时不追加）。versionDrift=true 说明脚本版号或源码 sha 已变，断言失败先怀疑版本漂移。不传 name 只列已有用例。需 confirmed:true。',
     {
       scriptId: z.string(),
       name: z.string().optional().describe('用例名；缺省则只列出该脚本已有的用例'),

@@ -79,7 +79,7 @@ function prune(dir, keep) {
     health = await request('/api/health');
   } catch (e) {
     console.error(`[cache] 服务不可达 ${BASE}：${e.message}`);
-    console.error('[cache] 先启动服务：(cd D:/Workbuddy/home/ha3d-automation && npm start)');
+    console.error('[cache] 先启动服务：在项目根目录执行 npm start');
     process.exit(1);
   }
 

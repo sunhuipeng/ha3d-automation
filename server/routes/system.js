@@ -3,14 +3,18 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { connector, store, executor } = require('../lib/runtime');
-const { publicConfig, saveConfig, getConfig } = require('../config');
+const { connector, executor } = require('../lib/runtime');
+const { publicConfig, saveConfig, getConfig, ENV_OVERRIDES } = require('../config');
+const { systemSnapshot } = require('../lib/system-info');
 
 module.exports = function systemRoutes() {
   const r = express.Router();
 
   r.get('/health', (req, res) => {
-    res.json({ ok: true, ts: Date.now(), ha: connector.status, demo: connector.demo, devMode: getConfig().devMode === true, scripts: store.list().length, running: executor.runningList().length });
+    /* 字段拼装与 MCP automation_get_system_info 共用 systemSnapshot（审计 2.2）；
+     * ha 是历史字段名，前端与探针都在消费，保持不变。 */
+    const s = systemSnapshot({ connector, executor });
+    res.json({ ok: true, ts: s.ts, ha: s.haStatus, demo: s.demo, devMode: s.devMode, scripts: s.scripts, running: s.running });
   });
 
   /* HA 连接配置：token 只回传是否已配置，不回传明文 */
@@ -18,9 +22,19 @@ module.exports = function systemRoutes() {
 
   r.put('/config', (req, res) => {
     try {
+      /* 重连范围显式化（审计 3.4）：只有 HA 连接字段（haUrl/token）真正变化才 restart。
+       * 之前无条件 restart——改 runnerTimeoutMs 等运行参数也会触发重连 → 脚本挂起/恢复的隐式链路。 */
+      const before = getConfig();
       const cfg = saveConfig(req.body || {});
-      connector.restart();
-      res.json({ ok: true, config: cfg });
+      const after = getConfig();
+      const haChanged = before.haUrl !== after.haUrl || before.token !== after.token;
+      if (haChanged) connector.restart();
+      /* 审计 4.5：env 同名变量优先于 config.json——用户保存被 env 覆盖的字段时不生效，
+       * 显式回传 overridden 列表让前端提示，而不是 200 回显旧值让用户以为保存成功。 */
+      const overridden = Object.keys(req.body || {})
+        .filter((k) => ENV_OVERRIDES[k] && process.env[ENV_OVERRIDES[k]] != null && process.env[ENV_OVERRIDES[k]] !== '')
+        .map((k) => ({ key: k, env: ENV_OVERRIDES[k] }));
+      res.json({ ok: true, config: cfg, haRestarted: haChanged, overridden });
     } catch (e) {
       res.status(400).json({ error: e.message });
     }

@@ -87,9 +87,9 @@ class HaConnector {
 
   _startDemo() {
     this.demo = true;
-    this.ready = true;
-    this._setStatus('demo');
-    this.onReady();
+    /* 审计 4.1：必须先填充实体/服务，再置 ready 并通知 onReady——
+     * onHaReady 会用 entityStatus 复核运行脚本依赖，空表会把所有实体判 missing，
+     * 导致刚恢复/启动的脚本被整体误暂停（只有 10s 后 sensor.temperature 变化能救回一个）。 */
     const demo = [
       ['light.living', 'on', { friendly_name: '客厅灯', brightness: 180 }],
       ['light.bedroom', 'off', { friendly_name: '卧室灯' }],
@@ -103,6 +103,9 @@ class HaConnector {
       this.entities.set(eid, { entity_id: eid, state, attributes, demo: true });
     }
     this.services = { light: { turn_on: {}, turn_off: {}, toggle: {} }, switch: { turn_on: {}, turn_off: {} }, cover: { open_cover: {}, close_cover: {}, stop_cover: {} } };
+    this.ready = true;
+    this._setStatus('demo');
+    this.onReady();
     this.demoTimer = setInterval(() => {
       const e = this.entities.get('sensor.temperature');
       if (!e) return;
@@ -244,24 +247,30 @@ class HaConnector {
     }
   }
 
-  /* 老版本 HA 回退通道：get_states 全量 + subscribe_events 增量（与 subscribe_entities 绝不并发） */
+  /* 老版本 HA 回退通道：先订增量并等订阅确认，再拉全量快照（审计 4.7）。
+   * 之前两者并发：订阅确认前的增量先写缓存，随后到达的全量会整体覆盖，
+   * 把增量刚更新的实体抹回旧值；串行化后全量是最后落地的完整一致快照。 */
   _fallbackSnapshot(ws, isCurrent) {
-    this.send({ type: 'get_states' }).then((states) => {
-      if (!isCurrent()) return;
-      if (Array.isArray(states)) for (const s of states) this.entities.set(s.entity_id, s);
-      this.ready = true;
-      this.onReady();
-    }).catch(() => {
-      /* 全量拉取失败视为连接不可用：先关旧 socket 再重连，避免孤儿连接占用 */
-      if (!isCurrent()) return;
-      if (this.ws === ws) { try { ws.close(); } catch (e) {} }
-      this._scheduleReconnect();
-    });
-    this.send({ type: 'subscribe_events', event_type: 'state_changed' }).catch(() => {
-      /* 订阅失败静默吞掉会导致回退通道缓存永久陈旧，必须留痕并重连 */
-      console.error('[ha] subscribe_events 订阅失败，回退增量通道不可用，重连');
-      if (isCurrent()) this._scheduleReconnect();
-    });
+    this.send({ type: 'subscribe_events', event_type: 'state_changed' })
+      .then(() => {
+        if (!isCurrent()) throw new Error('stale-connection');
+        return this.send({ type: 'get_states' });
+      })
+      .then((states) => {
+        if (!isCurrent()) return;
+        if (Array.isArray(states)) for (const s of states) this.entities.set(s.entity_id, s);
+        this.ready = true;
+        this.onReady();
+      })
+      .catch((e) => {
+        if (!isCurrent()) return;
+        if (e && e.message === 'stale-connection') return;
+        /* 拉取/订阅失败视为连接不可用：先关旧 socket 再重连，避免孤儿连接占用。
+         * subscribe_events 订阅失败静默吞掉会导致回退通道缓存永久陈旧，必须留痕。 */
+        console.error('[ha] 回退通道建立失败（get_states/subscribe_events）：', e && e.message || e, '，重连');
+        if (this.ws === ws) { try { ws.close(); } catch (err) {} }
+        this._scheduleReconnect();
+      });
   }
 
   /* 全量快照的精简格式归一：{s, a, lc, lu} → 完整 state object（借鉴 ha-3d-home 的 norm）。

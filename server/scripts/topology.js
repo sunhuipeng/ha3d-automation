@@ -22,7 +22,7 @@ function emptyGroup(sid, mode, version) {
     contextReads: [], // 读取/订阅的上下文（scope.key）
     contexts: [],     // 写入的上下文（scope.key）
     calls: [],        // ctx.call 调用过的其他脚本 id（脚本间控制流）
-    taskDeps: [],     // task.status/require/watch 查询/等待/订阅过的脚本 id（脚本间状态依赖）
+    taskDeps: [],     // task.status/require 查询/等待过的脚本 id（脚本间状态依赖）
     firstSeen: new Date().toISOString(),
     lastSeen: new Date().toISOString(),
   };
@@ -96,7 +96,7 @@ function observeCall(sid, mode, version, targetSid) {
   if (g) pushUnique(g.calls, t);
 }
 
-/* 记录一次脚本间状态依赖（task.status / task.require / task.watch）。方向口径：观察者侧观测，记目标脚本 id */
+/* 记录一次脚本间状态依赖（task.status / task.require）。方向口径：观察者侧观测，记目标脚本 id */
 function observeTaskDep(sid, mode, version, targetSid) {
   const t = String(targetSid || '');
   if (!t || t === String(sid || '')) return;

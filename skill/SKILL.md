@@ -6,9 +6,9 @@ agent_created: true
 
 # ha3d-automation 脚本开发流程
 
-本 skill 指导 AI 在 ha3d-automation 平台（`http://localhost:8100`，项目目录 `D:\Workbuddy\home\ha3d-automation`）上开发新的自动化脚本，从需求到正式上线一条路走通。
+本 skill 指导 AI 在 ha3d-automation 平台（`http://localhost:8100`）上开发新的自动化脚本，从需求到正式上线一条路走通。
 
-**资料分工**：本文件是流程与硬规则的唯一现行版本；ctx 接口完整参考见 `references/ctx-api.md`；版本文件（script.js / flow.json / meta.json）规范见 `references/file-specs.md`；MCP 工具完整清单见 `references/mcp-tools.md`；**仿真（simulate）的完整用法、断言 DSL、踩坑清单见 `references/simulation.md`**；脚本骨架模板见 `templates/script-template.js`；**可复用脚本与仿真用例库存放在 `.scripts/` 与 `.fixtures/`（见下节）**；**读源码才澄清的接口语义沉淀在 `.notes/`（见下节）**。规范细节以 references 为准，本文件冲突时以 references 为准。
+**资料分工**：本文件是流程与硬规则的唯一现行版本；ctx 接口完整参考见 `references/ctx-api.md`；版本文件（script.js / flow.json / meta.json）规范见 `references/file-specs.md`；MCP 工具完整清单见 `references/mcp-tools.md`；**仿真（simulate）的完整用法、断言 DSL、踩坑清单见 `references/simulation.md`**；脚本骨架模板见 `templates/script-template.js`；**可复用脚本与仿真用例库存放在 `.scripts/` 与 `.fixtures/`（见下节）**。规范细节以 references 为准，本文件冲突时以 references 为准。
 
 **参考文档的权威顺序（用户通过链接下载技能、且已部署正式服务时）**：
 
@@ -25,7 +25,7 @@ agent_created: true
    - 该工具同时返回 `devMode`：`devMode=true` 表示所有 HA 写只记日志、不下发到真实设备（调试态），判读脚本行为与日志时必须带上这个前提；还返回 `haStatus`/`demo`/`executionMode`/实例数等运行态快照。
    - **源码只用来解释行为与澄清语义，严禁据此直接改线上**：服务端代码不由助手改，改动须走 bug 反馈 → 用户修 → 用户发布；
 3. **注意版本漂移**：线上部署的服务可能比 skill 文档旧或新——发现文档与线上 MCP 实际行为不一致时，先以**线上工具实际返回**为准（`automation_get_system_info` / health / list / 快照），再用**同版本**源码解释差异并告知用户；不要把源码里"有"而线上"没有"的能力当成已可用；
-4. **澄清后必须沉淀**（用户要求）：凡因接口表述不清 / 有歧义而读了源码才弄清的语义，明确后**修正 references 对应文件**（权威口径唯一落点，语义不另存 `.notes`——那类内容会随框架演进漂移）。若这次澄清伴随一次方案拍板/全链路改造，把**决策历史**（为什么这么定、用户拍板口径、改动面、发布顺序约束）追加到 `skill/.notes/decisions.md`（只追加不改写，见该目录 README）。
+4. **澄清后必须沉淀**（用户要求）：凡因接口表述不清 / 有歧义而读了源码才弄清的语义，明确后**修正 references 对应文件**（权威口径唯一落点，语义不另存旁路文件——那类内容会随框架演进漂移）。若这次澄清伴随一次方案拍板/全链路改造，把**设计动机**（为什么这么定、用户拍板口径、改动面、发布顺序约束）一并写进该 references 章节，保证口径可追溯。
 
 ---
 
@@ -66,40 +66,35 @@ node skill/tools/sync-cache.cjs --force   # 忽略缓存全量重拉
 
 ---
 
-## 可复用资产（skill/.cache / .fixtures / .scripts / .work / .notes）— 下次别从零写
+## 可复用资产（skill/.cache / .fixtures / .scripts / .work）— 下次别从零写
 
-skill 下有**五个隐藏目录**（均不进 Git；`scripts/pack-skill.cjs` 的 `SKIP_NAMES` 把它们排除在 `skill.zip` 外，要带走请手动 `cp -r`）。分工一句话：**`.cache` 缓存线上所有脚本文件，`.notes` 只存不会漂移的决策历史，另外三个只存 AI Agent 执行任务期间可复用的文件**：
+skill 下有**四个隐藏目录**（均不进 Git；`scripts/pack-skill.cjs` 的 `SKIP_NAMES` 把它们排除在 `skill.zip` 外，要带走请手动 `cp -r`）。分工一句话：**`.cache` 缓存线上所有脚本文件，另外三个只存 AI Agent 执行任务期间可复用/沉淀的文件**：
 
 | 目录 | 定位 | 性质 |
 |---|---|---|
 | `skill/.cache/` | 线上脚本只读镜像（`sync-cache.cjs` 维护）+ MDI 图标清单等工具缓存 | 运行时缓存，**可随时删掉重建**，绝不手改 |
 | `skill/.fixtures/` | 可复用仿真用例：`case.cjs` 与服务端 `sim_export` / `sim_run_fixture` 读写同一份 | 可复用资产，只增不删 |
-| `skill/.scripts/` | 可复用**脚本实现库**：已验证的实现沉淀为 `lib/<name>/`（script.js + 可选 flow.json + note.md） | 可复用资产，收录门槛=验证通过+真被复用 |
+| `skill/.scripts/` | 可复用**脚本实现库**：已验证的实现沉淀为 `<name>/`（script.js + 可选 flow.json + note.md） | 可复用资产，收录门槛=验证通过+真被复用 |
 | `skill/.work/` | AI 任务**工作区**：工作副本 `drafts/<scriptId>/`、诊断复现 `repro/`、临时 JSON `data/` | 任务期间产物，可复用才留，无价值直接删 |
-| `skill/.notes/` | **决策日志**：只记不会漂移的历史——方案取舍、用户拍板口径、改动面与发布顺序约束；**只追加、不改写**。接口语义一律不进这里（会随框架演进漂移），唯一权威是 `references/` | 长期知识资产，永不漂移 |
 
 ```
-skill/.scripts/lib/<name>/     # 已验证实现：script.js + 可选 flow.json + note.md
+skill/.scripts/<name>/         # 已验证实现：script.js + 可选 flow.json + note.md
 skill/.work/
 ├─ drafts/<scriptId>/          # 提交影子/正式前的暂存源码，提交成功后仅作存档
 ├─ repro/                      # 诊断/复现脚本；旧框架历史档案在文件头标注「不可跑」
 └─ data/                       # 一次性 JSON / 中间产物
-skill/.notes/
-└─ decisions.md                 # 决策日志：方案取舍 / 用户拍板 / 改动面（只追加不改写）
 ```
 
 | 目录 | 怎么用 |
 |---|---|
 | `.cache/<id>/v<n>/` | 读脚本、看流程、冲突分析一律先读这里（快、可 grep）；权威运行态再查 API |
 | `.fixtures/<scriptId>/<用例>.json` | `case.cjs run` 一键回归；`case.cjs push --run-fixture` 服务端重放 |
-| `.scripts/lib/<name>/` | `cp -r` 出去改实体与参数再提交；**不要直接改库里的文件当交付物** |
+| `.scripts/<name>/` | `cp -r` 出去改实体与参数再提交；**不要直接改库里的文件当交付物** |
 | `.work/drafts/<scriptId>/` | 改完提交走 MCP；副本仅存档 |
-| `.notes/decisions.md` | 想知道某个能力「为什么这么设计 / 当时怎么拍的板」时读；现行语义仍以 `references/` 为准 |
 
 **开工前先看这三处**（比翻 `.cache` 里十几个业务脚本快得多）：
 
 ```bash
-cat skill/.notes/README.md              # 索引：框架演进至今有哪些关键决策
 cat skill/.scripts/README.md            # 索引：有哪些可复用实现
 node skill/tools/case.cjs list          # 索引：目标脚本已有哪些用例
 grep -rl "ctx.hold" skill/.scripts skill/.work   # 按判据形态找实现
@@ -107,10 +102,10 @@ grep -rl "ctx.hold" skill/.scripts skill/.work   # 按判据形态找实现
 
 **做完要沉淀**（否则库会空转）：
 
-- 写出跑通的判据/结构 → 复制进 `.scripts/lib/<name>/`、补 `note.md`、更新 `.scripts/README.md` 索引表；
+- 写出跑通的判据/结构 → 复制进 `.scripts/<name>/`、补 `note.md`、更新 `.scripts/README.md` 索引表；
 - 仿真跑通一个场景 → `node skill/tools/case.cjs save <scriptId> <用例名>` 归档进 `.fixtures`，补 `note`、更新 `.fixtures/README.md` 索引表；
-- 因接口歧义读了源码才弄清 → **修正 references 对应文件**（唯一落点；语义不写 `.notes`）；若伴随方案拍板或全链路改造，把决策历史追加进 `.notes/decisions.md`；
-- 收录门槛：**验证通过 + 真被复用至少一次**；半成品、一次性产物留在 `.work/`，不进 lib。
+- 因接口歧义读了源码才弄清 → **修正 references 对应文件**（唯一落点）；若伴随方案拍板，把设计动机一并写进对应 references 章节；
+- 收录门槛：**验证通过 + 真被复用至少一次**；半成品、一次性产物留在 `.work/`，不进库。
 
 用例命令速查：
 
@@ -435,7 +430,7 @@ node skill/tools/submit.cjs <scriptId> "<脚本名>" <脚本源文件路径> <fl
 - **影子是工作副本，可反复修改**：已有影子时重新提交 = **原地覆盖**（版本号不变、revision+1），不会新增版本号；只有想另起候选版（如分支试验）才加 `--new-version`；
 - **宿主覆盖（可选）**：个别脚本需要单独指定执行宿主时加 `--host-mode=fork|inprocess|worker`（等价 MCP 参数 `hostMode`）。典型场景：全局 `inprocess` 下把高频计算的重脚本覆盖为 `fork` 独享子进程。跟随版本持久化、后续迭代自动继承；不传则按默认策略选宿主（2026-11-26 热池改造：正式一次性动作/场景自动走热池会话，常驻自动化跟随全局 `EXECUTION_MODE`）。影子恒为专属 worker（每次新建、用完即毁），此参数只影响发布后的正式实例；
 - **业务种类（`--kind=automation|script|scene`）**：业务种类同时决定运行模型——`automation`=常驻自动化（默认，常驻运行、由 start 管理、无一次性看门狗）；`script`/`scene`=一次性动作（跑完即退、有看门狗、供 Home 面板或自动化脚本按次触发）。与宿主模式同策略：不传则继承上一版，全新脚本默认 `automation`。等价 MCP 参数 `kind`。一次性脚本正文直接顺序执行动作、自然结束，**不要写 `ctx.keepAlive()`**；
-- **图标（`--icon <icon.svg>`）**：**新脚本首次提交必须提供**（后续迭代不传则自动继承上一版）。**统一使用 MDI 图标库（https://pictogrammers.com/library/mdi/），不手绘**——Home 平台前端已接入 MDI，两边用同一套图标天然一致。用 `skill/tools/mdi-icon.cjs` 完成选名/验证/取图：`search <关键词>` 按词搜名（7447 个图标）→ `check <名称>…` 验证存在（**提交前必做**，猜错的 slug 如 `lightning` 会 MISS，正确名是 `flash`）→ `get <名称> > icons/<scriptId>.svg` 取图并自动补 `fill="currentColor"`（必做适配，否则暗色主题不可见）→ `--icon` 传入（MCP 等价参数 `icon`，值是 SVG 源码字符串）。细则见 `references/file-specs.md` §icon；服务端做安全校验（拒绝 script/事件属性/外链引用）；
+- **图标（`--icon <icon.svg>`）**：**新脚本首次提交必须提供**（后续迭代不传则自动继承上一版）。**统一使用 MDI 图标库（https://pictogrammers.com/library/mdi/），不手绘**——Home 平台前端已接入 MDI，两边用同一套图标天然一致。用 `skill/tools/mdi-icon.cjs` 完成选名/验证/取图：`search <关键词>` 按词搜名（全量清单来自 jsdelivr，按版本缓存于 `.cache`，数量随 MDI 版本变化，勿硬记）→ `check <名称>…` 验证存在（**提交前必做**，猜错的 slug 如 `lightning` 会 MISS，正确名是 `flash`）→ `get <名称> > icons/<scriptId>.svg` 取图并自动补 `fill="currentColor"`（必做适配，否则暗色主题不可见）→ `--icon` 传入（MCP 等价参数 `icon`，值是 SVG 源码字符串）。细则见 `references/file-specs.md` §icon；服务端做安全校验（拒绝 script/事件属性/外链引用）；
 - 改的是**正在运行**的影子会先被服务端自动停止，需重新 start 才生效；
 - flow 文件是**必填**：只做链路联通测试时可显式加 `--placeholder`（写入通用三节点模板，正式交付前必须换真图）；
 - 提交成功后立即 `node skill/tools/sync-cache.cjs --force`，让缓存对齐新内容（影子内容会变，缓存靠 sha256 比对，不要只看版本号）。
@@ -619,7 +614,7 @@ node skill/tools/sync-cache.cjs --force
 - Bash 会话 cwd 固定在 `D:\Workbuddy\home`，`cd` 前缀可能被剥离，用子 shell `(cd ha3d-automation && <cmd>)` 最稳。
 - 测试跑法：`(cd ha3d-automation && npm test)`（node:test，测试位于顶层 `tests/`）。
 - 改动服务端代码（runner/executor/store）不在本 skill 范围；只做脚本开发时**不要重启服务**（会按运行意图清单恢复，但正在验证的影子实例会重跑）。
-- 可复用资产与任务工作区收纳在五个隐藏目录：`skill/.cache/`（线上脚本缓存）、`skill/.scripts/`（已验证实现库 lib/）、`skill/.work/`（任务工作区 drafts/repro/data）、`skill/.fixtures/`（仿真用例）、`skill/.notes/`（决策日志，只记不漂移的历史）——**用例目录同时是服务端 `sim_export` / `sim_run_fixture` 的读写目录**，不再有 `data/fixtures`；五目录均已 `.gitignore`，`pack:skill` 也跳过；`.fixtures` **只增不删**，删之前先确认没有脚本在用例里引用；`.notes` **只追加不改写**，语义修正只改 `references/`。
+- 可复用资产与任务工作区收纳在四个隐藏目录：`skill/.cache/`（线上脚本缓存）、`skill/.scripts/`（已验证实现库）、`skill/.work/`（任务工作区 drafts/repro/data）、`skill/.fixtures/`（仿真用例）——**用例目录同时是服务端 `sim_export` / `sim_run_fixture` 的读写目录**，不再有 `data/fixtures`；四目录均已 `.gitignore`，`pack:skill` 也跳过；`.fixtures` **只增不删**，删之前先确认没有脚本在用例里引用。
 - 崩溃现场 `data/runtime/<id>/v<n>.sim.crash.json`（只读）是运行数据：别清理、别手改成"通过"。
 - **仿真是临时状态**：影子实例的常态是 `follow`。`simulate` 只在 5.1 存在，跑完必须 `case.cjs finish` 切回 follow 并保持运行；服务重启后仿真实例也会恢复成 follow（虚拟世界不持久化，别指望"留着会话"复现，复现靠 `.fixtures` 用例）。
 - `skill/.cache/` 是运行时缓存，已加入 `.gitignore`，不要提交。

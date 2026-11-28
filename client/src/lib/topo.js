@@ -94,7 +94,6 @@ export function settleSync(simNodes, configure, posCache) {
   const sim = configure(forceSimulation(simNodes)).stop();
   sim.tick(SETTLE_TICKS);
   for (const n of simNodes) posCache.set(n.id, { x: n.x, y: n.y });
-  return sim;
 }
 
 /* d3 坐标 → Vue Flow 展示节点（含节点盒尺寸偏移）。opts.nodeType 为模板插槽名，

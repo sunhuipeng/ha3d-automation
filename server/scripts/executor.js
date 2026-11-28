@@ -1,6 +1,6 @@
 'use strict';
 /* 执行器：按 EXECUTION_MODE 三选一宿主（fork 子进程 / inprocess 单进程 / worker 线程），
- * 影子实例强制 fork（未验证代码独享子进程硬隔离，见 start 内注释）。
+ * 影子实例强制专属 worker（未验证代码独享线程硬隔离，见 start 内宿主选择注释）。
  * 管理生命周期 / 全局锁 / 看门狗 / 日志。
  * 同一脚本最多 1 正式 + 1 影子实例并行（同槽位互斥）；callService 经 actionLock
  * 做互斥 + 冷却，冲突拒绝不覆盖。 */
@@ -13,6 +13,7 @@ const hub = require('../lib/ws-hub');
 const { getConfig, DEV_MODE } = require('../config');
 const { shadowHa, devHa } = require('./log-text');
 const topology = require('./topology');
+const { createSimControl } = require('./sim-control');
 
 const RUNNER = path.join(__dirname, 'runner.js');
 const { createInlineChild } = require('./inline-runner');
@@ -25,8 +26,6 @@ const hotPool = require('./hot-pool');
 const { instKey, parseKey } = require('./inst-key');
 const running = new Map();      // instKey -> { child, key, sid, version, dryRun, verifyMode, startedAt, restarts }
 /* 仿真控制请求回执：requestId -> { resolve, reject, timer }。会话以 scriptId 为键（影子槽位唯一）。 */
-const simPending = new Map();
-let simSeq = 0;
 const actionLocks = new Map();  // "domain.service.entityId" -> { at, inflight }
 const subscriptions = new Map(); // entityId -> Set<child>
 /* ctx.global.watch：namespace -> key -> Set<entry>。读侧统一正式命名空间（不隔离），
@@ -151,7 +150,7 @@ function pauseScriptsForMissingEntity(eid) {
     emitLog(entry, 'warn', `[兜底] 依赖实体 ${key} 被删除，脚本已暂停（实体恢复后自动继续）`);
     try { entry.child.send({ type: 'suspend', reason: 'entity-missing', entityId: key }); } catch (e) {}
     broadcastScript(entry.sid, entry.version, 'status', { status: 'paused', reason: 'entity-missing' });
-    notifyCtxWriterObservers(entry.sid, 'entity-missing', entry);
+    notifyCtxWriterState(entry.sid, 'entity-missing', entry);
   }
 }
 
@@ -168,7 +167,7 @@ function resumeScriptsForEntity(eid) {
     emitLog(entry, 'info', `[兜底] 依赖实体 ${key} 已恢复，脚本自动继续`);
     try { entry.child.send({ type: 'resume' }); } catch (e) {}
     broadcastScript(entry.sid, entry.version, 'status', { status: 'running', reason: 'entity-restored' });
-    notifyCtxWriterObservers(entry.sid, 'entity-restored', entry);
+    notifyCtxWriterState(entry.sid, 'entity-restored', entry);
   }
 }
 
@@ -299,6 +298,19 @@ function runningList() {
   }));
 }
 
+/* 详情接口用的状态聚合（REST /api/script/:id 与 MCP get_script_status 共用，此前两处各自
+ * 并行调 5 个函数拼同一组字段，改口径要同步两处）。status=版本级（当前版本徽章）；
+ * scriptStatus=脚本级（列表徽章口径）——两者口径不同，前端回填列表必须用 scriptStatus。 */
+function statusSummary(sid, version) {
+  return {
+    status: versionRuntimeStatus(sid, version),
+    scriptStatus: scriptRuntimeStatus(sid),
+    running: isRunning(sid),
+    runningVersion: runningVersion(sid),
+    runningVersions: runningVersions(sid),
+  };
+}
+
 /* ---------- ctx.task（status / require / watch）：依赖脚本状态裁决 ----------
  * 只读接口一律看依赖的**正式实例**，与调用者影子/正式无关：状态查询、等待、监听
  * 都不产生设备副作用，没必要做通道隔离。写隔离仍由 ctx.write / ctx.global.set 负责。
@@ -324,18 +336,13 @@ function taskStateFor(sid, reason) {
   const info = { scriptId: sid, version: pick.version, mode: 'production', reason: reason || '' };
   return { scriptId: sid, version: pick.version, mode: 'production', state, info };
 }
-/* 实例状态变化 → 写者状态折叠派发（ctx.global.watch 消费者的唯一状态通知通道；
- * ctx.task.watch 已删除，订阅类状态通知全部走这里）。只读流统一看正式实例：
- * 影子实例的状态变化不通知任何人（与原 task.watch / writerState 同一口径）。 */
-function notifyCtxWriterObservers(sid, reason, changedEntry) {
-  if (changedEntry && changedEntry.dryRun) return;
-  notifyCtxWriterState(sid, reason);
-}
-
 /* ctx.global.watch 的写者状态折叠：写者实例状态变化时，对它写过的每个 global key 的
  * 订阅者派发 contextWriterState（value = prev = 当前存量值，旧消费者当作"值没变的通知"
- * 消化，天然兼容）。防抖在 runner 侧做（虚拟时钟），宿主只如实转发状态事实。 */
-function notifyCtxWriterState(sid, reason) {
+ * 消化，天然兼容）。防抖在 runner 侧做（虚拟时钟），宿主只如实转发状态事实。
+ * changedEntry 为影子实例（dryRun）时直接忽略：只读流统一看正式实例，影子状态变化
+ * 不通知任何人（与原 task.watch / writerState 同一口径）。 */
+function notifyCtxWriterState(sid, reason, changedEntry) {
+  if (changedEntry && changedEntry.dryRun) return;
   if (!store.safeId(sid)) return;
   const keysMap = ctxWatchers.get('production');
   if (!keysMap) return;
@@ -367,7 +374,7 @@ function settleStatus(sid, version, { status, error, reason, entry }) {
   if (status === 'error') noteError(sid, version, error);
   else clearError(sid, version);
   broadcastScript(sid, version, 'status', { status });
-  notifyCtxWriterObservers(sid, reason, entry);
+  notifyCtxWriterState(sid, reason, entry);
 }
 
 function broadcastScript(id, version, event, extra) {
@@ -384,7 +391,7 @@ function broadcastScript(id, version, event, extra) {
     } : {}), ...(extra || {}) });
   /* 状态变化必须同步左侧列表：前端只对"当前打开的脚本"消费 status 事件，
    * 其余脚本若不重拉列表，徽标会残留旧状态（如已停仍显示运行中） */
-  if (event === 'status') hub.broadcast({ type: 'refresh', what: 'scripts' });
+  if (event === 'status') broadcastRefresh(['scripts']);
 }
 
 /* 执行方式：EXECUTION_MODE / config.json 的 executionMode，三选一（模块级：start 选宿主、
@@ -394,9 +401,9 @@ function broadcastScript(id, version, event, extra) {
  *   worker        = 每脚本一个 worker 线程，OS 抢占式公平调度 + terminate 强杀，内存居中。
  * 三种模式的 child 句柄同形状（send/on/kill/stdout/exit），上层生命周期逻辑完全复用。
  *
- * 影子强制 fork：影子是未验证代码（反复试错，死循环/崩溃/泄漏概率高），inprocess/worker
- * 模式下也独享子进程硬隔离——失控只影响自己，看门狗可杀可重启；主进程/worker 池里
- * 只剩已验证的正式脚本。dryRun=false 时才按 EXECUTION_MODE 选。 */
+ * 影子强制专属 worker（2026-11-26 热池改造）：影子是未验证代码（反复试错，死循环/崩溃/
+ * 泄漏概率高），任何全局模式下都独享一个全新 worker 线程——失控只影响自己，看门狗可杀可
+ * 重启；热池里只剩已验证的正式脚本。dryRun=false 时才按 EXECUTION_MODE 选宿主。 */
 const EXECUTION_MODES = store.EXECUTION_HOST_MODES;
 const executionMode = EXECUTION_MODES.includes(getConfig().executionMode) ? getConfig().executionMode : 'fork';
 
@@ -525,9 +532,11 @@ function start(id, version, connector, restarts = 0, callInfo = null, opts = {})
   if (entry.callerSid) emitLog(entry, 'info', `[联动] 由脚本 ${entry.callerSid} 调用启动（第 ${entry.callDepth} 层）`);
   if (DEV_MODE && !dryRun) emitLog(entry, 'warn', '开发模式：正式实例已启动（身份/上下文均为正式），设备写操作只记日志不下发');
   /* 运行意图持久化：start 全部成功后才落盘，确保重启能按此版本恢复。 */
-  runState.mark(sid, rec.version, entry.startedAt);
+  /* 审计 4.11：simulate 实例不持久化运行意图——虚拟世界不持久化（§2.4），重启后按
+   * follow 恢复会让"仿真"悄悄变成影子真跑；onExit 对 simulate 不自动重启也是同一意图。 */
+  if (entry.verifyMode !== 'simulate') runState.mark(sid, rec.version, entry.startedAt);
   broadcastScript(sid, rec.version, 'status', { status: 'running' });
-  notifyCtxWriterObservers(sid, 'started', entry);
+  notifyCtxWriterState(sid, 'started', entry);
   return entry;
 }
 
@@ -540,11 +549,7 @@ function emitLog(entry, level, message, nodeId) {
 
 function handleChildMessage(entry, msg, connector) {
   if (msg.type === 'simReply') {
-    const p = simPending.get(msg.id);
-    if (!p) return;
-    simPending.delete(msg.id);
-    clearTimeout(p.timer);
-    if (msg.ok) p.resolve(msg.result); else p.reject(new Error(msg.error || '仿真请求失败'));
+    simControl.resolveSimReply(msg); // 回执表归 sim-control 私有（审计 3.1），这里只转交
     return;
   }
   if (msg.type === 'log') {
@@ -555,9 +560,11 @@ function handleChildMessage(entry, msg, connector) {
   }
   if (msg.type === 'simWrite') {
     /* 防御分支：worker 已在本地消费 simWrite（会话记写意图），正常不会到这里。
-     * 万一别的宿主转发上来，也只能广播，绝不写版本日志（§9 不落盘）。 */
+     * 万一别的宿主转发上来，也只能广播，绝不写版本日志（§9 不落盘）。
+     * 带 at（缺省 0）：本分支 sim:true，前端按虚拟时刻渲染，与脚本日志 +X.Xs 口径一致（审计 4.12）。 */
     hub.broadcast({ type: 'script', event: 'log', ts: Date.now(), scriptId: entry.sid, version: entry.version,
-      level: 'warn', message: `[仿真·写意图上报] ${msg.desc || msg.op || ''}（${msg.kind}）`, nodeId: msg.nodeId || undefined, sim: true });
+      level: 'warn', message: `[仿真·写意图上报] ${msg.desc || msg.op || ''}（${msg.kind}）`, nodeId: msg.nodeId || undefined,
+      at: typeof msg.at === 'number' ? msg.at : 0, sim: true });
     return;
   }
   if (msg.type === 'subscribe') {
@@ -795,7 +802,7 @@ function stopInstance(entry, reason) {
   clearRefs(entry.key);
   clearTimeout(entry.watchdog);
   detachChild(entry);
-  notifyCtxWriterObservers(entry.sid, reason === 'timeout' ? 'timeout' : 'stopped', entry);
+  notifyCtxWriterState(entry.sid, reason === 'timeout' ? 'timeout' : 'stopped', entry);
   try { entry.child.send({ type: 'stop' }); } catch (e) {}
   setTimeout(() => {
     try { entry.child.kill(); } catch (e) {}
@@ -989,7 +996,7 @@ function removeVersion(id, version) {
   /* 异常标记同步清理：lastErrors 按 sid#v 键控，版本删了标记还留着会让
    * scriptRuntimeStatus 永远报"异常"，且 Map 只增不减（审计 P1-#5） */
   lastErrors.delete(instKey(sid, version));
-  hub.broadcast({ type: 'refresh', what: 'scripts' });
+  broadcastRefresh(['scripts']);
   return result;
 }
 
@@ -1011,7 +1018,7 @@ function removeScript(id) {
   const result = store.removeScript(sid);
   /* 脚本删除后观测数据立即失效，避免全局图残留已删除脚本的子图 */
   topology.clear(sid);
-  hub.broadcast({ type: 'refresh', what: 'scripts' });
+  broadcastRefresh(['scripts']);
   return result;
 }
 
@@ -1181,256 +1188,23 @@ function trigger(id, connector, channel) {
   return { id: sid, version, mode: ch, devMode: DEV_MODE };
 }
 
-/* ================= 影子双模式验证：simulate 控制面（SIMULATION-DESIGN §2/§8）=================
- * 会话以 scriptId 为键（影子槽位唯一）。所有控制请求经 worker 的 simReply 回执，
- * 请求超时用真实定时器（10s）——仿真的 request 在 worker 内微任务应答，不占用这条链路。 */
-const SIM_REPLY_TIMEOUT_MS = 10000;
-const SWITCH_EXIT_TIMEOUT_MS = 2000;
-
-function currentShadowEntry(sid) {
-  return instancesOf(sid).find((e) => e.dryRun) || null;
-}
-
-function findSimEntry(sid) {
-  const e = currentShadowEntry(sid);
-  return e && e.verifyMode === 'simulate' ? e : null;
-}
-
-/* 向影子实例发控制消息并等回执。未运行 / 非 simulate / 超时都会 reject。 */
-function simCall(sid, type, payload = {}) {
-  const entry = findSimEntry(sid);
-  if (!entry) return Promise.reject(new Error(`脚本 ${sid} 当前没有仿真（simulate）实例`));
-  const id = ++simSeq;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      simPending.delete(id);
-      reject(new Error(`仿真请求超时：${type}`));
-    }, SIM_REPLY_TIMEOUT_MS);
-    simPending.set(id, { resolve, reject, timer });
-    try { entry.child.send({ type, id, ...payload }); }
-    catch (e) { simPending.delete(id); clearTimeout(timer); reject(e); }
-  });
-}
-
-function simInject(sid, payload) { return simCall(sid, 'simInject', { payload }); }
-function simAdvance(sid, ms) { return simCall(sid, 'simAdvance', { ms }); }
-
-/* 快照：实例在跑就实时拉；实例已崩/已停则回退读崩溃只读快照（§5.2），
- * 让 AI 在失败之后仍能看到当时的写意图、终值与待触发定时器（只读，不能继续 advance）。 */
-async function simSnapshot(sid, opts) {
-  if (!findSimEntry(sid)) {
-    const v = store.versionOfChannel(String(sid || ''), 'shadow');
-    const crash = v == null ? null : store.readSimCrash(String(sid || ''), v);
-    if (crash) return { ...crash, version: v, readOnly: true, crashed: true, fromCrashFile: true };
-  }
-  return simCall(sid, 'simSnapshot', { opts });
-}
-
-/* 等脚本启动进入 keepAlive：steps 若在脚本注册订阅前跑，注入会被丢失。
- * 用真实定时器轮询（不占虚拟时钟），最多 ~1s。 */
-async function waitSimReady(sid, tries = 20) {
-  for (let i = 0; i < tries; i += 1) {
-    try {
-      const snap = await simSnapshot(sid, { include: ['execution', 'watchers'] });
-      if (snap && snap.execution && snap.execution.runCount > 0) return snap;
-    } catch (e) { /* 还没就绪，重试 */ }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`脚本 ${sid} 仿真会话就绪超时`);
-}
-
-/* 批量用例（§7.4）：一次提交整组 steps 跑完并返回逐步断言。
- * 默认**重建**虚拟世界（用例必须可独立重跑，不能带着上一个用例的残留状态）；
- * 只有显式 continue:true 才在当前 simulate 会话上续跑（多段探索），此时不接受 startAt/seed。 */
-async function simRunSteps(sid, payload = {}) {
-  const p = payload || {};
-  const reuse = p.continue === true;
-  if (reuse && (p.startAt !== undefined || p.seed !== undefined)) {
-    throw new Error('continue:true 表示在当前仿真会话续跑，不能再指定 startAt/seed；要换起点请去掉 continue');
-  }
-  const hasSim = !!findSimEntry(sid);
-  if (!reuse || !hasSim) {
-    /* 每次重建都要新世界：即便目标模式相同也 force，否则 switchVerifyMode 会幂等返回旧世界。 */
-    await switchVerifyMode(sid, 'simulate', { startAt: p.startAt, seed: p.seed, force: true });
-  }
-  await waitSimReady(sid);
-  return simCall(sid, 'simRunSteps', { steps: p.steps, failFast: p.failFast });
-}
-/* ---- P2：交互式断言 / 标记回滚 / 用例导出与重放 ---- */
-
-/* 对当前仿真会话做一次断言（不重建世界）。step 用与 run_steps 的 assert 相同字段。 */
-function simAssert(sid, step, opts = {}) {
-  return simCall(sid, 'simAssert', { step, since: opts.since });
-}
-
-/* 打点：记下当前虚拟世界数据（实体/上下文/task）。 */
-function simMark(sid, name) { return simCall(sid, 'simMark', { name }); }
-
-/* 回滚到标记点：只回滚输入世界，时钟与脚本状态不回退（见报告 P2 语义）。 */
-function simRewind(sid, name) { return simCall(sid, 'simRewind', { mark: name }); }
-
-/* 导出用例：把当前会话的起点 + 驱动流水 + 观测到的写意图存成 fixture。
- * 用例目录与服务端同一份（skill/.fixtures）后，导出即"写进资产库"：同名文件若已带 assert
- * 步骤（手写用例），默认拒绝覆盖——导出的 fixture 没有断言，覆盖等于把资产降级。 */
-async function simExport(sid, name, opts = {}) {
-  const id = String(sid || '');
-  if (!store.safeId(id)) throw new Error('脚本 id 非法');
-  const existing = store.readFixture(id, name);
-  if (existing && !opts.force && (existing.steps || []).some((s) => s && s.op === 'assert')) {
-    throw new Error(`${name} 已存在且带断言（手写用例），拒绝用导出的 fixture 覆盖；换个 name 或传 force:true`);
-  }
-  const data = await simCall(sid, 'simExport');
-  const v = store.versionOfChannel(id, 'shadow');
-  const meta = v == null ? null : store.getMeta(id, v);
-  const payload = {
-    ...data, name: String(name), scriptVersion: v,
-    scriptSha: (meta && meta.sha256) || null,
-    exportedAt: new Date().toISOString(),
-  };
-  const file = store.writeFixture(id, name, payload);
-  return { ok: true, scriptId: id, name: String(name), file, steps: (payload.steps || []).length, writes: ((payload.expected || {}).writes || []).length };
-}
-
-/* 重放 fixture：默认重建世界 → 跑 steps → 追加一条 since:0 的写意图全序列断言。
- * since:0 使追尾断言不受用例自带 assert 消耗 seq 游标的影响：自带 assert 验各段增量，
- * 追尾断言验全序列，两者各验各的、可以并存（旧实现直接跳过，会漏掉全序列这层校验）。
- * versionDrift 表示导出时的影子版号/源码 sha 与当前不同（脚本可能已改，断言失败先怀疑这个）。 */
-async function simRunFixture(sid, name, opts = {}) {
-  const id = String(sid || '');
-  const fx = store.readFixture(id, name);
-  if (!fx) throw new Error(`没有这个用例：${name}（先 sim_export 或写到 skill/.fixtures/${id}/）`);
-  const steps = Array.isArray(fx.steps) ? [...fx.steps] : [];
-  const expected = ((fx.expected || {}).writes) || [];
-  const hasOwnAsserts = steps.some((s) => s && s.op === 'assert');
-  /* expected 为空且用例自带断言时追加空序列断言只会误报，此时不追尾；其余情况都追加。 */
-  if (opts.assertWrites !== false && (expected.length > 0 || !hasOwnAsserts)) {
-    steps.push({ op: 'assert', label: `fixture:${name}`, since: 0, writes: expected });
-  }
-  const r = await simRunSteps(id, { startAt: fx.startAt, seed: fx.seed, steps, failFast: opts.failFast });
-  const curV = store.versionOfChannel(id, 'shadow');
-  const curMeta = curV == null ? null : store.getMeta(id, curV);
-  const curSha = (curMeta && curMeta.sha256) || null;
-  /* 版号 + 源码 sha 双重比对：影子可原地覆盖（版号不变、内容变了），只看版号会漏。 */
-  const drift = fx.scriptVersion !== curV || (!!fx.scriptSha && !!curSha && fx.scriptSha !== curSha);
-  return {
-    ...r,
-    fixture: { name, scriptId: id, scriptVersion: fx.scriptVersion, currentVersion: curV, versionDrift: drift },
-  };
-}
-
-/* 列出某个脚本已存的用例（不带执行）。 */
-function simListFixtures(sid) {
-  return { scriptId: String(sid || ''), fixtures: store.listFixtures(String(sid || '')) };
-}
-
-/* 关闭仿真会话：只对 simulate 影子实例生效。follow 影子是真实验证态，误调不能把它停掉
- * （那会让用户以为"关掉仿真"，实际停掉了实跑验证）；要停请走正常 stop。 */
-async function simClose(sid) {
-  const entry = currentShadowEntry(sid);
-  if (!entry) return { ok: true, scriptId: String(sid || ''), closed: false, note: '没有运行中的影子实例' };
-  if ((entry.verifyMode || 'follow') !== 'simulate') {
-    throw new Error('当前影子实例是 follow 模式（跟随真实），不是仿真；如需停止请调用 automation_stop_script');
-  }
-  try { await simCall(sid, 'simClose'); } catch (e) { /* worker 已退出也视为关闭成功 */ }
-  stop(sid, 'sim-close', entry.version);
-  return { ok: true, scriptId: String(sid || ''), closed: true };
-}
-
-/* 等实例真正退出：stop 是「置标志 + 宽限后 kill」，切换必须等 exit 确认，否则撞槽位。 */
-function waitExit(entry, timeoutMs = SWITCH_EXIT_TIMEOUT_MS) {
-  if (entry.exited) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (v) => { if (done) return; done = true; entry.child.off('exit', onExitEvt); clearTimeout(timer); resolve(v); };
-    const onExitEvt = () => finish(true);
-    entry.child.on('exit', onExitEvt);
-    const timer = setTimeout(() => finish(false), timeoutMs);
-  });
-}
-
-/* 模式切换提示：属于运维事件，不是脚本运行日志。
- * 切到 simulate 时只广播（sim:true），不写版本日志——否则真实运行记录里会混进仿真期条目，
- * 事后排查分不清「哪次是真跑的」；切回 follow 时才正常落盘（此时已在真实模式）。 */
-function emitSwitchLog(sid, version, level, message, targetMode) {
-  const line = { ts: Date.now(), scriptId: sid, version, level, message };
-  if (targetMode === 'simulate') {
-    /* 模式切换发生在仿真会话的起点：虚拟时刻 at=0。必须带 at——前端按
-     * 「at!=null ? +X.Xs : 墙钟」渲染，缺 at 会显示成具体时分秒，和脚本日志的 +X.Xs 混排。
-     * 同时落进 sim.log（与 worker 脚本日志同文件），刷新页面后这条仍在。 */
-    const simLine = { ...line, at: 0 };
-    store.appendSimLog(sid, version, simLine);
-    hub.broadcast({ type: 'script', event: 'log', ...simLine, sim: true });
-    return;
-  }
-  store.appendLog(sid, version, line);
-  hub.broadcast({ type: 'script', event: 'log', ...line });
-}
-
-/* 切换验证方式：校验 → 暂停（等真正退出）→ 清理模式态 → 启动 → 回滚 → 广播。
- * 不做热切换；目标与当前相同幂等返回；正式实例是另一个槽位、完全不受影响。 */
-async function switchVerifyMode(sid, mode, opts = {}) {
-  const id = String(sid || '');
-  const target = mode === 'simulate' ? 'simulate' : 'follow';
-  const shadowV = store.versionOfChannel(id, 'shadow');
-  if (shadowV == null) throw new Error(`脚本 ${id} 没有影子版本，无法切换验证方式`);
-  const cur = currentShadowEntry(id);
-  if (cur) {
-    const from = cur.verifyMode || 'follow';
-    if (from === target && !opts.force) {
-      return { from, to: target, idempotent: true, version: shadowV, verifyMode: target };
-    }
-  }
-  const from = cur ? (cur.verifyMode || 'follow') : 'stopped';
-  const startAt = Date.now();
-  /* 瞬态 switching（§2.3）：前端显示「切换中」，避免暂停→启动的空窗被误读为崩溃。
-   * 只是状态事件，不写版本日志、不影响正式槽位。 */
-  if (cur) broadcastScript(id, shadowV, 'status', { status: 'switching', verifyMode: target });
-  if (cur) {
-    stop(id, 'mode-switch', shadowV);
-    const exited = await waitExit(cur);
-    if (!exited) {
-      /* 宽限 + 超时仍未退出：强杀，避免撞槽位 */
-      try { cur.child.kill(); } catch (e) {}
-      await waitExit(cur, 500);
-    }
-  }
-  /* simulate → follow 的虚拟世界随 worker 退出自然销毁（不持久化，§2.4）。
-   * follow → simulate 无需额外清理。 */
-  const launch = (m) => start(id, shadowV, currentConnector, 0, null, {
-    verifyMode: m, startAt: opts.startAt, seed: opts.seed,
-  });
-  try {
-    const entry = launch(target);
-    broadcastScript(id, shadowV, 'status', { status: 'running', verifyMode: target });
-    broadcastRefresh(['scripts', 'script']);
-    emitSwitchLog(id, shadowV, 'warn', `[模式切换] ${from} → ${target}（暂停 ${Date.now() - startAt}ms，重新启动 v${shadowV}）`, target);
-    return {
-      from, to: target, idempotent: false, version: shadowV, verifyMode: target,
-      pausedMs: Date.now() - startAt, clock: target === 'simulate' ? (opts.startAt || null) : null,
-    };
-  } catch (e) {
-    /* 回滚：目标模式启动失败 → 尝试以原模式重启一次；仍失败则 stopped + error。 */
-    try {
-      if (from !== 'stopped') {
-        launch(from);
-        emitSwitchLog(id, shadowV, 'warn', `[模式切换] 启动 ${target} 失败，已回滚到 ${from}：${e.message}`, from);
-      } else {
-        throw e;
-      }
-    } catch (e2) {
-      clearError(id, shadowV);
-      broadcastScript(id, shadowV, 'status', { status: 'error' });
-      emitLog({ sid: id, version: shadowV }, 'error', `[模式切换] 启动 ${target} 失败且回滚 ${from} 也失败：${e2.message}`);
-    }
-    throw e;
-  }
-}
+/* ================= 影子双模式验证：simulate 控制面（已抽出为 sim-control.js，审计 3.1）=================
+ * 本模块只保留装配与回执转交：控制面函数（switchVerifyMode / sim* 12 个）与
+ * simPending 私有状态都在 sim-control.js，实例生命周期仍归本模块（deps 注入）。 */
+const simControl = createSimControl({
+  instancesOf, store, hub, start, stop, broadcastScript, broadcastRefresh,
+  emitLog, clearError, getConnector: () => currentConnector,
+});
+const {
+  switchVerifyMode, simInject, simAdvance, simSnapshot, simRunSteps, simClose,
+  simAssert, simMark, simRewind, simExport, simRunFixture, simListFixtures,
+} = simControl;
 
 module.exports = {
   start, stop, stopAll, restore, isRunning, runningVersion, runningVersions, runningList, onStateChange,
   acquireAction, releaseAction, submitScript, rollback, publish, removeVersion, removeScript, trigger,
   onHaReady, onHaOffline, haStatus, writeAllowed, broadcastRefresh,
-  versionRuntimeStatus, scriptRuntimeStatus,
+  versionRuntimeStatus, scriptRuntimeStatus, statusSummary,
   switchVerifyMode, simInject, simAdvance, simRunSteps, simSnapshot, simClose,
   simAssert, simMark, simRewind, simExport, simRunFixture, simListFixtures,
 };

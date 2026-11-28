@@ -3,7 +3,7 @@
  * 会话按 scriptId 唯一（影子槽位唯一），生命周期 = simulate 实例，切模式/关闭即销毁。
  *
  * 数据来源全部来自 MCP 注入与脚本写回，接触真实世界的通道只有脚本源码（只读），
- * 不写 data/context.json、不写版本日志、不进真实订阅表（SIMULATION-DESIGN §5/§7.5）。 */
+ * 不写 data/context.json、不写版本日志、不进真实订阅表。 */
 const { isDeepStrictEqual } = require('node:util');
 const { VirtualClock } = require('./clock');
 const { createSimHost } = require('./host');

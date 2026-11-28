@@ -5,12 +5,13 @@
  *
  * simulate 模式：meta.simulate 时在本线程创建 VirtualClock + SimSession，
  * core 的 request 由 sim-host 在微任务内闭环应答（不跨 IPC），保证 advance 快进
- * 不会误触发 request 的 10s 超时（SIMULATION-DESIGN §4）。控制消息 simInject /
+ * 不会误触发 request 的 10s 超时。控制消息 simInject /
  * simAdvance / simSnapshot 由主进程下发，simReply 回执。 */
 const { parentPort } = require('worker_threads');
 const fs = require('fs');
 const path = require('path');
 const { createCore } = require('./runner-core');
+const simLog = require('./sim-log'); // sim.log 读写契约唯一实现（审计 3.6）
 const { VirtualClock } = require('../sim/clock');
 const { createSimSession } = require('../sim/session');
 
@@ -18,33 +19,29 @@ if (!parentPort) throw new Error('worker-runner.js 只能在 worker_threads 内�
 
 let core = null;
 let session = null;
-let simLog = null;
+let simLogStream = null; // 会话期仿真日志写流（sim-log.openStream 产物）
 let crashFile = null;        // meta.simCrashFile：崩溃只读快照落点（§5.2）
 let crashWritten = false;
 let intentionalStop = false; // 收到 stop/simClose：正常结束，不写崩溃现场
 
 /* 仿真日志独立文件（§5）：逐行 JSON 追加写，与线上 v<n>.log 分开。
- * 只在 simulate worker 打开（meta.simLogFile 由主进程按仓库路径规则下发）。
- * 会话开始时的清空由主进程 start(simulate) 统一做（store.clearSimLog）——
- * 这里必须用 'a' 追加：否则会抹掉主进程先落的框架日志（如 [模式切换]）。 */
+ * 打开/写入契约统一在 sim-log.js（审计 3.6）：主进程会话起点已清空（store.clearSimLog），
+ * 这里必须 'a' 追加，否则会抹掉主进程先落的框架日志（如 [模式切换]）。
+ * 只在 simulate worker 打开（meta.simLogFile 由主进程按仓库路径规则下发）。 */
 function openSimLog(file) {
   closeSimLog();
   if (!file) return;
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    simLog = fs.createWriteStream(file, { flags: 'a' });
-    simLog.on('error', () => { simLog = null; });
-  } catch (e) { simLog = null; }
+  try { simLogStream = simLog.openStream(file); } catch (e) { simLogStream = null; }
 }
 function writeSimLog(level, message, nodeId) {
-  if (!simLog) return;
+  if (!simLogStream) return;
   try {
     const at = session ? session.clock.elapsedMs() : 0;
-    simLog.write(JSON.stringify({ ts: Date.now(), at, level: level || 'info', message: String(message || ''), nodeId: nodeId || undefined }) + '\n');
+    simLogStream.write(JSON.stringify({ ts: Date.now(), at, level: level || 'info', message: String(message || ''), nodeId: nodeId || undefined }) + '\n');
   } catch (e) { /* 日志写失败不影响仿真 */ }
 }
 function closeSimLog() {
-  try { if (simLog) { simLog.end(); simLog = null; } } catch (e) { simLog = null; }
+  try { if (simLogStream) { simLogStream.end(); simLogStream = null; } } catch (e) { simLogStream = null; }
 }
 
 /* 崩溃现场：同步写盘（退出前没有异步窗口），只写一次。

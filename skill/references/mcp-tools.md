@@ -64,7 +64,7 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `automation_submit_script` | `script`（源码，AST 校验）、`flow`、`confirmed:true`、`scriptId?`（新建可不传，服务端生成）、`name?`（**必传贴切中文业务名，严禁用 id 充当名字**，可随迭代演进）、`description?`、`kind?`（automation=常驻（默认）/ script=一次性动作 / scene=场景；运行模型由此派生）、`channel?`（默认 shadow，一般不要直接建 production）、`newVersion?`（强制另开版本号）、`hostMode?`（脚本级宿主覆盖：fork/inprocess/worker 三值对称，跟随版本持久化、迭代自动继承；未设置走默认策略——正式一次性走热池会话、常驻跟随全局 EXECUTION_MODE。影子恒为专属 worker 不受影响）、`runnerTimeoutMs?`（脚本级运行超时覆盖，一次性脚本含长延时时用）、`restartable?`（可重入触发：重复 trigger/ctx.call 时停旧启新） | 提交脚本。**影子可原地反复修改**：已有影子时默认覆盖（版本号不变、revision+1，返回 `overwritten:true`）；改运行中的影子会先自动停止。正式/归档内容不可改 |
+| `automation_submit_script` | `script`（源码，AST 校验）、`flow`、`confirmed:true`、`scriptId?`（新建可不传，服务端生成）、`name?`（**新建必须传贴切中文业务名，严禁用 id 充当名字**；迭代可省略，自动继承上一版）、`icon?`（**新脚本首次提交必须提供**：完整 `<svg>` 源码字符串 ≤8KB，viewBox 0 0 64 64、`stroke="currentColor"`；后续迭代自动继承，规范见 `references/file-specs.md` §icon）、`description?`、`kind?`（automation=常驻（默认）/ script=一次性动作 / scene=场景；运行模型由此派生）、`channel?`（默认 shadow，一般不要直接建 production）、`newVersion?`（强制另开版本号）、`hostMode?`（脚本级宿主覆盖：fork/inprocess/worker 三值对称，跟随版本持久化、迭代自动继承；未设置走默认策略——正式一次性走热池会话、常驻跟随全局 EXECUTION_MODE。影子恒为专属 worker 不受影响）、`runnerTimeoutMs?`（脚本级运行超时覆盖，一次性脚本含长延时时用）、`restartable?`（可重入触发：重复 trigger/ctx.call 时停旧启新） | 提交脚本。**影子可原地反复修改**：已有影子时默认覆盖（版本号不变、revision+1，返回 `overwritten:true`）；改运行中的影子会先自动停止。正式/归档内容不可改 |
 | `automation_start_script` | `scriptId`、`version?`、`confirmed:true` | 启动指定版本；槽位规则：同一脚本最多 1 正式 + 1 影子并行，同槽位已占用报错 |
 | `automation_stop_script` | `scriptId`、`version?`、`confirmed:true` | 停止实例；version 省略 = 停全部（正式+影子），给 version 只停该版本 |
 | `automation_trigger_script` | `scriptId`、`channel?`（production=正式，默认，真实下发 / shadow=影子，写不下发，验证用）、`confirmed:true` | **按次触发一次性脚本/场景**（kind=script/scene）：起独立实例跑顶层代码，跑完自动清理。只返回启动回执——不等跑完、无返回值，结果用 `automation_get_logs` / `automation_get_script_status` 确认。常驻自动化不能按次触发（用 start）；运行中未设 restartable 会报 busy |
@@ -80,7 +80,7 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 | 工具 | 参数 | 说明 |
 |---|---|---|
 | `automation_switch_verify_mode` | `scriptId`、`mode`（`follow`/`simulate`）、`startAt?`（ISO）、`seed?`（`{entities:{eid:{state,attributes}}, context:{global,local}}`） | 唯一切换入口：暂停旧实例 → 等真正退出 → 以目标模式启动（不热切，正式实例不受影响）。已是目标模式则幂等返回 |
-| `automation_sim_inject` | `scriptId`、`payload.{entity\|context\|task\|suspend}` | 注入一次变化：`entity`（先改虚拟表再触发订阅）/ `context`（`{scope,key,value}`）/ `task`（`{scriptId,state}`）/ `suspend` |
+| `automation_sim_inject` | `scriptId`、`payload.{entity\|context\|task\|suspend\|params}` | 注入一次变化：`entity`（先改虚拟表再触发订阅）/ `context`（`{scope,key,value}`）/ `task`（`{scriptId,state}`）/ `suspend` / `params`（覆盖触发参数，运行中注入仅进快照可见并记 warn，**下一次进入 simulate 才生效**） |
 | `automation_sim_advance` | `scriptId`、`ms` | 快进虚拟时钟（毫秒），到点定时器按 dueAt 顺序触发；真实等待不会推进仿真 |
 | `automation_sim_run_steps` | `scriptId`、`steps[]`、`startAt?`、`seed?`、`continue?`、`failFast?` | 批量跑用例 + 逐步断言，返回 `ok/passed/failed/total/executed/aborted`、每条 `checks` 与终态。**默认每次重建世界**；`continue:true` 才续跑且与 `startAt/seed` 互斥。`failFast` 缺省收集全部失败 |
 | `automation_sim_assert` | `scriptId`、`writes?`、`noWrites?`、`state?`、`context?`、`logs?`、`expect?`、`label?`、`since?` | 对当前会话单次断言，不推进不重建。默认基准 = 上次断言以来的新增 |
@@ -88,7 +88,7 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 | `automation_sim_mark` | `scriptId`、`name?` | 标记世界数据点（实体/上下文/task），供 `sim_rewind` |
 | `automation_sim_rewind` | `scriptId`、`mark` | 回滚**数据**到标记点；虚拟时钟继续前进、脚本定时器/订阅不回退（完全重放请重建世界或跑 fixture） |
 | `automation_sim_export` | `scriptId`、`name` | 导出回归用例 `skill/.fixtures/<id>/<name>.json`（与可复用用例同目录）：startAt + seed + 驱动流水（inject/advance）+ 观测写意图 + 脚本版号/sha |
-| `automation_sim_run_fixture` | `scriptId`、`name?`、`assertWrites?`（缺省 true）、`failFast?` | 重放同一目录里的用例并做写意图全序列断言；**用例自带 assert 时自动跳过追尾断言**（游标已被消耗），要强制追加显式传 `true`。`versionDrift=true` 说明脚本已改，先怀疑版本漂移。不传 `name` 只列已有用例 |
+| `automation_sim_run_fixture` | `scriptId`、`name?`、`assertWrites?`（缺省 true）、`failFast?` | 重放同一目录里的用例并默认追加一条 `since:0` 写意图全序列断言（与用例自带 assert 并存、各验各的）；**仅当用例 `expected.writes` 为空且自带 assert 时不追加**（此时传 `assertWrites:true` 也无法强制追加，需要全序列校验改用 `case.cjs run`），`assertWrites:false` 显式关闭。`versionDrift=true` 说明脚本已改，先怀疑版本漂移。不传 `name` 只列已有用例 |
 | `automation_sim_close` | `scriptId` | 结束仿真实例、销毁虚拟世界（不持久化）；`follow` 模式下拒绝（用 `automation_stop_script`）。**非收尾命令**：不会回 follow，收尾用 `case.cjs finish` / `switch_verify_mode {"mode":"follow"}` |
 
 `steps[]` 的 `op`：`advance` / `inject_entity` / `inject_context` / `inject_task` / `inject_params` / `inject_suspend` / `mark` / `rewind` / `snapshot` / `assert`。

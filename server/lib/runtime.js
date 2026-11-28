@@ -1,6 +1,5 @@
 'use strict';
-/* 共享运行实例：路由与 MCP 都 require 这里，避免 index.js 组装时到处传 ctx。
- * 各域路由文件零参：module.exports = function xxxRoutes() { const r = express.Router(); ... } */
+/* 共享运行实例：各域路由 require 这里直接取用（零参路由），MCP 挂载只传一次 mcpCtx。 */
 const { HaConnector } = require('../ha/connector');
 const hub = require('./ws-hub');
 const store = require('../scripts/store');

@@ -15,6 +15,7 @@
  * 脚本层 ctx.write 写闸（影子 / 开发模式）+ 主进程 executor 硬拦截。 */
 const vm = require('vm');
 const { shadowWrite, devWrite } = require('./log-text');
+const { createHold } = require('./hold');
 
 /* 真实时钟适配器：follow 模式默认走原生定时器/Date，签名与 sim/clock.js 的 VirtualClock 一致。
  * 虚拟化只在 meta.simulate 时由宿主注入 VirtualClock，runner-core 全部时间源统一走 clock。 */
@@ -570,7 +571,8 @@ function createCore({ emit, clock }) {
     };
 
     /* 批量订阅实体变化（转发 ctx.ha.change，签名一致）。
-     * ctx.watch 只管 HA 实体；依赖脚本的查/等/订统一在 ctx.task.*（status/require/watch）。 */
+     * ctx.watch 只管 HA 实体；依赖脚本的查/等统一在 ctx.task.*（status/require，
+     * task.watch 已删除，见上方注释）。 */
     ctx.watch = (entityIds, cb) => {
       const list = Array.isArray(entityIds) ? entityIds : [entityIds];
       for (const eid of list) if (eid) ctx.ha.change(eid, cb);
@@ -679,205 +681,14 @@ function createCore({ emit, clock }) {
       };
     };
 
-    /* ctx.hold：期待值/期待条件的双边迟滞确认器（ref-like 句柄）。
-     * 数据流：raw（脚本写入的最新值）→ expect 投影 → desired（是否满足期待，二态）→
-     *   desired !== state 时按方向计时（满足=satisfyMs / 不满足=unsatisfyMs）→
-     *   持续到点复核仍成立 → state 切换并通知 watcher 一次。
-     * watch 回调：(satisfied, prev, info)，satisfied=true 表示"满足期待持续到位"，
-     *   false 表示"不满足期待/回落持续到位"。同一状态持续多久都不会重复回调。
-     * raw 只由脚本赋值：a.value = x。实体变化由脚本自己 ctx.watch 订阅并在回调里写 raw；
-     *   expect 需要读 HA 也可在函数里 await ctx.ha.xxx —— 框架不内置实体监听。
-     * 只接受对象参数：{ expect, satisfyMs, unsatisfyMs?, initial?, nodeId?, label? }；
-     *   不使用旧语法（数字首参 / ms / condition / fallMs）。unsatisfyMs=null/0/缺省 → 不满足立即回落。
-     * 内部状态纯闭包内存，不碰 global/local；stop 时 ctx.after 统一清理。 */
-    ctx.hold = (opts) => {
-      if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
-        throw new Error('ctx.hold 只接受对象参数 { expect, satisfyMs, unsatisfyMs? }');
-      }
-      const conf = opts;
-      const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
-      for (const oldKey of ['ms', 'condition', 'fallMs']) {
-        if (hasOwn(conf, oldKey)) {
-          throw new Error(`ctx.hold 不再支持旧参数 ${oldKey}：请改用 ${oldKey === 'ms' ? 'satisfyMs' : oldKey === 'condition' ? 'expect' : 'unsatisfyMs'}`);
-        }
-      }
-      const satisfyMs = Math.max(0, Number(conf.satisfyMs) || 0);
-      if (satisfyMs <= 0) throw new Error('ctx.hold 的满足持续时长 satisfyMs 必须大于 0');
-
-      const unsatisfyRaw = hasOwn(conf, 'unsatisfyMs') ? conf.unsatisfyMs : null;
-      const unsatisfyMs = (unsatisfyRaw === null || unsatisfyRaw === undefined || unsatisfyRaw === '')
-        ? 0 : Math.max(0, Number(unsatisfyRaw) || 0);
-
-      const initial = conf.initial === undefined ? false : !!conf.initial;
-      const expectFn = typeof conf.expect === 'function' ? conf.expect : null;
-      const hasExpectValue = !expectFn && hasOwn(conf, 'expect');
-      const expectValue = hasExpectValue ? conf.expect : undefined;
-      const nodeId = conf.nodeId;
-      const label = conf.label ? `[hold·${conf.label}] ` : '[hold] ';
-      const log = (message, level = 'info') =>
-        emit({ type: 'log', level, message: label + message, nodeId });
-      /* 日志文案中文化：只翻显示用的方向/触发标记，info.reason、state().pending 等字段值仍是英文。 */
-      const dirCn = (v) => v === 'satisfied' ? '满足' : v === 'unsatisfied' ? '回落' : String(v);
-      const trigCn = (v) => String(v).split(':').map((p) => ({
-        init: '初始化', assign: '赋值', timer: '到点', retry: '重试', resume: '补排',
-      }[p] || dirCn(p))).join('·');
-
-      let raw = initial;
-      let state = initial;   // 当前已确认状态：true=已确认满足期待，false=未满足/已回落
-      let stable = state;    // 兼容旧 state()/文档：与 state 同步，不再作为 watch 触发条件
-      let desired = false;   // 最近一次 expect 投影结果：是否满足期待
-      let pending = null;    // 'satisfied' / 'unsatisfied' / null
-      let since = 0;         // 当前等待方向开始持续的起点；0 = 未计时
-      let timer = null;      // ctx.after 句柄（受 timers 注册表管理，stop 统一清理）
-      let seq = 0;           // 重评序号：异步 expect 期间被新一次重评抢占则放弃旧结果
-      let dead = false;
-      const watchers = new Set();
-      const clearHoldTimer = () => { if (timer) { cancelTimer(timer); timer = null; } };
-      const delayFor = (direction) => direction === 'satisfied' ? satisfyMs : unsatisfyMs;
-
-      const notify = (trigger, waitedMs) => {
-        const prev = state;
-        state = desired;
-        stable = state;
-        pending = null;
-        since = 0;
-        const reason = state ? 'satisfied' : 'unsatisfied';
-        log(`确认${state ? '满足' : '不满足'}：状态 ${String(prev)} → ${String(state)}` +
-          `（持续 ${waitedMs}ms，触发=${trigCn(trigger)}）`);
-        const info = {
-          satisfied: state,
-          value: state,
-          reason,
-          raw,
-          expected: desired,
-          state,
-          stable,
-          ms: waitedMs,
-          nodeId,
-        };
-        for (const cb of [...watchers]) {
-          evalRealm(cb, [state, prev, info]).catch((e) =>
-            log(`watcher 异常：${e && e.message || e}`, 'error'));
-        }
-      };
-
-      /* 统一到点排程：回调先确认自己仍是当前 timer 再处理（过期回调直接丢弃），
-       * 句柄清理也收在这里。到点复核抛异常时保留 pending/since，由异常路径补排重试。 */
-      const arm = (delay, trigger) => {
-        const id = ctx.after(delay, () => {
-          if (timer !== id) return;
-          timer = null;
-          reevaluate(trigger);
-        });
-        /* 给虚拟时钟的定时器打标签：快照 timers[] 展示「满足计时/回落计时」，
-         * 让 AI 一眼看出脚本此刻在等什么（§7.6）。follow 模式 label 是 no-op。 */
-        if (clk.isVirtual && typeof clk.label === 'function') {
-          clk.label(id, `${conf.label || 'hold'}·${dirCn(pending || 'satisfied')}计时`);
-        }
-        timer = id;
-      };
-      /* 异常重试/句柄补排的间隔：到点后剩余时间为 0 时给 50ms 下限，
-       * 避免 expect 连续抛错形成 0ms 紧循环刷日志。 */
-      const retryDelay = () => {
-        if (!pending) return satisfyMs;
-        const delay = delayFor(pending);
-        return since > 0 ? Math.max(50, delay - (clk.now() - since)) : Math.max(50, delay);
-      };
-
-      async function reevaluate(trigger) {
-        if (dead || ctxRuntime.stopped) return;
-        const my = ++seq;
-        /* 1) 投影 desired：expect 可同步可 async，可自行 await ctx.ha 读实体；
-         *    抛错则保守跳过、不推进计时，但必须补排重试。 */
-        let next;
-        if (expectFn) {
-          try { next = !!(await evalRealm(expectFn, [raw])); }
-          catch (e) {
-            log(`expect 异常，本轮跳过：${e && e.message || e}`, 'error');
-            if (my === seq && !dead && !ctxRuntime.stopped && !timer) arm(retryDelay(), 'retry');
-            return;
-          }
-        } else if (hasExpectValue) {
-          next = signalEquals(raw, expectValue); // 期待值模式：raw 等于 expect 才算满足
-        } else {
-          next = !!raw;                          // 默认期待值：truthy 即满足，兼容 a.value=true/'Busy'
-        }
-        if (my !== seq || dead || ctxRuntime.stopped) return;
-        desired = next;
-
-        /* 2) 期待结果与当前已确认状态一致：没有待确认边沿，取消本轮计时，不回调。 */
-        if (desired === state) {
-          if (pending) log(`期待回到已确认状态 ${String(desired)}，取消${dirCn(pending)}计时`);
-          pending = null;
-          since = 0;
-          clearHoldTimer();
-          return;
-        }
-
-        /* 3) 期待结果与当前状态相反：按方向计时；中途回到当前状态则上一步会取消。 */
-        const direction = desired ? 'satisfied' : 'unsatisfied';
-        const delay = delayFor(direction);
-        if (pending !== direction) {
-          pending = direction;
-          since = clk.now();
-          clearHoldTimer();
-          log(`期待${desired ? '满足' : '不满足'}，${dirCn(direction)}计时 ${delay}ms（触发=${trigCn(trigger)}）`);
-          if (delay === 0) { notify(trigger + ':立即', 0); return; }
-          arm(delay, trigger);
-          return;
-        }
-
-        /* 4) 同方向已计时：到点复核仍成立就切换状态并通知一次；句柄丢失则按剩余时间补排。 */
-        if (since > 0 && clk.now() - since >= delay) {
-          const waitedMs = clk.now() - since;
-          clearHoldTimer();
-          notify(trigger, waitedMs);
-          return;
-        }
-        if (since > 0 && !timer) arm(Math.max(1, delay - (clk.now() - since)), 'resume');
-      }
-
-      const handle = {
-        get value() { return state; },
-        set value(nv) {
-          if (dead) return;
-          raw = nv;
-          reevaluate('assign');
-        },
-        watch(cb) {
-          if (typeof cb !== 'function') throw new Error('hold.watch 需要回调函数');
-          if (dead) return () => false;
-          watchers.add(cb);
-          return makeOff(watchers, cb);
-        },
-        cancel() {
-          if (dead) return false;
-          dead = true;
-          seq++;
-          clearHoldTimer();
-          pending = null;
-          since = 0;
-          watchers.clear();
-          return true;
-        },
-        state() {
-          const active = pending !== null;
-          return {
-            raw, desired, signal: desired, state, stable: state,
-            pending,
-            since,
-            active,
-            remaining: active ? Math.max(0, delayFor(pending) - (clk.now() - since)) : 0,
-            ms: satisfyMs,
-            satisfyMs,
-            unsatisfyMs,
-            dead,
-          };
-        },
-      };
-      reevaluate('init'); // 首次投影：让初始实体值/expect 立即进入判定
-      return handle;
-    };
+    /* ctx.hold：双边迟滞确认器（实现抽出为同目录 hold.js，审计 3.5——createCore 只留装配）。
+     * 数据流与 watch 语义见 hold.js 头注释；闭包依赖显式注入，不再内嵌 200 行。 */
+    ctx.hold = (opts) => createHold(opts, {
+      emit, evalRealm, makeOff, cancelTimer, signalEquals,
+      isStopped: () => ctxRuntime.stopped,
+      after: (ms, fn) => ctx.after(ms, fn),
+      clk,
+    });
 
     /* 常驻模式锚点：脚本结尾 await ctx.keepAlive() 让顶层协程永不 resolve，
      * runner 不 emit done、executor 不 cleanup —— 长驻守护脚本的标准结尾。
@@ -1074,9 +885,9 @@ function createCore({ emit, clock }) {
     writerDebounce.clear();
     globalWriter.clear();
     globalDebounceMs.clear();
-    for (const t of timers.values()) clearTimeout(t);
+    for (const t of timers.values()) clk.clearTimeout(t); // 审计 4.2：sim 定时器句柄是自增数字，全局 clear 清不掉
     timers.clear();
-    for (const id of intervals) clearInterval(id);
+    for (const id of intervals) clk.clearInterval(id);
     intervals.clear();
     /* 会话模型（热池）必须项：拒绝仍在等待宿主回执的请求，防止泄漏定时器与悬挂 Promise */
     for (const w of waiting.values()) { clearTimeout(w.timer); w.reject(new Error('实例已结束')); }
@@ -1107,7 +918,9 @@ function createCore({ emit, clock }) {
     };
   }
 
-  return { handleMessage, isStopped: () => ctxRuntime.stopped, destroy, simState, ctxRuntime };
+  /* 消费面只暴露消息入口/销毁/状态快照（4 个宿主入口与测试均只用这三样）；
+   * ctxRuntime 是内部可变状态，不外露（审计 1.2：此前 isStopped/ctxRuntime 泄漏封装）。 */
+  return { handleMessage, destroy, simState };
 }
 
 module.exports = { createCore };

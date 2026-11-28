@@ -323,8 +323,6 @@ html[data-theme="dark"] .side-row.change > .scode:last-of-type .chg { background
 .vb-ch.production { background: var(--err-bg); color: var(--err-fg); }
 .vb-ch.archive { background: var(--badge-bg); color: var(--muted); }
 .vb-status { font-size: 10px; color: var(--muted); }
-.vb-status.running { color: var(--green); }
-.vb-status.paused { color: var(--amber); }
 .vb-status.error { color: var(--red); }
 .vb-del { width: 18px; height: 18px; line-height: 1; padding: 0; border: none; background: transparent; color: var(--muted); border-radius: 4px; font-size: 15px; }
 .vb-del:hover:not(:disabled) { background: var(--err-bg); color: var(--red); }

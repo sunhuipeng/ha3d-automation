@@ -7,6 +7,13 @@ function unwrap(r) {
   return r;
 }
 
+/* runningVersions 快照回填与 WS 增量的竞态防护（审计 4.10）：
+ * open/loadVersions 的整表快照在途时，WS setStatus 增量先进缓冲；快照落地后按序回放，
+ * 避免启动/停止瞬间"晚到的快照"覆盖刚写入的实例行（徽标与按钮短暂错乱）。
+ * 深度计数支持嵌套（open 内部又调 loadVersions）；回放复用 setStatus 保证口径一致。 */
+let rvFetchDepth = 0;
+const rvBuffer = [];
+
 export const useScriptStore = defineStore('scripts', {
   state: () => ({
     list: [],
@@ -15,7 +22,7 @@ export const useScriptStore = defineStore('scripts', {
     shadowVersion: null,
     productionVersion: null,
     runningVersions: [], // 实例真正在跑的列表 [{version, mode}]：正式与影子可各有一个（运行态唯一真相源）
-    logs: [],
+    logs: [],            // 当前版本的运行日志（loadLogs 整表 + WS pushLog 增量）
     logsSource: 'real',  // 'real' = v<n>.log；'sim' = v<n>.sim.log（仿真实例运行时）
     logsCursor: null,    // { ts, ord } 已加载最早一条的游标（同一毫秒内的序号），null = 没有更早
     logsHasMore: false,  // 日志文件里是否还有比游标更早的行
@@ -24,11 +31,16 @@ export const useScriptStore = defineStore('scripts', {
     nodeStates: {},      // nodeId -> state（运行时投影，不写回 flow.json）
   }),
   getters: {
+    /* 当前打开版本的运行实例（正式/影子各至多一个，按版本号锁定）。
+     * App.vue 与 currentVerifyMode 同源派生，版本锁定规则只此一处（审计 2.5）。 */
+    currentInstance(state) {
+      if (!state.current) return null;
+      return state.runningVersions.find((x) => x.version === state.current.version) || null;
+    },
     /* 当前打开版本实例的验证方式：'follow' | 'simulate'，无实例为 null。
      * runningVersions 仍是唯一真相源，verifyMode 只是实例上的一个属性。 */
     currentVerifyMode(state) {
-      if (!state.current) return null;
-      const row = state.runningVersions.find((x) => x.version === state.current.version);
+      const row = this.currentInstance;
       return row ? (row.verifyMode || 'follow') : null;
     },
   },
@@ -38,31 +50,49 @@ export const useScriptStore = defineStore('scripts', {
     },
     async open(id, version) {
       const q = version ? `?version=${version}` : '';
-      this.current = await fetch(`/api/script/${id}${q}`).then((r) => r.json());
-      /* 换脚本必须清空节点运行状态投影：nodeStates 按 nodeId（n_start 等）键控，
-       * 不清会把上一个脚本的运行痕迹画到新脚本流程图上 */
-      this.nodeStates = {};
-      /* 用详情的运行态真相回填左侧列表徽标，防止列表残留旧状态。
-       * 必须用 scriptStatus（脚本级口径）：status 是版本级（当前打开版本的徽章），
-       * 影子版本 stopped 会把脚本级 error 遮蔽掉。 */
-      /* 先回填 runningVersions，后续选日志源（real/sim）依赖它 */
-      this.runningVersions = this.current.runningVersions || [];
-      const item = this.list.find((x) => x.id === id);
-      if (item) {
-        item.status = this.current.scriptStatus || this.current.status || 'stopped';
-        item.runningVersions = this.current.runningVersions || [];
+      rvFetchDepth += 1; // 快照在途：WS 状态增量进缓冲（审计 4.10）
+      try {
+        this.current = await fetch(`/api/script/${id}${q}`).then((r) => r.json());
+        /* 换脚本必须清空节点运行状态投影：nodeStates 按 nodeId（n_start 等）键控，
+         * 不清会把上一个脚本的运行痕迹画到新脚本流程图上 */
+        this.nodeStates = {};
+        /* 用详情的运行态真相回填左侧列表徽标，防止列表残留旧状态。
+         * 必须用 scriptStatus（脚本级口径）：status 是版本级（当前打开版本的徽章），
+         * 影子版本 stopped 会把脚本级 error 遮蔽掉。 */
+        /* 先回填 runningVersions，后续选日志源（real/sim）依赖它 */
+        this.runningVersions = this.current.runningVersions || [];
+        const item = this.list.find((x) => x.id === id);
+        if (item) {
+          item.status = this.current.scriptStatus || this.current.status || 'stopped';
+          item.runningVersions = this.current.runningVersions || [];
+        }
+        await Promise.all([this.loadLogs(id, this.current.version, 100, this.logsSourceForCurrent()), this.loadVersions(id)]);
+        /* API 的 running = 该脚本任一实例在跑；这里收敛为"当前打开版本是否有实例"（与头部按钮对应） */
+        this.syncRunning();
+      } finally {
+        rvFetchDepth -= 1;
+        if (rvFetchDepth === 0) {
+          const buffered = rvBuffer.splice(0);
+          for (const e of buffered) this.setStatus(e.status, e.version, e.mode, e.verifyMode);
+        }
       }
-      await Promise.all([this.loadLogs(id, this.current.version, 100, this.logsSourceForCurrent()), this.loadVersions(id)]);
-      /* API 的 running = 该脚本任一实例在跑；这里收敛为"当前打开版本是否有实例"（与头部按钮对应） */
-      this.syncRunning();
     },
     async loadVersions(id) {
       if (!id) return;
-      const r = await fetch(`/api/script/${id}/versions`).then((x) => x.json());
-      this.versions = r.versions || [];
-      this.shadowVersion = r.shadowVersion;
-      this.productionVersion = r.productionVersion;
-      this.runningVersions = r.runningVersions || [];
+      rvFetchDepth += 1; // 独立调用也走防护（open 内嵌套时计数为 2，快照落地不回放）
+      try {
+        const r = await fetch(`/api/script/${id}/versions`).then((x) => x.json());
+        this.versions = r.versions || [];
+        this.shadowVersion = r.shadowVersion;
+        this.productionVersion = r.productionVersion;
+        this.runningVersions = r.runningVersions || [];
+      } finally {
+        rvFetchDepth -= 1;
+        if (rvFetchDepth === 0) {
+          const buffered = rvBuffer.splice(0);
+          for (const e of buffered) this.setStatus(e.status, e.version, e.mode, e.verifyMode);
+        }
+      }
     },
     /* 打开脚本面板只拉最近 100 行（后端仍支持 ?limit= 覆盖）；实时日志由 WS 增量追加。
      * source='sim' 读仿真独立日志（v<n>.sim.log）——仿真实例运行时不该给用户看真实日志，
@@ -150,7 +180,7 @@ export const useScriptStore = defineStore('scripts', {
       await fetch(`/api/script/${id}/stop`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(version ? { version } : {}),
-      });
+      }).then((x) => x.json()).then(unwrap); // 审计 4.4：唯一漏走 unwrap 的写操作，服务端 {error} 曾被静默吞掉
       await this.syncStatus(id);
     },
     /* 发布影子版本为正式版本（真实下发），旧正式自动归档 */
@@ -213,7 +243,10 @@ export const useScriptStore = defineStore('scripts', {
     setStatus(status, version, mode, verifyMode) {
       if (!this.current) return;
       /* 切换空窗：暂停旧实例会先广播 stopped，随后才 running。保留下发起始的 switching，
-       * 否则用户会看到「切换中 → 已停止 → 运行中」的假崩溃闪动。 */
+       * 否则用户会看到「切换中 → 已停止 → 运行中」的假崩溃闪动。
+       * 审计 4.9 复核：switchVerifyMode 的所有失败路径都会补发 running（回滚成功）
+       * 或 error（回滚也失败）广播，stopped 事件之后必有后续事件，
+       * "永久卡切换中"不可达（WS 断线漏事件是通用问题，不在此处理）。保持原设计。 */
       if (status === 'stopped' && this.current.status === 'switching') return;
       const live = status === 'running' || status === 'paused' || status === 'switching';
       const v = version || this.current.version;
