@@ -36,6 +36,11 @@ function entityLabel(id) {
   return entityLabels.value[eid]?.label || eid;
 }
 
+/* global 键的写者角标（接口按 production 写者表推导，展示层 join）：无写者返回 null 不显示 */
+function contextWriter(entry) {
+  return data.value?.topology?.[mode.value]?.contextWriters?.[entry] || null;
+}
+
 let timer = null;
 let seq = 0;
 let pendingId = null;
@@ -164,7 +169,7 @@ watch(() => store.current?.id, () => {
             <div class="tb-head"><span class="tb-dot ctx-read"></span>读取上下文（get / watch）<span class="tb-count">{{ group.contextReads?.length || 0 }}</span></div>
             <div v-if="group.contextReads?.length" class="tb-items">
               <code v-for="c in group.contextReads" :key="c" class="tb-item ctx-read"
-                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode })" @mousemove="move" @mouseleave="hide">{{ c }}</code>
+                @mouseenter="open($event, { kind: 'context', id: c, scriptId: store.current?.id, mode: mode })" @mousemove="move" @mouseleave="hide">{{ c }}<span v-if="contextWriter(c)" class="tb-writer" :title="'事实来源（单写者）' + (scriptNames[contextWriter(c)] || contextWriter(c))">← {{ scriptNames[contextWriter(c)] || contextWriter(c) }}</span></code>
             </div>
             <div v-else class="tb-empty">暂无观测</div>
           </div>
@@ -195,7 +200,7 @@ watch(() => store.current?.id, () => {
             <div v-else class="tb-empty">暂无观测</div>
           </div>
           <div class="tb-section">
-            <div class="tb-head"><span class="tb-dot dep"></span>依赖脚本状态（status / require / watch）<span class="tb-count">{{ group.taskDeps?.length || 0 }}</span></div>
+            <div class="tb-head"><span class="tb-dot dep"></span>依赖脚本状态（status / require）<span class="tb-count">{{ group.taskDeps?.length || 0 }}</span></div>
             <div v-if="group.taskDeps?.length" class="tb-items">
               <code v-for="t in group.taskDeps" :key="t" class="tb-item dep">{{ scriptNames[t] || t }}</code>
             </div>
@@ -253,6 +258,8 @@ watch(() => store.current?.id, () => {
 .tb-item.call { color: #D97706; }
 .tb-dot.dep { background: #0E9F9F; }
 .tb-item.dep { color: #0E9F9F; }
+/* global 键 chip 的写者角标：弱化配色附在键名后，说明该键的事实来源脚本 */
+.tb-writer { margin-left: 6px; padding-left: 6px; border-left: 1px solid var(--line); color: var(--hint); font-weight: 400; }
 .tb-services { margin-top: 6px; font-size: 11px; color: var(--hint); display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .tb-svc { font-size: 11px; color: var(--muted); }
 .tb-empty { font-size: 12px; color: var(--hint); padding: 4px 0; }

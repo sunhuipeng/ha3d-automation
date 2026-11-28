@@ -25,11 +25,24 @@ function scriptNamesMap() {
   return Object.fromEntries(store.list().map((s) => [String(s.id), s.name || String(s.id)]));
 }
 
+/* 读取上下文键的写者映射（chip 角标用）：'global.<key>' -> 写者脚本 id；无写者为 null。
+ * 单写者约定下写者即事实源；读侧不隔离（get/watch 只收 production 派发），一律查
+ * production 写者。展示层 join，不进观测存储；写者尚未盖章（存量键未重写）时为 null。 */
+function contextWritersFor(group) {
+  const map = {};
+  for (const entry of group.contextReads || []) {
+    if (!String(entry).startsWith('global.')) continue;
+    map[entry] = context.writerOf(String(entry).slice('global.'.length), false);
+  }
+  return map;
+}
+
 function topologyForDisplay(sid) {
   const result = topology.get(sid);
   const ids = new Set();
   for (const group of Object.values(result.topology || {})) {
     for (const id of [...(group.reads || []), ...(group.writes || [])]) ids.add(String(id));
+    group.contextWriters = contextWritersFor(group); // chip 角标：键 -> 写者
   }
   return { ...result, entityLabels: entityLabelsFor(ids), scriptNames: scriptNamesMap() };
 }
