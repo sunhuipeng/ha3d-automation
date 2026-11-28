@@ -40,7 +40,7 @@ function powerScript(op = 'setFlag') {
         await ctx.global.set('avoiding', true);
       }
     });
-    ctx.watch('sensor.power', async (n) => { h.value = Number(n && n.state) || 0; });
+    ctx.watch('sensor.power', async (n) => { h.value = Number(n && n.state) || 0; }, { debounceMs: 0 }); // 验 hold 精确计时，关缺省防抖
     await ctx.keepAlive();
   `;
 }

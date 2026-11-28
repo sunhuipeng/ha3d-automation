@@ -66,6 +66,7 @@ function createCore({ emit, clock }) {
   const writerDebounce = new Map(); // 写者失效防抖：key -> timer（持续 debounceMs 仍非 running 才上报）
   const globalDebounceMs = new Map(); // key -> 防抖时长（首次注册的 opts 定格，默认 5000）
   const localSubs = new Map();     // ctx.local.watch：key -> Set<cb>（脚本私有桶，runner 内闭环，无 IPC 订阅）
+  const entityDebounce = new Map(); // ctx.watch 实体防抖：cb -> { timer, state, prev, eids, count }（同一次注册的多个实体合并进同一窗口）
   const localReplay = new Map();   // ctx.local.watch 默认回放：cb -> key（真实事件先到则丢弃回放值）
   const timers = new Map();        // ctx.after 定时器：id -> timeout（stop 时统一清理）
   const intervals = new Set();     // sandbox.setInterval 建立的循环定时器（stop 时统一 clear）
@@ -572,10 +573,43 @@ function createCore({ emit, clock }) {
 
     /* 批量订阅实体变化（转发 ctx.ha.change，签名一致）。
      * ctx.watch 只管 HA 实体；依赖脚本的查/等统一在 ctx.task.*（status/require，
-     * task.watch 已删除，见上方注释）。 */
-    ctx.watch = (entityIds, cb) => {
-      const list = Array.isArray(entityIds) ? entityIds : [entityIds];
-      for (const eid of list) if (eid) ctx.ha.change(eid, cb);
+     * task.watch 已删除，见上方注释）。
+     * opts = { debounceMs? }：**尾沿防抖合并**——HA 一波推送里多个被订阅实体先后变化
+     *   （如 water_heater 本体 + 从其属性解析的模板温度传感器各发一次 state_changed），
+     *   回调只触发一次，等静默 debounceMs 后取**最后一个事件**的状态对象回调；
+     *   第三个参数 info = { merged, entityIds }（窗口内合并的事件数 / 去重后的实体 id）。
+     *   防抖计时走受控定时器（仿真 advance 可推动、stop 统一清理）。
+     * 缺省 300ms（用户 2026-11-28 拍板写死默认），`{ debounceMs: 0 }` 关闭回到逐事件回调。
+     * 注意：合并场景下 (state, prev) 是最后一个事件的前后值，要完整现状请在回调里自己拉。 */
+    ctx.watch = (entityIds, cb, opts = {}) => {
+      if (typeof cb !== 'function') throw new Error('ctx.watch 需要回调函数');
+      const list = (Array.isArray(entityIds) ? entityIds : [entityIds])
+        .map((x) => String(x == null ? '' : x)).filter(Boolean);
+      if (!list.length) throw new Error('ctx.watch 需要至少一个实体 id');
+      const rawMs = Number(opts && opts.debounceMs);
+      const debounceMs = opts && opts.debounceMs != null && Number.isFinite(rawMs) && rawMs > 0 ? rawMs : (opts && opts.debounceMs != null ? 0 : 300);
+      if (!debounceMs) {
+        for (const eid of list) ctx.ha.change(eid, cb);
+        return;
+      }
+      const pend = { timer: null, state: null, prev: null, eids: new Set(), count: 0 };
+      entityDebounce.set(cb, pend);
+      const wrapped = (state, prev, eid) => {
+        if (ctxRuntime.stopped) return;
+        pend.state = state;
+        pend.prev = prev;
+        pend.eids.add(String(eid || ''));
+        pend.count += 1;
+        if (pend.timer) return; // 窗口已开：只吸收最新事件，计时不到点不回调
+        pend.timer = clk.setTimeout(() => {
+          pend.timer = null;
+          const info = { merged: pend.count, entityIds: [...pend.eids] };
+          pend.count = 0;
+          pend.eids.clear();
+          guardedCall(cb, [pend.state, pend.prev, info]);
+        }, debounceMs);
+      };
+      for (const eid of list) ctx.ha.change(eid, wrapped);
     };
 
     /* 时间工具：sod = 当日秒数，与 HA input_datetime 的 timestamp 属性同口径 */
@@ -757,10 +791,11 @@ function createCore({ emit, clock }) {
     if (ctxRuntime.stopped) return;
     const key = String(eid || '');
     const cbs = subscriptions.get(key) || [];
-    /* 回调签名固定为 (nextObj, prevObj) 完整状态对象，与 ctx.ha.state() 返回字符串不同（契约 §6）。
+    /* 回调签名固定为 (nextObj, prevObj, entityId)：前两个是完整状态对象（与 ctx.ha.state()
+     * 返回字符串不同，契约 §6），第三个是触发实体 id——防抖合并场景下脚本可据此区分来源。
      * 脚本若要字符串需自行取 s.state，避免误用 s === 'on' 静默失效。
      * guardedCall：同步死循环被 V8 timeout 中断（inline 模式防主进程被卡死的关键）。 */
-    for (const cb of cbs) guardedCall(cb, [state, prev]);
+    for (const cb of cbs) guardedCall(cb, [state, prev, key]);
   }
 
   /* ctx.local 的外部写入事件（仿真 inject_context scope=local 经 world.dispatch 回送）：
@@ -885,6 +920,8 @@ function createCore({ emit, clock }) {
     writerDebounce.clear();
     globalWriter.clear();
     globalDebounceMs.clear();
+    for (const p of entityDebounce.values()) if (p.timer) clk.clearTimeout(p.timer);
+    entityDebounce.clear();
     for (const t of timers.values()) clk.clearTimeout(t); // 审计 4.2：sim 定时器句柄是自增数字，全局 clear 清不掉
     timers.clear();
     for (const id of intervals) clk.clearInterval(id);

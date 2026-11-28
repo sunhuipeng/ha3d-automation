@@ -38,7 +38,7 @@ const POWER_SCRIPT = `
       await ctx.global.set('avoiding', false);
     }
   });
-  ctx.watch('sensor.power', async (next) => { h.value = Number(next && next.state) || 0; });
+  ctx.watch('sensor.power', async (next) => { h.value = Number(next && next.state) || 0; }, { debounceMs: 0 }); // 验 hold 精确计时，关缺省防抖
   await ctx.keepAlive();
 `;
 

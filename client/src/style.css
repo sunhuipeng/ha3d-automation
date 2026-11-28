@@ -128,6 +128,7 @@ button { cursor: pointer; font-family: inherit; font-size: inherit; }
 .code { width: 100%; background: var(--code-bg); border: 1px solid var(--line); color: var(--code-fg); padding: 10px; border-radius: 6px; font-family: 'SF Mono', Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
 .dl-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 8px; }
 .dl-link { background: none; border: none; color: var(--accent); font-size: 12px; cursor: pointer; padding: 0; text-decoration: underline; }
+.dl-sep { color: var(--hint); font-size: 12px; }
 .dl-link:disabled { opacity: .6; cursor: wait; }
 .dl-hint { color: var(--hint); font-size: 12px; }
 .tip { color: var(--muted); font-size: 12px; margin: 0 0 8px; line-height: 1.6; }

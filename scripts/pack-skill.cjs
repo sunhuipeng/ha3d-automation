@@ -31,7 +31,7 @@ const METHOD_DEFLATE = 8;
 const VERSION_NEEDED = 20;          // 2.0：deflate / 目录条目都够用
 const VERSION_MADE_BY = 0x0314;     // (3=Unix) << 8 | 20，让 unzip 认 externalAttrs 的 unix 权限位
 
-const SKIP_NAMES = new Set(['.cache', '.fixtures', '.scripts', '.work', '.notes', '.git', '.DS_Store']);
+const SKIP_NAMES = new Set(['.cache', '.fixtures', '.scripts', '.work', '.git', '.DS_Store']);
 
 /* ---------- crc32 ---------- */
 const CRC_TABLE = (() => {

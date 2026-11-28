@@ -219,6 +219,7 @@ node skill/tools/case.cjs push <id>/<name> --run-fixture      # 走服务端 sim
 | `ctx.task.require` | **完全可验证**：轮询定时器走虚拟时钟（只有 `advance` 才走），靠反复 `taskStatus` 轮询推进 | ✅ `inject_task {state:'running'}` 验放行；不注入 + `advance` 推过 timeout 验超时抛错/降级（timeout 是虚拟时间） |
 | `ctx.global.watch` | **注册回放读虚拟桶**：仿真宿主 `contextGet` 无值返回 undefined → 桶无值不回放，与真实口径一致；回放值与 `inject_context` 派发的事件共用同一回调（`info.source='replay'` 可区分）。**写者状态折叠可验**：`inject_context` 带 `writer` 盖章后，`inject_task` 改写者状态即派发 `contextWriterState`，防抖走虚拟时钟（`advance` 可推动）；seed 预置的 global 键**无写者**，要验写者失效必须先 `inject_context` 盖章（`sim_run_steps` 的 `inject_context` 同样支持 `writer` 字段；脚本注册早于盖章步骤时，首个带 `writerSid` 的值事件会补建写者缓存，down 防抖仍可验） | ✅ 基线裁决 + 值通知 + 写者失效/恢复全链路 |
 | `ctx.local.watch` | **注册回放读虚拟 local 桶**：`inject_context scope=local`（缺省）会 dispatch `contextChange` 进回调（`info.source='set'`，回放为 `'replay'`）；脚本内 `ctx.local.set` 同样触发。仿真注入是 local 唯一外部写入源，不派发就验不到 | ✅ 私有持久化状态驱动重评、回放 vs 注入区分 |
+| `ctx.watch`（实体订阅） | `inject_entity` 直接触发订阅回调；**缺省 300ms 尾沿防抖走虚拟时钟**——同批多条 `inject_entity` 要在**最后一条之后 `advance ≥300ms`** 才见回调（合并 `info={merged, entityIds}`）；`debounceMs:0` 时逐条立即回调（`extra`=实体 id）。要验"同波合并"就连注两条 + `advance 300`；要验"两条独立回调"就在两条之间 `advance ≥300` | ✅ 同波合并 / 独立触发 / 尾沿值三种路径 |
 | `ctx.ref` | 纯脚本进程内机制，与虚拟时钟无关，仿真下语义不变（同值静默、结构比较、`immediate` 回放） | ✅ 可直接验赋值通知行为 |
 | `ctx.gate` | 纯脚本进程内机制，与虚拟时钟无关，仿真下语义不变（忙合并、只保留最后一次） | ✅ 可直接验合并行为 |
 

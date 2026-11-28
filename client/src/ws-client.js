@@ -57,7 +57,9 @@ function onMcpEvent(msg) {
 
 function onScriptEvent(msg) {
   const s = useScriptStore();
-  if (msg.event === 'log' && s.current && msg.scriptId === s.current.id) {
+  /* 日志按 (scriptId, version) 双重过滤：同脚本的正式与影子实例同时在跑、各自广播，
+   * 只按 scriptId 过滤会把另一版本的日志串进当前面板（v3 正式串台 v4 影子的根因）。 */
+  if (msg.event === 'log' && s.current && msg.scriptId === s.current.id && msg.version === s.current.version) {
     if (msg.nodeId) s.nodeStates[msg.nodeId] = msg.level === 'error' ? 'error' : (s.nodeStates[msg.nodeId] || 'ok');
     s.pushLog(msg);
   }

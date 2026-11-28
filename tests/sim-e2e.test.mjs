@@ -46,7 +46,7 @@ const POWER_SCRIPT = `
   });
   ctx.watch('sensor.power', async (next) => {
     h.value = Number(next && next.state) || 0;
-  });
+  }, { debounceMs: 0 }); // 本用例验证 hold 精确计时，关闭 watch 缺省 300ms 防抖
   await ctx.keepAlive();
 `;
 
@@ -186,6 +186,7 @@ test('仿真 E2E：日志写入独立文件 v<n>.sim.log，不落版本日志', 
   }
   assert.ok(lines.length > 0, '仿真日志文件应有内容');
   const parsed = lines.map((l) => JSON.parse(l));
+  if (!parsed.some((l) => /满足计时/.test(l.message))) console.error('[DEBUG] 文件实际内容:', JSON.stringify(parsed.map((l) => l.message), null, 1));
   assert.ok(parsed.some((l) => /满足计时/.test(l.message)), '应含 hold 满足计时日志');
   assert.equal(typeof parsed[0].at, 'number', '日志应带虚拟时刻 at');
 

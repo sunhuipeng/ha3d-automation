@@ -82,6 +82,8 @@ onBeforeUnmount(() => clearTimeout(timer));
         <template v-else>
           <div class="dl-row">
             <button class="dl-link" :disabled="dlBusy" @click="downloadSkill">下载 skill 压缩包</button>
+            <span class="dl-sep">·</span>
+            <a class="dl-link" href="/skill-flow.html" target="_blank" title="skill/SKILL.md 开发流程的可视化速览（静态页，新标签打开）">开发流程可视化</a>
             <span v-if="dlBusy" class="dl-hint">正在下载…</span>
           </div>
           <div v-if="dlErr" class="err">{{ dlErr }}</div>

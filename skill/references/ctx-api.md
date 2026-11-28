@@ -153,7 +153,7 @@ if (!hasSeed) await ctx.global.set(GLOBAL_KEY, false);  // ❌ 全局键已有�
 | `ctx.global.watch(key, cb, opts?)` | **是**（桶有值时） | `(value, null, info)`，`info.source='replay'`、`info.writerSid`=存储写者 | 桶无值不回放；真实事件先到丢弃回放值；写者状态事件 `info.type='writerState'` 走同一回调 |
 | `ctx.local.watch(key, cb)` | **是**（桶有值时） | `(value, null, info)`，`info.source='replay'` | 脚本私有桶、runner 内闭环；同值 `set` 不触发；无写者章/健康防抖 |
 | `ctx.ref(v).watch(cb, opts?)` | **否**（`{immediate:true}` 可开） | `(value, null, info)`，`info.source='replay'` | 初始值在创建处已知；要"先跑一遍"直接读 `a.value` 或开 immediate |
-| `ctx.watch(entityIds, cb)`（实体订阅） | **否** | `(nextObj, prevObj)` | 只在实体变化时触发；启动基线自己 `ctx.ha.state/entity` 拉 |
+| `ctx.watch(entityIds, cb, opts?)`（实体订阅） | **否** | `(nextObj, prevObj, extra)` | 只在实体变化时触发；启动基线自己 `ctx.ha.state/entity` 拉；**缺省 300ms 尾沿防抖合并**（同波多实体只回调一次，`extra={merged, entityIds}`；`debounceMs:0` 逐事件，`extra`=实体 id） |
 | `ctx.hold` 的 watch 回调 | **否** | `(satisfied, prev, info)` | 只在状态切换时通知；初始态由 `initial` 决定 |
 
 统一心智：**global/local.watch 注册即知道"现在是什么"**；实体订阅与 hold 只报"变化"，基线自己拉；ref 私有值初始态天然已知。三者都遵守"真实事件先到则丢弃在途回放值"。
@@ -205,13 +205,32 @@ if (ctx.invalid(await ctx.ha.state(ID.wh))) return; // 断线保守分支
 | 动作互斥/冷却冲突 | `{ skipped:true, reason:冲突原因, ... }` |
 | HA 下发失败（断线/超时） | `{ skipped:true, reason:'HA 下发失败', error, ... }` |
 
-### 2.3 实体订阅（批量）
+### 2.3 实体订阅（批量，内置防抖合并）
 
 | 接口 | 参数 | 返回值 |
 |---|---|---|
-| `ctx.watch(entityIds, cb)` | `entityIds`: 单个 id 或 id 数组；`cb`: `(nextObj, prevObj)` | **无返回值**（内部转发 `ctx.ha.change`；框架注册不回放，启动基线自己拉） |
+| `ctx.watch(entityIds, cb, opts?)` | `entityIds`: 单个 id 或 id 数组；`cb`: `(nextObj, prevObj, extra)`；`opts.debounceMs` | **无返回值**（内部转发 `ctx.ha.change`；框架注册不回放，启动基线自己拉） |
 
-**案例**：`ctx.watch([ID.temp, ID.kw, ID.wh], () => requestEvaluate('实体推送'));`
+**防抖合并（2026-11-28 下沉框架）**：`opts.debounceMs` **缺省 300**，`0` 关闭回逐事件回调。语义是**尾沿防抖**：窗口由第一个事件开启，窗口内的后续事件只吸收（更新待发状态、计数、实体集合），**300ms 静默后回调一次**；窗口关闭后的新事件开新窗口。场景：HA 模板实体与本体同波各发一次 `state_changed`（如 water_heater 属性变化 + 模板温度传感器重算）、一秒内多个实体同时刷新——旧行为是逐事件回调导致重复评估/日志刷屏，现在同批变化天然合并为一次。
+
+回调第三参 `extra`：
+
+- **防抖开启（缺省）**：`info = { merged, entityIds }`——窗口内合并的事件数、去重后的触发实体 id 列表；
+- **`debounceMs: 0`**：逐事件回调，`extra` 为触发实体 id 字符串（与 `ctx.ha.change` 直订同款）。
+
+**合并时 `(nextObj, prevObj)` 是最后一个事件的前后值**（不同实体的 prev 拼在一起无意义），要完整现状请在回调里自己拉。防抖计时走受控定时器：仿真 `advance` 可推动、stop 自动清理。
+
+**案例**：
+
+```js
+// 同波多实体推送合并为一次评估（缺省 300ms）
+ctx.watch([ID.temp, ID.kw, ID.wh], () => requestEvaluate('实体推送'));
+
+// 想知道这波是谁触发的
+ctx.watch([ID.temp, ID.wh], (s, p, info) => {
+  ctx.log('info', `变化来源 ${info.entityIds.join(',')}（合并 ${info.merged} 条）`);
+});
+```
 
 ---
 

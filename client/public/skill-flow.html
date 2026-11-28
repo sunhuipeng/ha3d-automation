@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ha3d-automation · 脚本开发流程</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --surface2: #eef2f7; --line: #dde4ec;
+    --text: #1e2a38; --muted: #5d6e80; --hint: #8494a6;
+    --accent: #0e8f8c; --accent2: #2563eb; --warn: #b45309; --bad: #c2410c; --ok: #15803d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.65 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 64px; }
+  header.hero { margin-bottom: 8px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  h2 { font-size: 16px; margin: 36px 0 6px; display: flex; align-items: center; gap: 8px; }
+  h2::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+  .desc { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .card svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  td code, .sub code { background: var(--surface2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; font-size: 12px; color: var(--accent2); }
+  .foot { margin-top: 40px; color: var(--hint); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>ha3d-automation · 脚本开发流程</h1>
+  <div class="sub">与 <code>skill/SKILL.md</code> 同源的可视化速览 · Agent 按 0→7 顺序执行，门禁不可跳过</div>
+</header>
+
+<h2>主流程（第 0 ~ 7 步）</h2>
+<p class="desc">两道硬门禁：第 0 步环境检查不过不写码；第 2 步流程图未经用户确认不写码。发布永远由用户确认，绝不自动。</p>
+<div class="card">
+<svg viewBox="0 0 980 566" xmlns="http://www.w3.org/2000/svg" font-family="inherit">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8494a6"/>
+    </marker>
+    <marker id="arG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#15803d"/>
+    </marker>
+  </defs>
+  <style>
+    .n { fill: var(--surface2); stroke: #b6c2d0; rx: 9; }
+    .gate { stroke: var(--bad); stroke-dasharray: 5 3; }
+    .nt { fill: var(--text); font-size: 14px; font-weight: 600; }
+    .nd { fill: var(--muted); font-size: 11.5px; }
+    .step { fill: var(--hint); font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+    .edge { stroke: #8494a6; stroke-width: 1.6; fill: none; marker-end: url(#ar); }
+    .edgeG { stroke: var(--ok); stroke-width: 1.6; fill: none; marker-end: url(#arG); }
+  </style>
+
+  <rect class="n gate" x="60" y="18" width="380" height="52" rx="9"/>
+  <text class="step" x="76" y="38">STEP 0 · 门禁</text>
+  <text class="nt" x="76" y="58">前置环境检查（health / 双实例确认 / 缓存同步）</text>
+
+  <rect class="n" x="540" y="18" width="380" height="52" rx="9"/>
+  <text class="step" x="556" y="38">STEP 1</text>
+  <text class="nt" x="556" y="58">需求合理性检查（MCP 核查实体可落地 · 多轮吸收补充）</text>
+
+  <rect class="n gate" x="60" y="112" width="380" height="52" rx="9"/>
+  <text class="step" x="76" y="132">STEP 2 · 门禁</text>
+  <text class="nt" x="76" y="152">流程图共创与确认（多轮确认后才可写码）</text>
+
+  <rect class="n" x="540" y="112" width="380" height="52" rx="9"/>
+  <text class="step" x="556" y="132">STEP 3</text>
+  <text class="nt" x="556" y="152">写脚本 script.js → 反推版本 flow.json（硬规则）</text>
+
+  <rect class="n" x="60" y="206" width="380" height="52" rx="9"/>
+  <text class="step" x="76" y="226">STEP 4</text>
+  <text class="nt" x="76" y="246">提交影子版本（影子可反复原地覆盖，版本号不变）</text>
+
+  <rect class="n" x="540" y="206" width="380" height="52" rx="9"/>
+  <text class="step" x="556" y="226">STEP 5 · 验收门禁</text>
+  <text class="nt" x="556" y="246">影子验证：先仿真 → 切回 follow → 影子真跑</text>
+
+  <rect class="n gate" x="60" y="300" width="380" height="52" rx="9"/>
+  <text class="step" x="76" y="320">STEP 6 · 用户确认</text>
+  <text class="nt" x="76" y="340">发布正式版本（绝不自动发布，必须用户点头）</text>
+
+  <rect class="n" x="540" y="300" width="380" height="52" rx="9"/>
+  <text class="step" x="556" y="320">STEP 7</text>
+  <text class="nt" x="556" y="340">收尾汇报（改动 / 验证口径 / 遗留与建议）</text>
+
+  <!-- 迭代环 -->
+  <rect class="n" x="60" y="394" width="860" height="52" rx="9"/>
+  <text class="step" x="76" y="414" fill="#b45309">迭代环</text>
+  <text class="nt" x="76" y="434">影子阶段发现任何问题：直接改脚本 → 重新提交影子（原地覆盖，改版次数 +1）→ 重启实例 → 重新走第 5 步</text>
+
+  <!-- 缓存提示 -->
+  <rect class="n" x="60" y="488" width="860" height="52" rx="9"/>
+  <text class="step" x="76" y="508" fill="#2563eb">全程约定</text>
+  <text class="nt" x="76" y="528">一切以线上 MCP 为准（http://fnos.local:8100）· 缓存 .cache 只读镜像 · fixtures 用例回归 · 文档权威在 skill/references</text>
+
+  <path class="edge" d="M440 44 C 480 44 500 44 536 44"/>
+  <path class="edge" d="M730 70 L730 96 L250 96 L250 108"/>
+  <path class="edge" d="M440 138 L536 138"/>
+  <path class="edge" d="M730 164 L730 190 L250 190 L250 202"/>
+  <path class="edge" d="M440 232 L536 232"/>
+  <path class="edge" d="M730 258 L730 284 L250 284 L250 296"/>
+  <path class="edgeG" d="M440 326 L536 326"/>
+  <path class="edge" d="M730 352 L730 390"/>
+  <path class="edge" d="M250 446 L250 484" stroke-dasharray="4 4"/>
+</svg>
+</div>
+<div class="legend">
+  <span><i style="background:transparent;border:1px dashed #c2410c"></i>门禁 / 用户确认点</span>
+  <span><i style="background:#15803d"></i>进入发布（绿色 = 用户已放行）</span>
+  <span><i style="background:#b45309"></i>迭代环（影子期反复覆盖）</span>
+</div>
+
+<h2>第 1 步细分：需求合理性检查</h2>
+<p class="desc">先梳理、再初判、后决策——动手写码之前完成全部六小节。</p>
+<div class="card">
+<svg viewBox="0 0 980 300" xmlns="http://www.w3.org/2000/svg" font-family="inherit">
+  <rect class="n" x="24" y="30" width="200" height="64" rx="9"/>
+  <text class="step" x="38" y="50">1.1</text>
+  <text class="nt" x="38" y="70">需求梳理</text>
+  <text class="nd" x="38" y="86">散装表述 → 结构化目标</text>
+
+  <rect class="n" x="268" y="30" width="200" height="64" rx="9"/>
+  <text class="step" x="282" y="50">1.2</text>
+  <text class="nt" x="282" y="70">可行性初判</text>
+  <text class="nd" x="282" y="86">平台能力边界内？</text>
+
+  <rect class="n" x="512" y="30" width="200" height="64" rx="9"/>
+  <text class="step" x="526" y="50">1.3</text>
+  <text class="nt" x="526" y="70">落三要素</text>
+  <text class="nd" x="526" y="86">对象 / 动作 / 判据</text>
+
+  <rect class="n" x="756" y="30" width="200" height="64" rx="9"/>
+  <text class="step" x="770" y="50">1.4</text>
+  <text class="nt" x="770" y="70">与已有脚本比对</text>
+  <text class="nd" x="770" y="86">读 .cache，不凭印象</text>
+
+  <!-- 1.5 三选一（分支扇出）→ 1.6 实体核对 → 进入第 2 步 -->
+  <rect class="n" x="40" y="150" width="170" height="56" rx="9"/>
+  <text class="step" x="54" y="170">1.5</text>
+  <text class="nt" x="54" y="190">三选一决策</text>
+
+  <rect class="n" x="330" y="106" width="150" height="44" rx="9"/>
+  <text class="nt" x="405" y="128" text-anchor="middle">扩展现有</text>
+  <text class="nd" x="405" y="143" text-anchor="middle">加判据 / 分支</text>
+  <rect class="n" x="330" y="166" width="150" height="44" rx="9"/>
+  <text class="nt" x="405" y="188" text-anchor="middle">合并</text>
+  <text class="nd" x="405" y="203" text-anchor="middle">收编散装脚本</text>
+  <rect class="n" x="330" y="226" width="150" height="44" rx="9"/>
+  <text class="nt" x="405" y="248" text-anchor="middle">新建</text>
+  <text class="nd" x="405" y="263" text-anchor="middle">独立职责</text>
+
+  <rect class="n" x="600" y="166" width="170" height="56" rx="9"/>
+  <text class="step" x="614" y="184">1.6</text>
+  <text class="nt" x="614" y="202">实体核对</text>
+  <text class="nd" x="614" y="217">MCP 拉状态 / 历史</text>
+
+  <rect class="n" x="810" y="166" width="146" height="56" rx="9" style="stroke:#15803d"/>
+  <text class="nt" x="883" y="200" text-anchor="middle" fill="#15803d">进入第 2 步</text>
+
+  <path class="edge" d="M224 62 L264 62"/>
+  <path class="edge" d="M468 62 L508 62"/>
+  <path class="edge" d="M712 62 L752 62"/>
+  <path class="edge" d="M856 94 L856 285 L125 285 L125 206"/>
+  <path class="edge" d="M210 168 L260 168 C 280 168 285 128 326 128"/>
+  <path class="edge" d="M210 178 L326 188"/>
+  <path class="edge" d="M210 188 L260 188 C 280 188 285 248 326 248"/>
+  <path class="edge" d="M480 128 C 530 128 545 180 596 188"/>
+  <path class="edge" d="M480 194 L596 194"/>
+  <path class="edge" d="M480 248 C 530 248 545 210 596 202"/>
+  <path class="edgeG" d="M770 194 L806 194"/>
+</svg>
+</div>
+<div class="legend">
+  <span>1.5 三选一必须「有理有据」：为什么选它、为什么不是另外两个、代价与风险</span>
+</div>
+
+<h2>第 1 步核心能力：实体落地核查（MCP 远程访问 HA）</h2>
+<p class="desc">判据里引用的实体不凭记忆和想象写——Agent 经 MCP 工具远程拉取实体当前状态与历史记录验证可落地；不通过或口径不全时，在多轮对话中吸收用户补充，再重新核查，直到定稿。</p>
+<div class="card">
+<svg viewBox="0 0 980 236" xmlns="http://www.w3.org/2000/svg" font-family="inherit">
+  <rect class="n" x="24" y="28" width="190" height="72" rx="9"/>
+  <text class="step" x="38" y="50">核查输入</text>
+  <text class="nt" x="38" y="70">需求判据</text>
+  <text class="nd" x="38" y="88">对象 / 动作 / 阈值</text>
+
+  <rect class="n" x="258" y="28" width="230" height="72" rx="9" style="stroke:#2563eb"/>
+  <text class="step" x="272" y="50" fill="#2563eb">MCP 只读</text>
+  <text class="nt" x="272" y="70">远程访问 HA</text>
+  <text class="nd" x="272" y="88">实体当前状态 · 实体历史记录</text>
+
+  <rect class="n" x="532" y="28" width="220" height="72" rx="9"/>
+  <text class="step" x="546" y="50">落地校验</text>
+  <text class="nt" x="546" y="70">可落地判定</text>
+  <text class="nd" x="546" y="88">存在性 / 单位量程 / 历史支撑</text>
+
+  <rect class="n" x="796" y="28" width="160" height="72" rx="9" style="stroke:#15803d"/>
+  <text class="nt" x="876" y="58" text-anchor="middle" fill="#15803d">判据定稿</text>
+  <text class="nd" x="876" y="78" text-anchor="middle">进入第 2 步共创确认</text>
+
+  <rect class="n" x="532" y="152" width="220" height="52" rx="9" style="stroke:#b45309"/>
+  <text class="nt" x="546" y="174">不可落地 / 有疑问</text>
+  <text class="nd" x="546" y="192">拿证据向用户澄清</text>
+
+  <rect class="n" x="258" y="152" width="230" height="52" rx="9"/>
+  <text class="step" x="272" y="170">多轮对话</text>
+  <text class="nt" x="272" y="190">用户补充</text>
+  <text class="nd" x="272" y="206">新实体 / 阈值 / 特殊时段</text>
+
+  <path class="edge" d="M214 64 L254 64"/>
+  <path class="edge" d="M488 64 L528 64"/>
+  <path class="edgeG" d="M752 64 L792 64"/>
+  <path class="edge" d="M642 100 L642 148" style="stroke:#b45309" stroke-dasharray="4 4"/>
+  <path class="edge" d="M528 178 L492 178"/>
+  <path class="edge" d="M254 178 L120 178 L120 104" stroke-dasharray="4 4"/>
+
+  <text class="nd" x="654" y="130" fill="#b45309">校验不通过</text>
+  <text class="nd" x="150" y="170" text-anchor="middle">补充并入判据</text>
+</svg>
+</div>
+<div class="legend">
+  <span><i style="background:transparent;border:1px solid #2563eb"></i>远程只读查询（只拉状态与历史，不写 HA）</span>
+  <span><i style="background:transparent;border:1px dashed #b45309"></i>澄清回路：用户多轮补充 → 并入判据 → 重新核查</span>
+  <span><i style="background:#15803d"></i>定稿后仍要过第 2 步流程图确认门禁</span>
+</div>
+
+<h2>第 5 步细分：影子验证链（验收门禁）</h2>
+<p class="desc">仿真只验证流程 / 时序 / 写意图，结果不能直接当上线依据；三段走完才有资格进入第 6 步。</p>
+<div class="card">
+<svg viewBox="0 0 980 170" xmlns="http://www.w3.org/2000/svg" font-family="inherit">
+  <rect class="n" x="24" y="30" width="270" height="72" rx="9"/>
+  <text class="step" x="38" y="52">5.1</text>
+  <text class="nt" x="38" y="72">仿真 simulate</text>
+  <text class="nd" x="38" y="90">虚拟实体 / 虚拟时钟；fixtures 用例回归</text>
+
+  <rect class="n" x="360" y="30" width="230" height="72" rx="9"/>
+  <text class="step" x="374" y="52">5.2</text>
+  <text class="nt" x="374" y="72">切回影子 follow</text>
+  <text class="nd" x="374" y="90">case.cjs finish · 固定收尾动作</text>
+
+  <rect class="n" x="656" y="30" width="300" height="72" rx="9"/>
+  <text class="step" x="670" y="52">5.3</text>
+  <text class="nt" x="670" y="72">影子真跑 follow</text>
+  <text class="nd" x="670" y="90">写操作只记日志不下发 · 用户看日志验收</text>
+
+  <rect class="n" x="330" y="120" width="290" height="40" rx="9" style="stroke:#15803d"/>
+  <text class="nt" x="475" y="146" text-anchor="middle" fill="#15803d">用户验证通过 → 进入第 6 步发布</text>
+
+  <path class="edge" d="M294 66 L356 66"/>
+  <path class="edge" d="M590 66 L652 66"/>
+  <path class="edgeG" d="M806 102 C 806 140 660 140 620 140"/>
+</svg>
+</div>
+<div class="legend">
+  <span><i style="background:#15803d"></i>只有用户放行才推进 · 影子硬隔离保证全程碰不到真实设备</span>
+</div>
+
+<h2>版本角色与生命周期</h2>
+<p class="desc">每版本 meta.channel 四选一；影子 / 正式各至多一个。这就是「影子可反复改、正式不可变」的机制基础。</p>
+<div class="card">
+<svg viewBox="0 0 980 190" xmlns="http://www.w3.org/2000/svg" font-family="inherit">
+  <rect class="n" x="24" y="46" width="180" height="64" rx="9"/>
+  <text class="nt" x="114" y="72" text-anchor="middle">修改稿</text>
+  <text class="nd" x="114" y="92" text-anchor="middle">script.js + flow.json</text>
+
+  <rect class="n" x="290" y="46" width="210" height="64" rx="9" style="stroke:#b45309"/>
+  <text class="nt" x="395" y="72" text-anchor="middle">影子版本 shadow</text>
+  <text class="nd" x="395" y="92" text-anchor="middle">唯一工作副本 · 原地覆盖 · 只记日志</text>
+
+  <rect class="n" x="590" y="46" width="200" height="64" rx="9" style="stroke:#15803d"/>
+  <text class="nt" x="690" y="72" text-anchor="middle">正式版本 production</text>
+  <text class="nd" x="690" y="92" text-anchor="middle">内容不可变 · 真实下发</text>
+
+  <rect class="n" x="850" y="46" width="106" height="64" rx="9"/>
+  <text class="nt" x="903" y="72" text-anchor="middle">归档 archive</text>
+  <text class="nd" x="903" y="92" text-anchor="middle">曾上线可回滚</text>
+
+  <text class="nd" x="216" y="36" text-anchor="middle">submit</text>
+  <text class="nd" x="528" y="36" text-anchor="middle">publish（用户确认）</text>
+  <text class="nd" x="820" y="36" text-anchor="middle">被替换</text>
+  <text class="nd" x="500" y="130" text-anchor="middle" fill="#b45309">影子期迭代：重新 submit 原地覆盖（版本号不变，改版次数 +1），旧影子归档</text>
+  <text class="nd" x="500" y="156" text-anchor="middle">发布动作：影子转正式（旧正式归档、dryRun=false）；删除版本走 removeVersion（运行中不可删）</text>
+
+  <path class="edge" d="M204 78 L286 78"/>
+  <path class="edgeG" d="M500 78 L586 78"/>
+  <path class="edge" d="M790 78 L846 78"/>
+</svg>
+</div>
+
+<h2>贯穿全程的硬规则</h2>
+<div class="card">
+<table>
+  <tr><th>规则</th><th>口径</th></tr>
+  <tr><td>影子硬隔离</td><td>影子实例的所有 HA 写调用被主进程拦截、只记日志；脚本绕过 <code>ctx.write</code> 也拦——两层保障缺一不可</td></tr>
+  <tr><td>绝不自动发布</td><td>正式版本必须用户验证后确认发布；「发布」= 影子转正式，旧正式自动归档</td></tr>
+  <tr><td>读不隔离 / 写隔离</td><td><code>ctx.global.get / watch / task.*</code> 统一读 production；<code>ctx.global.set</code> 按调用者通道落桶</td></tr>
+  <tr><td>单写者约定</td><td>每个 global 键只能有一个写者脚本；订阅方通过折叠通道（值 + 写者状态）感知依赖健康</td></tr>
+  <tr><td>实体现状先行</td><td>判据引用的实体一律经 MCP 工具远程拉<strong>当前状态与历史记录</strong>核对（存在性 / 单位量程 / 历史能否支撑判据），不凭记忆写实体 id；多轮对话中用户补充的口径即时并入需求，不视为推倒重来</td></tr>
+  <tr><td>存储分层</td><td>跨脚本共享 → <code>ctx.global</code>；本脚本需复原 → <code>ctx.local</code>；重启可重算 → 内存（普通变量 / <code>ctx.ref</code>）；人改人看 → HA 实体</td></tr>
+  <tr><td>版本 flow.json</td><td>由 script.js 反推画关键节点，不逐行也不笼统；它是只读投影，真相在脚本</td></tr>
+  <tr><td>仿真是临时态</td><td>5.1 存在、跑完必须 finish 切回 follow；复现靠 fixtures 用例，不靠留着会话</td></tr>
+</table>
+</div>
+
+<div class="foot">静态页 · 与 skill/SKILL.md 同源维护 · 权威口径以 SKILL.md 与 references/ 为准</div>
+</div>
+</body>
+</html>
