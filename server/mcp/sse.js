@@ -5,6 +5,8 @@ const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js'
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { buildTools } = require('./tools');
 const hub = require('../lib/ws-hub');
+/* MCP serverInfo 版本与 package.json / 镜像 tag 同源，避免硬编码漂移（历史上曾停在 0.1.0）。 */
+const PKG_VERSION = require('../../package.json').version;
 
 const sessions = new Map(); // sessionId -> { transport, server, openedAt }
 
@@ -15,7 +17,7 @@ function mountMcpSse(app, ctx) {
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
-    const server = new McpServer({ name: 'ha3d-automation', version: '0.1.0' });
+    const server = new McpServer({ name: 'ha3d-automation', version: PKG_VERSION });
     buildTools(server, ctx);
     const transport = new SSEServerTransport('/mcp/messages', res);
     sessions.set(transport.sessionId, { transport, server, openedAt: Date.now() });

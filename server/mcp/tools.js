@@ -1,5 +1,5 @@
 'use strict';
-/* MCP 工具：只读 15 个 + 受控写 8 个 + 面板控制 2 个（切换选中/刷新面板），共 25 个。
+/* MCP 工具：只读 16 个 + 受控写 8 个 + 仿真 11 个 + 面板控制 2 个（切换选中/刷新面板），共 37 个。
  * 版本模型：shadow（工作副本，可原地反复修改）→ production（不可变，真实下发）→ archive（不可变，分 published/discarded）。
  * 只读里含 5 个 HA 自动规划迁移工具（list automations / get config / list scripts / get script config / resolve entities）。
  * ctx = { connector, executor, hub }
@@ -9,12 +9,39 @@ const { text, fail, wrapToolActivity } = require('./helpers');
 const store = require('../scripts/store');
 const context = require('../scripts/context');
 const { validateScript } = require('../scripts/validate');
+const { getConfig } = require('../config');
+/* 版本号唯一真相：服务端读根 package.json（与镜像 tag 同源，push-image.sh 用同一字段打 tag）。
+ * 前端也在构建期 import 同一文件，线上 MCP 返回的版本可与本地仓库 package.json 直接比对，
+ * 用来判断 skill 文档 / clone 下来的源码是否与线上部署同版本。 */
+const PKG_VERSION = require('../../package.json').version;
 
 function buildTools(server, ctx) {
   const { connector, executor } = ctx;
   wrapToolActivity(server);
 
   /* ---------------- 只读 ---------------- */
+  server.tool(
+    'automation_get_system_info',
+    '查询线上系统版本与运行信息（纯只读、无副作用、不需确认）。version 取自服务端 package.json，与镜像 tag 同源——可与本地仓库 package.json 对比，判断 skill 文档/clone 源码是否与线上同版本；devMode=true 时所有 HA 写只记日志不下发，务必据此判读行为。不返回 HA token 等任何敏感配置。',
+    {},
+    async () => {
+      const cfg = getConfig();
+      return text(JSON.stringify({
+        version: PKG_VERSION,
+        devMode: cfg.devMode === true,
+        executionMode: cfg.executionMode,
+        haStatus: connector.status,
+        demo: connector.demo === true,
+        scripts: store.list().length,
+        running: executor.runningList().length,
+        node: process.version,
+        platform: process.platform + '/' + process.arch,
+        uptimeSeconds: Math.floor(process.uptime()),
+        ts: Date.now(),
+      }, null, 2));
+    }
+  );
+
   server.tool(
     'automation_list_entities',
     '列出 HA 实体（可按 entity_id 或 friendly_name 过滤）。返回只读快照，不含 token。',

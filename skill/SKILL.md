@@ -8,18 +8,24 @@ agent_created: true
 
 本 skill 指导 AI 在 ha3d-automation 平台（`http://localhost:8100`，项目目录 `D:\Workbuddy\home\ha3d-automation`）上开发新的自动化脚本，从需求到正式上线一条路走通。
 
-**资料分工**：本文件是流程与硬规则的唯一现行版本；ctx 接口完整参考见 `references/ctx-api.md`；版本文件（script.js / flow.json / meta.json）规范见 `references/file-specs.md`；MCP 工具完整清单见 `references/mcp-tools.md`；**仿真（simulate）的完整用法、断言 DSL、踩坑清单见 `references/simulation.md`**；脚本骨架模板见 `templates/script-template.js`；**可复用脚本与仿真用例库存放在 `.scripts/` 与 `.fixtures/`（见下节）**。规范细节以 references 为准，本文件冲突时以 references 为准。
+**资料分工**：本文件是流程与硬规则的唯一现行版本；ctx 接口完整参考见 `references/ctx-api.md`；版本文件（script.js / flow.json / meta.json）规范见 `references/file-specs.md`；MCP 工具完整清单见 `references/mcp-tools.md`；**仿真（simulate）的完整用法、断言 DSL、踩坑清单见 `references/simulation.md`**；脚本骨架模板见 `templates/script-template.js`；**可复用脚本与仿真用例库存放在 `.scripts/` 与 `.fixtures/`（见下节）**；**读源码才澄清的接口语义沉淀在 `.notes/`（见下节）**。规范细节以 references 为准，本文件冲突时以 references 为准。
 
 **参考文档的权威顺序（用户通过链接下载技能、且已部署正式服务时）**：
 
 1. **优先用 skill 内部参考文档**（`references/*`、`templates/*`）：与技能版本同源、针对平台口径裁剪过，多数问题在这里就有答案，不必翻源码；
-2. **文档覆盖不了或怀疑文档与实际不符时**，拉取开源仓库到本地**只读参考更权威的源代码**：
+2. **文档覆盖不了或怀疑文档与实际不符时**，先核对线上版本，再拉取开源仓库**只读参考源码**：
    ```bash
-   git clone https://gitee.com/sunhuip/ha3d-automation   # 只读；放工作区外或 .work/ 下，别与线上部署目录混淆
+   node skill/tools/mcp-call.cjs automation_get_system_info   # ① 拿线上 version
+   node -p "require('./package.json').version"                # ② 本地仓库版本（clone 后在其根目录执行）
+   git clone https://gitee.com/sunhuip/ha3d-automation        # ③ 只读；放工作区外或 .work/ 下，别与线上部署目录混淆
    ```
-   - 源码重点看 `server/sim/session.js`（断言/游标真实实现）、`server/scripts/runner-core.js`（ctx 语义）、`server/mcp/tools.js`（工具参数）、`CONTRACT.md`（服务端契约）；
+   - **读完源码前先做版本比对**（这是能否采信源码的前提）：`automation_get_system_info` 返回的 `version` 来自线上服务端 `package.json`，与镜像 tag 同源。把它和本地仓库 `package.json` 的 `version` 对比：
+     - **一致**：源码可直接用来解释行为；
+     - **不一致**：线上与手头源码不同版本，`git clone` 默认拉 master（可能比线上新）——先把仓库切到与线上 `version` 对应的 tag 再读（若该 tag 不存在，说明线上版本未入库，以线上工具实际返回为准并告知用户）；**切勿拿新版源码的语义去解释旧版线上行为**。
+   - 该工具同时返回 `devMode`：`devMode=true` 表示所有 HA 写只记日志、不下发到真实设备（调试态），判读脚本行为与日志时必须带上这个前提；还返回 `haStatus`/`demo`/`executionMode`/实例数等运行态快照。
    - **源码只用来解释行为与澄清语义，严禁据此直接改线上**：服务端代码不由助手改，改动须走 bug 反馈 → 用户修 → 用户发布；
-3. **注意版本漂移**：线上部署的服务可能比 skill 文档旧或新——发现文档与线上 MCP 实际行为不一致时，先以**线上工具实际返回**为准（health / list / 快照），再用源码解释差异并告知用户；不要把源码里"有"而线上"没有"的能力当成已可用。
+3. **注意版本漂移**：线上部署的服务可能比 skill 文档旧或新——发现文档与线上 MCP 实际行为不一致时，先以**线上工具实际返回**为准（`automation_get_system_info` / health / list / 快照），再用**同版本**源码解释差异并告知用户；不要把源码里"有"而线上"没有"的能力当成已可用；
+4. **澄清后必须沉淀**（用户要求）：凡因接口表述不清 / 有歧义而读了源码才弄清的语义，明确后**修正 references 对应文件**（权威口径唯一落点，语义不另存 `.notes`——那类内容会随框架演进漂移）。若这次澄清伴随一次方案拍板/全链路改造，把**决策历史**（为什么这么定、用户拍板口径、改动面、发布顺序约束）追加到 `skill/.notes/decisions.md`（只追加不改写，见该目录 README）。
 
 ---
 
@@ -60,9 +66,9 @@ node skill/tools/sync-cache.cjs --force   # 忽略缓存全量重拉
 
 ---
 
-## 可复用资产（skill/.cache / .fixtures / .scripts / .work）— 下次别从零写
+## 可复用资产（skill/.cache / .fixtures / .scripts / .work / .notes）— 下次别从零写
 
-skill 下有**四个隐藏目录**（均不进 Git；`scripts/pack-skill.cjs` 的 `SKIP_NAMES` 把它们排除在 `skill.zip` 外，要带走请手动 `cp -r`）。分工一句话：**`.cache` 缓存线上所有脚本文件，另外三个只存 AI Agent 执行任务期间可复用的文件**：
+skill 下有**五个隐藏目录**（均不进 Git；`scripts/pack-skill.cjs` 的 `SKIP_NAMES` 把它们排除在 `skill.zip` 外，要带走请手动 `cp -r`）。分工一句话：**`.cache` 缓存线上所有脚本文件，`.notes` 只存不会漂移的决策历史，另外三个只存 AI Agent 执行任务期间可复用的文件**：
 
 | 目录 | 定位 | 性质 |
 |---|---|---|
@@ -70,6 +76,7 @@ skill 下有**四个隐藏目录**（均不进 Git；`scripts/pack-skill.cjs` �
 | `skill/.fixtures/` | 可复用仿真用例：`case.cjs` 与服务端 `sim_export` / `sim_run_fixture` 读写同一份 | 可复用资产，只增不删 |
 | `skill/.scripts/` | 可复用**脚本实现库**：已验证的实现沉淀为 `lib/<name>/`（script.js + 可选 flow.json + note.md） | 可复用资产，收录门槛=验证通过+真被复用 |
 | `skill/.work/` | AI 任务**工作区**：工作副本 `drafts/<scriptId>/`、诊断复现 `repro/`、临时 JSON `data/` | 任务期间产物，可复用才留，无价值直接删 |
+| `skill/.notes/` | **决策日志**：只记不会漂移的历史——方案取舍、用户拍板口径、改动面与发布顺序约束；**只追加、不改写**。接口语义一律不进这里（会随框架演进漂移），唯一权威是 `references/` | 长期知识资产，永不漂移 |
 
 ```
 skill/.scripts/lib/<name>/     # 已验证实现：script.js + 可选 flow.json + note.md
@@ -77,6 +84,8 @@ skill/.work/
 ├─ drafts/<scriptId>/          # 提交影子/正式前的暂存源码，提交成功后仅作存档
 ├─ repro/                      # 诊断/复现脚本；旧框架历史档案在文件头标注「不可跑」
 └─ data/                       # 一次性 JSON / 中间产物
+skill/.notes/
+└─ decisions.md                 # 决策日志：方案取舍 / 用户拍板 / 改动面（只追加不改写）
 ```
 
 | 目录 | 怎么用 |
@@ -85,10 +94,12 @@ skill/.work/
 | `.fixtures/<scriptId>/<用例>.json` | `case.cjs run` 一键回归；`case.cjs push --run-fixture` 服务端重放 |
 | `.scripts/lib/<name>/` | `cp -r` 出去改实体与参数再提交；**不要直接改库里的文件当交付物** |
 | `.work/drafts/<scriptId>/` | 改完提交走 MCP；副本仅存档 |
+| `.notes/decisions.md` | 想知道某个能力「为什么这么设计 / 当时怎么拍的板」时读；现行语义仍以 `references/` 为准 |
 
-**开工前先看这两处**（比翻 `.cache` 里十几个业务脚本快得多）：
+**开工前先看这三处**（比翻 `.cache` 里十几个业务脚本快得多）：
 
 ```bash
+cat skill/.notes/README.md              # 索引：框架演进至今有哪些关键决策
 cat skill/.scripts/README.md            # 索引：有哪些可复用实现
 node skill/tools/case.cjs list          # 索引：目标脚本已有哪些用例
 grep -rl "ctx.hold" skill/.scripts skill/.work   # 按判据形态找实现
@@ -98,6 +109,7 @@ grep -rl "ctx.hold" skill/.scripts skill/.work   # 按判据形态找实现
 
 - 写出跑通的判据/结构 → 复制进 `.scripts/lib/<name>/`、补 `note.md`、更新 `.scripts/README.md` 索引表；
 - 仿真跑通一个场景 → `node skill/tools/case.cjs save <scriptId> <用例名>` 归档进 `.fixtures`，补 `note`、更新 `.fixtures/README.md` 索引表；
+- 因接口歧义读了源码才弄清 → **修正 references 对应文件**（唯一落点；语义不写 `.notes`）；若伴随方案拍板或全链路改造，把决策历史追加进 `.notes/decisions.md`；
 - 收录门槛：**验证通过 + 真被复用至少一次**；半成品、一次性产物留在 `.work/`，不进 lib。
 
 用例命令速查：
@@ -335,7 +347,7 @@ grep -rn "nowSod\|ctx.after" skill/.cache --include=script.js | head -20   # 时
 
 1. **写操作一律走 `ctx.write(op, desc, nodeId, ...args)`**，HA 调用只出现在 `ctx.actions({...})` 注册的函数体内。绝不裸调 `ctx.ha.callService` 做业务写。
 2. **长驻脚本末尾 `await ctx.keepAlive()`**（常驻锚点，顶层永不结束，实例不被清理）；短任务脚本自然结束。
-3. **循环/回调里检查 `ctx.stopped`**（布尔属性，不是函数），保证 stop 能退出。
+3. **让步退出**：框架已在所有回调派发入口（实体订阅 / global·local watch / 定时器 / gate / ref / hold / ctx.write / callService）统一挡 stopped，**回调入口不必再写 `if (ctx.stopped) return;`**；只在长循环内、`await` 之后还有多步同步动作处显式检查 `ctx.stopped`（布尔属性，不是函数）。详见 `references/ctx-api.md` §7.3。
 4. **「持续 N 秒」= 滑动窗口重置语义（HA `for:` / `mode:restart`），禁止「先查一次 + 到点再查一次」**：
    - **优先用框架内置的 `ctx.hold`**（期待值/期待条件 + 双边计时 + 到点复核，详见 `references/ctx-api.md`）：
      ```js
@@ -357,7 +369,7 @@ grep -rn "nowSod\|ctx.after" skill/.cache --include=script.js | head -20   # 时
      期待值模式：`const a = ctx.hold({ satisfyMs: 30000, expect: true, unsatisfyMs: null }); a.value = true;`。满足持续 30s 回调一次 true；`a.value=false` 立即回调一次 false。
      **只接受对象参数**：数字首参、`ms`、`condition`、`fallMs` 等旧语法已删除，用了会直接抛错。
    - **只有 `ctx.hold` 不适用时**（如多组判据共享同一计时、需跨组互锁）才手写，照以下正例。注意下面与 hold 的语义差异，别照手写模板推断 hold 行为：
-     - **语义差异（重要）**：手写模板是 HA `for:` 的单边语义——条件掉出即**立即清零**，下次满足从 0 计；`ctx.hold` 是**期待状态双边迟滞**——满足按 `satisfyMs`、不满足按 `unsatisfyMs` 分别计时，未到阈值回到当前状态只取消计时不回调，到点仍会重跑 expect 复核。两者"中断"口径不同，细节见 `references/ctx-api.md` §ctx.hold。
+     - **语义差异（重要）**：手写模板是 HA `for:` 的单边语义——条件掉出即**立即清零**，下次满足从 0 计；`ctx.hold` 是**期待状态双边迟滞**——满足按 `satisfyMs`、不满足按 `unsatisfyMs` 分别计时，未到阈值回到当前状态只取消计时不回调，到点仍会重跑 expect 复核。两者"中断"口径不同，细节见 `references/ctx-api.md` §6.2 ctx.hold。
      - **手写语义**：条件必须**连续**满足满 N 秒才成立；窗口内任一时刻**判据结果翻转为不满足**（实体变化导致条件不再成立）→ 立即 `ctx.cancel(id)` 取消定时器、清零起点，下次重新满足时从 0 重新计时。多组条件各自独立一套起点/定时器，不能共用一个。
      - **反例（禁止）**：首次满足时排一个 `ctx.after(N, ...)`，中间不再重新评估，到点直接执行动作（或只到点复查一次）。这样"断断续续累计 N 秒"会被误判成"连续 N 秒"，正是用户最容易指出的错误。
      - **正例（照此写）**：
@@ -383,16 +395,16 @@ grep -rn "nowSod\|ctx.after" skill/.cache --include=script.js | head -20   # 时
    - **重置粒度**：以**期待结果（expect 投影）翻转**为准，不是实体任意数值抖动都重置。像 PWM 功率这种周期内反复波动的场景，只要判据（如"功率和 >800W"）仍成立就不重置；若按任何数值变化都重置，则永远无法确认持续时长。
    - `ctx.every` 只用于固定频率兜底/清理，**不用于"持续 N 秒"判定**；手写时 `ctx.after` 返回的 id 必须保存，重排或中断前先 `ctx.cancel(id)`。
 5. **防自发自收**：用 `expected` 表记录自己期望的实体值，在 watch 回调里过滤自己引起的 变化。
-6. **启动先拉当前值基线**（`ctx.ha.num/state`），续跑语义成立。
+6. **启动先拉当前值基线**（`ctx.ha.num/state`），续跑语义成立。**凡是负责写 `ctx.global` 键的脚本（该键的事实源/权威写者），启动段必须无条件 `await ctx.global.set(key, state)` 写一次基线**：即使全局键已有历史值、即使值与内存默认相同，也禁止用 `if (!hasSeed)` / `if (state !== next)` 这类幂等判断跳过——写者章（`writers[key]`）只在 `set` 时落盘，跳过写 = 不建章 = 消费方 `ctx.global.watch` 的写者状态折叠通道（`info.type='writerState'`）永远收不到失效事件；同值 `set` 只盖章、不发 change，不会误触发订阅者。真实踩坑：m7orioe9 v1 的 `if(!hasSeed)` 导致重启复用历史值时写者章永久缺失。详见 `references/ctx-api.md` §1.5 踩坑：写者脚本必须无条件写启动基线。
 7. **防重入用 `ctx.lock`**（忙跳过不排队）。
 8. **禁止无限/无界循环**（`while(true)`、无退出条件的 `while`/`for` 等）：inline 单进程模式下同步循环会阻塞其他所有脚本。等待一律异步让出：长驻用 `await ctx.keepAlive()`，延时用 `await ctx.sleep(ms)` / `ctx.after`，周期兜底用 `ctx.every`（回调里检查 `ctx.stopped` 让步）。
 9. **断线保守分支**：用 `ctx.invalid(v)` 统一判无效（`null`/`''`/`unavailable`/`unknown`/`none`/`NaN`，见 `ctx-api.md`），不要再各自抄 `INVALID` 数组。数字值直接 `await ctx.ha.num(eid, fallback)`——传 `null` 表示读不到就跳过、传安全数值表示读不到继续；**别用 `ctx.num`（非数字一律吞成 0）表达"读不到"**。`ctx.ha.state` 原样返回字符串，由脚本自己判有效性。判据读到无效值时按业务选保守策略（跳过 / 保持上次事实 / 写安全值），不能拿无效值推进计时或触发动作。
-10. **禁用清单**：`require`/`import`/`process`/`fetch`/`eval`/`fs.*`/`.constructor` 等——完整清单见 `references/ctx-api.md` 第一节，提交时 AST 校验会拦。
+10. **禁用清单**：`require`/`import`/`process`/`fetch`/`eval`/`fs.*`/`.constructor` 等——完整清单见 `references/ctx-api.md` §0.1，提交时 AST 校验会拦。
 11. `scriptId`：`/^[a-z0-9_-]+$/i`，业务语义命名；`nodeId` 用 `n_xxx`。
 12. **版本模型**：影子 = 可反复修改的工作副本（重新提交**原地覆盖**，版本号不变、revision+1）；正式版 = 内容不可变；归档 = 历史（分曾上线 / 试错废弃）。**正式与影子可各运行一个实例并行（互不影响：影子设备写只记日志、上下文写影子桶；正式写正式桶）；发布后收敛为只剩一个正式实例**。改正式内容只能提交新影子再发布，回滚走 `automation_rollback`（也产生新影子版本）。版本号只增不减。
-13. **依赖其他脚本**：不写配置式 `dependsOn`。脚本开头用 `await ctx.task.require('depId', { timeout })` 等依赖的**正式实例**就绪，再用 `ctx.task.watch('depId', cb)` 订阅后续状态变化；读侧不隔离——影子实例在跑不算就绪，接口返回 `mode` 恒为 `production`。全局上下文同样读不隔离（`ctx.global.get/watch` 统一读 `production`）、写仍隔离（`ctx.global.set` 按调用者模式落桶）。注册即回放当前状态，依赖重启抖动由业务侧防抖；依赖不健康时由脚本自己的判据短路写操作。一次只维护一个脚本，发布后其他脚本自然读到值。接口细节见 `references/ctx-api.md`。
+13. **依赖其他脚本**：不写配置式 `dependsOn`。脚本开头用 `await ctx.task.require('depId', { timeout })` 等依赖的**正式实例**就绪；**订阅类状态监控已删除**（`ctx.task.watch` 不存在），依赖健康统一走 `ctx.global.watch` 写者折叠通道（`info.type='writerState'`，`{debounceMs}` 防抖内建）；读侧不隔离——影子实例在跑不算就绪，接口返回 `mode` 恒为 `production`。全局上下文同样读不隔离（`ctx.global.get/watch` 统一读 `production`）、写仍隔离（`ctx.global.set` 按调用者模式落桶）。依赖不健康时由脚本自己的判据短路写操作。一次只维护一个脚本，发布后其他脚本自然读到值。接口细节见 `references/ctx-api.md`。
 14. **运行时拓扑是观测出来的，不是写出来的**：平台自动在 executor 真实拦截点记录脚本读/订阅的实体（`getState`/`subscribe`）、调用的 HA 服务（`callService`）、读取/订阅的上下文（`contextGet` / `contextSubscribe`）、写入的上下文（`contextSet`），按 `scriptId + 通道 + 版本` 分组存**纯内存**（不落盘，服务重启后从零重新观测，运行中脚本恢复实例时会秒级重建），换版本自动重置，前端详情页展示。**脚本里不要写任何拓扑声明字段/接口**——不手写依赖清单，不从上下文读拓扑。数据只在脚本真实跑过后逐步完整，未触发的分支不会出现；影子模式下 `ctx.write` 在脚本层被拦、动作函数不执行，所以"修改实体"观测不到是预期，读实体、上下文读取与写入照常记录。要查拓扑用 `GET /api/script/:id/topology`，不要静态猜。
-15. **状态存哪里按消费者分层，不按重要性**：跨脚本共享（别的脚本要读/写）的事实/裁决结果 → `ctx.global`；只有本脚本读但重启后要恢复的 → `ctx.local`；只有本脚本读、重启可重算的纯过程变化 → **脚本内普通变量**（计时起点、`expected` 表等，不要为了"持久化"滥用上下文）；人要改/人要看的配置 → HA `input_*` 实体，**不进上下文**。影子写入隔离、读取统一读正式桶，别依赖"影子写后自己读回"。详细判据与例子见 `references/ctx-api.md` 的「先选存储层」。
+15. **状态存哪里按消费者分层，不按重要性**：跨脚本共享（别的脚本要读/写）的事实/裁决结果 → `ctx.global`；只有本脚本读但重启后要恢复的 → `ctx.local`（**可配 `ctx.local.watch(key, cb)` 做脚本内闭环的状态驱动重评，默认回放、同值不触发、无写者章/防抖**；本脚本写、本脚本读、要跨重启的状态优先用它，别手写"set 完再手动调一次评估"）；只有本脚本读、重启可重算的纯过程变化 → **脚本内普通变量或 `ctx.ref`**（计时起点、`expected` 表、事件驱动的状态翻转等，不要为了"持久化"滥用上下文）；人要改/人要看的配置 → HA `input_*` 实体，**不进上下文**。影子写入隔离、global 读取统一读正式桶，别依赖"影子写后自己读回"（local 读的是自己的 shadow 桶）。详细判据与例子见 `references/ctx-api.md` §1.1 先选存储层与 §1.6 watch 家族对比表。
 
 ### 3.1 版本 flow.json 按 script.js 反推，画关键节点（不逐行，也不笼统）
 
@@ -607,7 +619,7 @@ node skill/tools/sync-cache.cjs --force
 - Bash 会话 cwd 固定在 `D:\Workbuddy\home`，`cd` 前缀可能被剥离，用子 shell `(cd ha3d-automation && <cmd>)` 最稳。
 - 测试跑法：`(cd ha3d-automation && npm test)`（node:test，测试位于顶层 `tests/`）。
 - 改动服务端代码（runner/executor/store）不在本 skill 范围；只做脚本开发时**不要重启服务**（会按运行意图清单恢复，但正在验证的影子实例会重跑）。
-- 可复用资产与任务工作区收纳在四个隐藏目录：`skill/.cache/`（线上脚本缓存）、`skill/.scripts/`（已验证实现库 lib/）、`skill/.work/`（任务工作区 drafts/repro/data）、`skill/.fixtures/`（仿真用例）——**用例目录同时是服务端 `sim_export` / `sim_run_fixture` 的读写目录**，不再有 `data/fixtures`；四目录均已 `.gitignore`，`pack:skill` 也跳过；`.fixtures` **只增不删**，删之前先确认没有脚本在用例里引用。
+- 可复用资产与任务工作区收纳在五个隐藏目录：`skill/.cache/`（线上脚本缓存）、`skill/.scripts/`（已验证实现库 lib/）、`skill/.work/`（任务工作区 drafts/repro/data）、`skill/.fixtures/`（仿真用例）、`skill/.notes/`（决策日志，只记不漂移的历史）——**用例目录同时是服务端 `sim_export` / `sim_run_fixture` 的读写目录**，不再有 `data/fixtures`；五目录均已 `.gitignore`，`pack:skill` 也跳过；`.fixtures` **只增不删**，删之前先确认没有脚本在用例里引用；`.notes` **只追加不改写**，语义修正只改 `references/`。
 - 崩溃现场 `data/runtime/<id>/v<n>.sim.crash.json`（只读）是运行数据：别清理、别手改成"通过"。
 - **仿真是临时状态**：影子实例的常态是 `follow`。`simulate` 只在 5.1 存在，跑完必须 `case.cjs finish` 切回 follow 并保持运行；服务重启后仿真实例也会恢复成 follow（虚拟世界不持久化，别指望"留着会话"复现，复现靠 `.fixtures` 用例）。
 - `skill/.cache/` 是运行时缓存，已加入 `.gitignore`，不要提交。

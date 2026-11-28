@@ -23,14 +23,16 @@ let crashFile = null;        // meta.simCrashFile：崩溃只读快照落点（�
 let crashWritten = false;
 let intentionalStop = false; // 收到 stop/simClose：正常结束，不写崩溃现场
 
-/* 仿真日志独立文件（§5）：会话开始时覆盖写，逐行 JSON，与线上 v<n>.log 分开。
- * 只由 simulate worker 打开（meta.simLogFile 由主进程按仓库路径规则下发）。 */
+/* 仿真日志独立文件（§5）：逐行 JSON 追加写，与线上 v<n>.log 分开。
+ * 只在 simulate worker 打开（meta.simLogFile 由主进程按仓库路径规则下发）。
+ * 会话开始时的清空由主进程 start(simulate) 统一做（store.clearSimLog）——
+ * 这里必须用 'a' 追加：否则会抹掉主进程先落的框架日志（如 [模式切换]）。 */
 function openSimLog(file) {
   closeSimLog();
   if (!file) return;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    simLog = fs.createWriteStream(file, { flags: 'w' });
+    simLog = fs.createWriteStream(file, { flags: 'a' });
     simLog.on('error', () => { simLog = null; });
   } catch (e) { simLog = null; }
 }
@@ -87,9 +89,8 @@ function emit(msg) {
       parentPort.postMessage({ ...msg, at }); // 实时广播（带 at），主进程按 verifyMode 不落版本日志
       return;
     }
-    /* 仿真不进真实订阅表（§9）：实体/上下文/task 订阅在 worker 内由 core 自己管。 */
-    if (msg.type === 'subscribe' || msg.type === 'contextSubscribe' || msg.type === 'contextUnsubscribe'
-      || msg.type === 'taskSubscribe' || msg.type === 'taskUnsubscribe') return;
+    /* 仿真不进真实订阅表（§9）：实体/上下文订阅在 worker 内由 core 自己管。 */
+    if (msg.type === 'subscribe' || msg.type === 'contextSubscribe' || msg.type === 'contextUnsubscribe') return;
   }
   parentPort.postMessage(msg);
 }

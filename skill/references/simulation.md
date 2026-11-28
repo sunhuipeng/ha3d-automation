@@ -129,8 +129,8 @@ node skill/tools/mcp-call.cjs automation_sim_run_steps "$(cat case.json)"
 |---|---|---|
 | `advance` | `ms` | 推进虚拟时钟，到点定时器按 dueAt 顺序触发。**时钟只有 advance 才前进**，不推进就永远不走；`ms` 是虚拟毫秒。节奏：每次只推进到下一个判据边界前后（2999 / 3000） |
 | `inject_entity` | `entityId`、`state?`、`attributes?`、`friendly_name?` | 注入一次实体变化：**先改虚拟表再触发订阅回调**（脚本 `ctx.watch` 会收到"状态变了"）。`state` 枚举大小写照抄真实值 |
-| `inject_context` | `scope?`（global/local，缺省 global）、`key`、`value` | 写虚拟上下文桶并派发 context 事件，用于预置/模拟其他脚本写入的共享键 |
-| `inject_task` | `scriptId`、`state`（`running/stopped/error/paused`） | 造"依赖脚本"的任务态。仿真不联动其他脚本，依赖其状态只能这样造 |
+| `inject_context` | `scope?`（global/local，**缺省 local**）、`key`、`value`、`writer?` | 写虚拟上下文桶；**两种 scope 都派发 `contextChange`**（2026-11-28 补齐 local 分支）：`scope:'global'` 进 `global.watch`，`scope:'local'`（缺省）进 `ctx.local.watch`。模拟**跨脚本**通知必须显式写 `"scope":"global"`；要驱动本脚本 `local.watch` 用 local（缺省）。`writer` 仅对 `global` 有效，为该 key 盖写者章（对齐单写者约定）——盖了章的 key，`inject_task` 改写者状态时会折叠派发 `contextWriterState`；不盖章则写者未知、不派发写者状态 |
+| `inject_task` | `scriptId`、`state`（`running/stopped/error/paused`） | 造"依赖脚本"的任务态。仿真不联动其他脚本，依赖其状态只能这样造。对**已盖章写者**的 key 同时派发 `contextWriterState`（runner 侧防抖后进同一回调） |
 | `inject_params` | `params` | 覆盖触发参数。**仅在下一次进入 simulate 时生效**，运行中注入只在快照可见并记 warn 日志 |
 | `inject_suspend` | `suspend?`（缺省 `true`） | 模拟实例挂起；传 `false` 表示恢复 |
 | `snapshot` | `since?`、`include?`、`entityScope?` | 用例中途留证据（字段同 §3 `sim_snapshot`），结果挂在 `results[i].snapshot` |
@@ -148,7 +148,7 @@ node skill/tools/mcp-call.cjs automation_sim_run_steps "$(cat case.json)"
 | `writes` | `[{kind?,op?,nodeId?,desc?,args?}]` | **全序列等长 + 逐条部分匹配**：条数必须相等，每条只比"给出了的字段"，`args` 一旦给出必须**完全相等** |
 | `noWrites` | `true` 或 `["op1","op2"]` | `true` = 本段不允许任何写意图；数组 = 不允许这些 op |
 | `state` | `[{entityId, state?, attributes?}]` | 虚拟实体当前值。`state` 宽松比较（String 化后相等即过），`attributes` 深比较 |
-| `context` | `[{scope?, key, value}]` | 虚拟上下文当前值，`value` 深比较；`scope` 缺省 global |
+| `context` | `[{scope?, key, value}]` | 虚拟上下文当前值，`value` 深比较；`scope` 缺省 global（**注意与 `inject_context` 相反**：断言缺省读 global，注入缺省写 local，源码 `runSteps` 的 `inject_context` 分支） |
 | `logs` | `["子串"]` 或 `[{level?, message?}]` | 本段日志里**出现过**即通过；字符串 = 包含匹配，对象 = `level` 相等且 `message` 包含 |
 | `expect` | 路径 DSL（下） | 任意路径断言。`writes/logs` 沿用增量基准，`entities/context/stats/timers/watchers/execution/tasks/clockNow/at/seq` 看**当前世界全量**；要看全量写/日志用 `allWrites/allLogs` |
 
@@ -216,8 +216,11 @@ node skill/tools/case.cjs push <id>/<name> --run-fixture      # 走服务端 sim
 |---|---|---|
 | `ctx.call` | 仿真宿主直接回 **mock 回执** `{id, version:0, mode:'shadow', started:true, mocked:true}`——只证明"调用链路走到了" | ✅ 调用后的后续逻辑；❌ 被调脚本真的执行、其内部动作（那是它自己的仿真/影子的事） |
 | `ctx.task.status` | 读虚拟任务表；**没注入过的脚本默认 `stopped`**，返回结构与真实模式一致（`version:0, mode:'production'`） | ✅ 依赖各状态分支的读侧反应 |
-| `ctx.task.require` | **完全可验证**：轮询定时器走虚拟时钟（只有 `advance` 才走）；`inject_task` 派发 `taskState` 会**提前唤醒**等待门闩 | ✅ `inject_task {state:'running'}` 验放行；不注入 + `advance` 推过 timeout 验超时抛错/降级（timeout 是虚拟时间） |
-| `ctx.task.watch` | 可用，但**注册无回放**：真实模式注册即回放当前状态，仿真里 `taskSubscribe` 被忽略，回调只在 `inject_task` 派发 `taskState` 时触发 | ⚠️ 脚本若依赖"注册即知道依赖当前状态"，仿真里要**补一条 `inject_task`**（状态与真实当前一致） |
+| `ctx.task.require` | **完全可验证**：轮询定时器走虚拟时钟（只有 `advance` 才走），靠反复 `taskStatus` 轮询推进 | ✅ `inject_task {state:'running'}` 验放行；不注入 + `advance` 推过 timeout 验超时抛错/降级（timeout 是虚拟时间） |
+| `ctx.global.watch` | **注册回放读虚拟桶**：仿真宿主 `contextGet` 无值返回 undefined → 桶无值不回放，与真实口径一致；回放值与 `inject_context` 派发的事件共用同一回调（`info.source='replay'` 可区分）。**写者状态折叠可验**：`inject_context` 带 `writer` 盖章后，`inject_task` 改写者状态即派发 `contextWriterState`，防抖走虚拟时钟（`advance` 可推动）；seed 预置的 global 键**无写者**，要验写者失效必须先 `inject_context` 盖章（`sim_run_steps` 的 `inject_context` 同样支持 `writer` 字段；脚本注册早于盖章步骤时，首个带 `writerSid` 的值事件会补建写者缓存，down 防抖仍可验） | ✅ 基线裁决 + 值通知 + 写者失效/恢复全链路 |
+| `ctx.local.watch` | **注册回放读虚拟 local 桶**：`inject_context scope=local`（缺省）会 dispatch `contextChange` 进回调（`info.source='set'`，回放为 `'replay'`）；脚本内 `ctx.local.set` 同样触发。仿真注入是 local 唯一外部写入源，不派发就验不到 | ✅ 私有持久化状态驱动重评、回放 vs 注入区分 |
+| `ctx.ref` | 纯脚本进程内机制，与虚拟时钟无关，仿真下语义不变（同值静默、结构比较、`immediate` 回放） | ✅ 可直接验赋值通知行为 |
+| `ctx.gate` | 纯脚本进程内机制，与虚拟时钟无关，仿真下语义不变（忙合并、只保留最后一次） | ✅ 可直接验合并行为 |
 
 验证示例（依赖等待 + 超时降级）：
 
@@ -230,7 +233,7 @@ node skill/tools/case.cjs push <id>/<name> --run-fixture      # 走服务端 sim
 ]
 ```
 
-要点：`inject_task` 写虚拟表并派发 `taskState`，同时作用于 `require` 的等待门闩与 `watch` 回调；`version:0` / `mode:'production'` 是仿真回执的固定值，断言别写死真实版本号。
+要点：`inject_task` 写虚拟表并驱动写者折叠派发（`require` 靠轮询读虚拟表，无需直派）；`version:0` / `mode:'production'` 是仿真回执的固定值，断言别写死真实版本号。
 
 ---
 

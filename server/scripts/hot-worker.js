@@ -9,7 +9,7 @@
  *
  * 消息协议（宿主 → 本线程）：{ type:'hotSession', id, op, msg }
  *   op='run' : msg = { type:'run', script, meta }   新建会话并启动脚本
- *   op='msg' : msg = runner-core 协议消息（reply/state/contextChange/taskState/…）
+ *   op='msg' : msg = runner-core 协议消息（reply/state/contextChange/contextWriterState/…）
  *   op='end' : 销毁会话（destroy + 出表）
  * 本线程 → 宿主：{ type:'hotSession', id, op:'msg', msg }（msg 为 runner-core 协议消息）
  *

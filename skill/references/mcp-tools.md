@@ -1,6 +1,6 @@
 # MCP 工具清单
 
-共 36 个工具（15 只读 + 19 受控写（8 脚本/版本 + 11 仿真）+ 2 面板控制），SSE 端点 `http://localhost:8100/mcp/sse`。
+共 37 个工具（16 只读 + 19 受控写（8 脚本/版本 + 11 仿真）+ 2 面板控制），SSE 端点 `http://localhost:8100/mcp/sse`。
 所有工具经 `wrapToolActivity` 统一广播活动到前端横条。
 
 **受控写**全部要求 `confirmed: true` 显式确认；`automation_call_service` 还需服务端开启 `allowMcpCallService`（默认关闭）。
@@ -18,7 +18,13 @@ node skill/tools/mcp-call.cjs automation_get_logs '{"scriptId":"s2countd"}'
 
 ---
 
-## 只读（15 个）
+## 只读（16 个）
+
+### 系统与版本
+
+| 工具 | 参数 | 说明 |
+|---|---|---|
+| `automation_get_system_info` | 无 | **线上版本与运行态快照**（纯只读、不需确认）。`version` 取自服务端 `package.json`，与镜像 tag 同源——**读源码前先调它和本地仓库 `package.json` 版本比对**：一致才采信 clone 的源码，不一致先切到对应 tag。另含 `devMode`（true=HA 写只记日志不下发）、`haStatus`、`demo`、`executionMode`、`scripts`/`running` 实例数、`node`/`platform`/`uptimeSeconds`、`ts`。不返回 token 等敏感配置 |
 
 ### 实体与状态
 

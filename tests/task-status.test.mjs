@@ -1,6 +1,7 @@
 'use strict';
-/* ctx.task / ctx.task.watch 测试：
- * ① runner 层用 mock 宿主验证 scriptId、状态订阅回放、require 门闩/超时/stop 中断；
+/* ctx.task 原语测试（status / require；订阅类 ctx.task.watch 已删除，状态订阅统一走
+ * ctx.global.watch 写者折叠通道）：
+ * ① runner 层用 mock 宿主验证 scriptId、require 门闩/超时/stop 中断；
  * ② executor 层用真实 fork + mock connector 验证影子优先、影子实例未起回退正式、
  *    正式观察者看不见影子实例（通道规则由主进程裁决）。全程不连接真实 HA。 */
 import { createRequire } from 'node:module';
@@ -16,7 +17,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(__dirname, '../server/scripts/runner.js');
 
 /* ---------- runner 层 mock 宿主 ---------- */
-function runWithMockHost(script, { meta = {}, onRequest, onSubscribe } = {}) {
+function runWithMockHost(script, { meta = {}, onRequest } = {}) {
   return new Promise((resolve) => {
     const child = fork(RUNNER, [], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...process.env, HA3D_RUNNER: '1' } });
     const logs = [];
@@ -39,10 +40,9 @@ function runWithMockHost(script, { meta = {}, onRequest, onSubscribe } = {}) {
           .catch((e) => child.send({ type: 'reply', id: msg.id, ok: false, error: String(e && e.message || e) }));
       }
       if (msg.type === 'log') logs.push(msg);
-      if (msg.type === 'taskSubscribe' && onSubscribe) onSubscribe(msg, child);
       if (msg.type === 'done') finish();
     });
-    timer = setTimeout(finish, 5000);
+    timer = setTimeout(finish, 8000);
     child.send({ type: 'run', script, meta: { version: 1, dryRun: true, sid: 'self', ...meta } });
   });
 }
@@ -64,43 +64,30 @@ test('ctx.scriptId / ctx.task.status：取到 executor 注入的权威 sid，状
   assert.deepEqual(actions, [{ action: 'taskStatus', scriptId: 'dep' }]);
 });
 
-test('ctx.task.watch：注册即回放，回调收到 (state, info)，off() 注销', async () => {
-  const { text, hostMsgs } = await runWithMockHost(`
-    const off = ctx.task.watch('dep', (state, info) => {
-      ctx.log('info', 'WATCH:' + state + ':' + info.reason);
-    });
-    await ctx.sleep(80);
-    ctx.log('info', 'OFF:' + off());
-    await ctx.sleep(20);
-  `, {
-    onSubscribe: (msg, child) => child.send({ type: 'taskState', scriptId: msg.scriptId, state: 'running', info: { reason: 'replay' } }),
-  });
-  assert.match(text, /WATCH:running:replay/, 'ctx.task.watch 须跨 realm 可见，且回调收到 info');
-  assert.match(text, /OFF:true/);
-  assert.ok(hostMsgs.some((m) => m.type === 'taskSubscribe' && m.scriptId === 'dep'), '应发出订阅消息');
-  assert.ok(hostMsgs.some((m) => m.type === 'taskUnsubscribe' && m.scriptId === 'dep'), 'off() 应发出注销消息');
+test('ctx.task.watch 已删除：调用应抛错（订阅统一走 ctx.global.watch 写者折叠）', async () => {
+  const { text } = await runWithMockHost(`
+    try { ctx.task.watch('dep', () => {}); ctx.log('info', 'NO_ERROR'); }
+    catch (e) { ctx.log('info', 'GONE:' + e.message); }
+  `);
+  assert.doesNotMatch(text, /NO_ERROR/, 'ctx.task.watch 不应存在');
+  assert.match(text, /watch is not a function|Cannot read|GONE:/, '调用必然失败');
 });
 
-test('ctx.task.require：依赖未起时等待，收到 taskState 后一次性返回 running', async () => {
+test('ctx.task.require：依赖未起时轮询等待，状态变 running 后一次性返回', async () => {
   let up = false;
-  let scheduled = false;
+  let calls = 0;
   const { text } = await runWithMockHost(`
-    const dep = await ctx.task.require('dep', { timeout: 2000 });
+    const dep = await ctx.task.require('dep', { timeout: 3000 });
     ctx.log('info', 'REQ:' + dep.state + ':' + dep.mode);
   `, {
-    /* require 不产生 taskSubscribe，用首次 status 请求作为"脚本已进入等待"的时序锚点 */
-    onRequest: (action, data, child) => {
-      if (!scheduled) {
-        scheduled = true;
-        setTimeout(() => {
-          up = true;
-          child.send({ type: 'taskState', scriptId: data.scriptId, state: 'running', info: { reason: 'started' } });
-        }, 60);
-      }
+    onRequest: () => {
+      calls += 1;
+      if (calls >= 2) up = true; // 第二次轮询起依赖已就绪（模拟 200ms 内启动完成）
       return { scriptId: 'dep', version: 1, mode: 'shadow', state: up ? 'running' : 'stopped', info: {} };
     },
   });
   assert.match(text, /REQ:running:shadow/);
+  assert.ok(calls >= 2, `require 应多次轮询（实际 ${calls} 次）`);
 });
 
 test('ctx.task.require：超时 reject；stop 中断等待', async () => {
@@ -125,7 +112,7 @@ test('ctx.task.require：超时 reject；stop 中断等待', async () => {
 
 /* ---------- executor 层端到端 ---------- */
 const require = createRequire(import.meta.url);
-const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ha3d-taskwatch-'));
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ha3d-taskstatus-'));
 const config = require('../server/config');
 config.DATA = tmpRoot; // 必须在 require store/executor 之前覆盖
 const store = require('../server/scripts/store');
@@ -138,18 +125,14 @@ const connector = {
   listEntities: () => [],
   callService: async () => ({ ok: true }),
 };
-const WATCH_SCRIPT = `
+const STATUS_SCRIPT = `
   ctx.log('info', 'SID:' + ctx.scriptId);
-  const off = ctx.task.watch('taskdep', (state, info) => {
-    ctx.log('info', 'WATCH:' + state + ':' + info.mode + ':' + (info.reason || ''));
-  });
   const st0 = await ctx.task.status('taskdep');
   ctx.log('info', 'ST0:' + st0.state + ':' + st0.mode);
   let dep = null;
   try { dep = await ctx.task.require('taskdep', { timeout: 3000 }); }
   catch (e) { ctx.log('info', 'TIMEOUT:' + e.message); }
   if (dep) ctx.log('info', 'REQ:' + dep.state + ':' + dep.mode + ':v' + dep.version);
-  off();
   ctx.log('info', 'DONE');
 `;
 
@@ -180,7 +163,7 @@ function waitForLog(sid, version, re, timeoutMs = 3000) {
   });
 }
 function submitWatcher(sid, channel) {
-  return store.submit(sid, { name: sid, script: WATCH_SCRIPT, flow: FLOW, channel });
+  return store.submit(sid, { name: sid, script: STATUS_SCRIPT, flow: FLOW, channel });
 }
 
 after(() => { executor.stopAll(); });
@@ -193,35 +176,32 @@ test('统一读正式实例：影子观察者忽略影子依赖，等正式实�
     name: '依赖', script: 'await ctx.keepAlive();', flow: FLOW, kind: 'automation', channel: 'production',
   });
   executor.start('taskdep', depShadow.version, connector); // 影子依赖先跑，观察者也必须无视它
-  const w = submitWatcher('taskwatch1', 'shadow');
+  const w = submitWatcher('taskstatus1', 'shadow');
 
-  executor.start('taskwatch1', w.version, connector);
-  /* 必须等观察者真正注册完订阅再启动正式依赖：fork 子进程启动晚于 start() 返回，
+  executor.start('taskstatus1', w.version, connector);
+  /* 必须等观察者的首次 status 真正落地再启动正式依赖：fork 子进程启动晚于 start() 返回，
    * 固定 sleep 会偶发"依赖先起"使回放状态变成 running，掩盖 waiting 路径。 */
-  await waitForLog('taskwatch1', w.version, /ST0:stopped:production/);
+  await waitForLog('taskstatus1', w.version, /ST0:stopped:production/);
   executor.start('taskdep', depProd.version, connector);
-  await waitDone('taskwatch1');
+  await waitDone('taskstatus1');
 
-  const text = logsOf('taskwatch1', w.version);
-  assert.match(text, /SID:taskwatch1/, 'ctx.scriptId 应为 executor 注入的 id');
+  const text = logsOf('taskstatus1', w.version);
+  assert.match(text, /SID:taskstatus1/, 'ctx.scriptId 应为 executor 注入的 id');
   assert.match(text, /ST0:stopped:production/, '影子实例在跑不算依赖就绪');
   assert.match(text, /REQ:running:production:v2/);
-  assert.match(text, /WATCH:stopped:production:subscribed/, '注册应回放当前状态');
-  assert.match(text, /WATCH:running:production:started/);
 });
 
 test('统一读正式实例：正式依赖已在跑时，影子观察者直接拿到正式状态', async () => {
   const prodVersion = store.versionOfChannel('taskdep', 'production');
   assert.equal(executor.isRunning('taskdep'), true, '正式实例应仍在运行');
 
-  const w = submitWatcher('taskwatch2', 'shadow');
-  executor.start('taskwatch2', w.version, connector);
-  await waitDone('taskwatch2');
+  const w = submitWatcher('taskstatus2', 'shadow');
+  executor.start('taskstatus2', w.version, connector);
+  await waitDone('taskstatus2');
 
-  const text = logsOf('taskwatch2', w.version);
+  const text = logsOf('taskstatus2', w.version);
   assert.match(text, /ST0:running:production/);
   assert.match(text, /REQ:running:production:v2/);
-  assert.match(text, /WATCH:running:production:subscribed/);
   assert.doesNotMatch(text, /:shadow:/, '所有状态都应是正式实例口径');
 });
 
@@ -232,11 +212,11 @@ test('影子实例在跑不算依赖就绪：require 超时', async () => {
   executor.start('taskdep', depShadow, connector);
   assert.equal(executor.isRunning('taskdep'), true);
 
-  const w = submitWatcher('taskwatch3', 'production');
-  executor.start('taskwatch3', w.version, connector);
-  await waitDone('taskwatch3');
+  const w = submitWatcher('taskstatus3', 'production');
+  executor.start('taskstatus3', w.version, connector);
+  await waitDone('taskstatus3');
 
-  const text = logsOf('taskwatch3', w.version);
+  const text = logsOf('taskstatus3', w.version);
   assert.match(text, /ST0:stopped:production/);
   assert.match(text, /TIMEOUT/, '影子实例在跑时正式依赖仍算未起，require 应超时');
   assert.doesNotMatch(text, /REQ:/);

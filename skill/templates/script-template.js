@@ -24,6 +24,13 @@ let selfValue = 0;                // 真相源：不依赖 HA 值驱动下一拍
 const expected = {};              // expected[entityId] = 自己下发后期望的值
 let timerId = null;
 
+/* ⬜ 3.5 状态摘要行（推荐）：一处定义、多处复用——复核 / 规避 / 恢复等日志统一
+ * 拼同一行快照，避免每处手拼状态字符串造成口径漂移；extra 可带本次特有信息。 */
+function stateLine(extra) {
+  return `阈值=${THRESHOLD} 当前=${selfValue} 定时=${timerId ? 'on' : 'off'}${extra ? '｜' + extra : ''}`;
+}
+// 用法：ctx.log('info', `复核｜${stateLine('动作=继续')}`, 'n_eval');
+
 /* ⬜ 4. 定时重排（mode:restart 语义）：先 cancel 旧 id 再排新的 */
 function arm() {
   if (timerId) ctx.cancel(timerId);

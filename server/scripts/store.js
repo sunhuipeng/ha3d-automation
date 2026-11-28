@@ -590,6 +590,21 @@ function appendLog(id, version, entry) {
   fs.appendFileSync(file, JSON.stringify({ ts: Date.now(), ...entry }) + '\n');
 }
 
+/* 仿真日志追加（主进程侧）：会话级框架日志（如 [模式切换]）也写进 v<n>.sim.log，
+ * 与 worker 的脚本日志同文件，前端才能按同一份虚拟时刻展示、刷新后不丢。
+ * 文件生命周期统一由主进程 start(simulate) 时 clearSimLog 清空，worker 改为追加写。 */
+function clearSimLog(id, version) {
+  if (!safeId(id) || !Number.isInteger(version) || version < 1) return;
+  try { fs.writeFileSync(simLogFile(id, version), ''); } catch (e) { /* 无旧文件也属正常 */ }
+}
+function appendSimLog(id, version, entry) {
+  if (!safeId(id) || !Number.isInteger(version) || version < 1) return;
+  const file = simLogFile(id, version);
+  ensureDataDir();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, JSON.stringify({ ts: Date.now(), ...entry }) + '\n');
+}
+
 /* 运行时日志定时清理（data/runtime/<id>/v<n>.log 为 JSON 行追加文件，天然只增不减）：
  * ① 超限截断：> MAX_LOG_BYTES 保留尾部 KEEP_BYTES（长驻脚本高频日志防无限膨胀）；
  * ② 孤儿删除：对应 data/scripts/<id>/v<n> 版本目录已不存在（版本被删/归档清理）→ 删日志；
@@ -650,7 +665,7 @@ module.exports = {
   safeId, newScriptId, validateFlow, kindOf,
   list, listVersions, get, submit, publish, rollback, removeVersion, removeScript, getMeta,
   channelOf, normalizeChannels, versionOfChannel, detailedVersions,
-  readLogs, readSimLogs, readLogPage, appendLog, simLogFile, simCrashFile, writeSimCrash, readSimCrash, clearSimCrash, cleanupRuntimeLogs,
+  readLogs, readSimLogs, readLogPage, appendLog, clearSimLog, appendSimLog, simLogFile, simCrashFile, writeSimCrash, readSimCrash, clearSimCrash, cleanupRuntimeLogs,
   writeFixture, readFixture, listFixtures,
   EXECUTION_HOST_MODES,
 };

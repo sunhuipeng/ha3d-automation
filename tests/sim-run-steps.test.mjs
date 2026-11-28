@@ -101,7 +101,8 @@ test('runSteps：state / context / logs 断言与 8 类 step 全覆盖', async (
   assert.equal(r.total, 1);
   assert.ok(dispatched.some((m) => m.type === 'state' && m.state.state === '1200'));
   assert.ok(dispatched.some((m) => m.type === 'contextChange' && m.key === 'avoiding'));
-  assert.ok(dispatched.some((m) => m.type === 'taskState' && m.state === 'running'));
+  /* ctx.task.watch 已删除：inject_task 不再直派 taskState（订阅类状态通知统一走写者折叠） */
+  assert.ok(!dispatched.some((m) => m.type === 'taskState'), 'taskState 直派已下线');
   assert.deepEqual(dispatched.filter((m) => m.type === 'suspend' || m.type === 'resume').map((m) => m.type), ['suspend', 'resume']);
   assert.ok(controls.some((m) => /params/.test(m.message)));
   assert.equal(r.results[8].snapshot.at, 500);

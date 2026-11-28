@@ -1,6 +1,7 @@
 'use strict';
 /* 脚本静态校验：用 acorn 解析，禁止require/import/dynamic import/process/globalThis/eval/
  * Function/网络与文件 API。只放行纯逻辑 + ctx 白名单调用。
+ * 例外：ctx.call / ctx.task.require 是框架开放 API，按精确形状放行。
  * 注意：这是可控约束，不是强安全沙箱；配合独立子进程一起用。 */
 const acorn = require('acorn');
 
@@ -57,7 +58,16 @@ function validateScript(source) {
       errors.push(`禁止无界同步循环（第 ${node.loc ? node.loc.start.line : '?'} 行）：会让出前永久阻塞其他脚本；长驻等待用 await ctx.keepAlive()，周期用 ctx.every，延时用 ctx.after / await ctx.sleep`);
     }
     if (node.type === 'Identifier') {
-      if (FORBIDDEN_NAMES.has(node.name)) failName(node.name, node);
+      /* require 是 Node 模块加载函数，但 ctx.task.require 是框架开放的依赖等待 API，
+       * 仅放行"ctx.task.require"这一个形状（computed ctx.task['require'] 的 property 是 Literal，不走这里）。 */
+      const isCtxTaskRequire = node.name === 'require' && parent && parent.type === 'MemberExpression'
+        && parent.property === node && !parent.computed
+        && parent.object && parent.object.type === 'MemberExpression' && !parent.object.computed
+        && parent.object.object && parent.object.object.type === 'Identifier'
+        && parent.object.object.name === 'ctx'
+        && parent.object.property && parent.object.property.type === 'Identifier'
+        && parent.object.property.name === 'task';
+      if (FORBIDDEN_NAMES.has(node.name) && !(node.name === 'require' && isCtxTaskRequire)) failName(node.name, node);
       // L8：用 node.name 显式判定 ctx.global 例外，不再用 parent.property === node 的对象身份比较
       if (node.name === 'global') {
         const isCtxGlobal = parent && parent.type === 'MemberExpression' && parent.property === node

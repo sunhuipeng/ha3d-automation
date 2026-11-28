@@ -197,6 +197,7 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
       local: clone((seed && seed.context && seed.context.local) || {}),
     },
     tasks: new Map(),          // scriptId -> { state }
+    writers: new Map(),        // global key -> writerSid（单写者约定仿真镜像；seed 预置值无写者）
     logs: [],                  // { seq, at, level, message, nodeId }
     writes: [],                // { seq, at, kind, op, desc, nodeId, args }
     tape: [],                  // 驱动步骤流水（inject/advance），sim_export 直接当 steps 用
@@ -242,7 +243,7 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
     return reply;
   }
 
-  /* 注入：先改虚拟世界，再把 state/contextChange/taskState/suspend 派发给 core（§3.2）。 */
+  /* 注入：先改虚拟世界，再把 state/contextChange/contextWriterState/suspend 派发给 core（§3.2）。 */
   function inject(payload) {
     const p = payload || {};
     const applied = [];
@@ -269,18 +270,35 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
       const bucket = world.context[scope] || (world.context[scope] = {});
       const prev = Object.prototype.hasOwnProperty.call(bucket, p.context.key) ? bucket[p.context.key] : null;
       bucket[p.context.key] = clone(p.context.value);
+      /* writer：为该 key 盖写者章（与真实单写者约定对齐）——盖了章的 key，
+       * inject_task 改写者状态时会折叠派发 contextWriterState。缺省无写者（不派发）。 */
+      const writer = scope === 'global' && p.context.writer ? String(p.context.writer) : null;
+      if (writer) world.writers.set(p.context.key, writer);
       if (scope === 'global') {
-        world.dispatch({ type: 'contextChange', scope: 'global', key: p.context.key, value: bucket[p.context.key], prev, writerSid: '', namespace: 'simulation' });
+        world.dispatch({ type: 'contextChange', scope: 'global', key: p.context.key, value: bucket[p.context.key], prev, writerSid: writer || '', namespace: 'simulation' });
+      } else {
+        /* local 私有桶：仿真注入是唯一外部写入源，dispatch 回 runner 的 local.watch；
+         * 真实执行器 local 写入不发事件（runner 内闭环），因此这里只补仿真路径。 */
+        world.dispatch({ type: 'contextChange', scope: 'local', key: p.context.key, value: bucket[p.context.key], prev, namespace: 'simulation' });
       }
       applied.push({ kind: 'context', scope, key: p.context.key });
-      world.tape.push({ op: 'inject_context', scope, key: p.context.key, value: clone(p.context.value) });
+      world.tape.push({ op: 'inject_context', scope, key: p.context.key, value: clone(p.context.value), ...(writer ? { writer } : {}) });
     }
     if (p.task) {
       const tid = String(p.task.scriptId || '');
-      world.tasks.set(tid, { state: String(p.task.state || 'stopped') });
-      world.dispatch({ type: 'taskState', scriptId: tid, state: String(p.task.state || 'stopped'), info: {} });
+      const tstate = String(p.task.state || 'stopped');
+      world.tasks.set(tid, { state: tstate });
+      /* 写者状态折叠：该脚本写过的 global key 同步派发 contextWriterState（与真实执行器
+       * notifyCtxWriterState 同构——runner 侧防抖后进同一回调）。taskState 直派已随
+       * ctx.task.watch 删除：订阅类状态通知统一走写者折叠通道。 */
+      for (const [k, wSid] of world.writers) {
+        if (wSid !== tid) continue;
+        const gbucket = world.context.global || {};
+        const wvalue = Object.prototype.hasOwnProperty.call(gbucket, k) ? clone(gbucket[k]) : null;
+        world.dispatch({ type: 'contextWriterState', scope: 'global', key: k, value: wvalue, prev: wvalue, scriptId: tid, state: tstate, namespace: 'simulation', reason: 'simulation' });
+      }
       applied.push({ kind: 'task', scriptId: tid });
-      world.tape.push({ op: 'inject_task', scriptId: tid, state: String(p.task.state || 'stopped') });
+      world.tape.push({ op: 'inject_task', scriptId: tid, state: tstate });
     }
     if (p.suspend !== undefined) {
       world.dispatch({ type: p.suspend ? 'suspend' : 'resume', reason: 'simulation' });
@@ -458,7 +476,9 @@ function createSimSession({ scriptId, startAt, seed, dispatch, onControlLog, clo
             } }).applied;
             break;
           case 'inject_context':
-            rec.applied = inject({ context: { scope: step.scope, key: step.key, value: step.value } }).applied;
+            /* writer 必须透传：fixture 用例靠它盖写者章，丢了写者折叠（writerState 派发）
+             * 在重放里永远验不了（与 MCP sim_inject 单步注入的 inject 路径同口径）。 */
+            rec.applied = inject({ context: { scope: step.scope, key: step.key, value: step.value, writer: step.writer } }).applied;
             break;
           case 'inject_task':
             rec.applied = inject({ task: { scriptId: step.scriptId, state: step.state } }).applied;

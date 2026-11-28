@@ -32,9 +32,6 @@ const subscriptions = new Map(); // entityId -> Set<child>
 /* ctx.global.watch：namespace -> key -> Set<entry>。读侧统一正式命名空间（不隔离），
  * 写侧仍按调用者 dryRun 落桶；脚本消息里的 scope/key 会被校验，namespace 不信任脚本。 */
 const ctxWatchers = new Map();
-/* ctx.task.watch：scriptId -> Set<观察者实例>。与 global 订阅分离，
- * 状态来源为实例生命周期，不做命名空间读写。 */
-const taskWatchers = new Map();
 const MAX_CALL_DEPTH = 5;       // ctx.call 调用链深度上限，防 A→B→A 无限递归
 let ctxDispatchDepth = 0;       // 同步派发重入保护（inline 模式下回调里再 set 会同步回到这里）
 const MAX_CTX_DISPATCH_DEPTH = 8;
@@ -154,7 +151,7 @@ function pauseScriptsForMissingEntity(eid) {
     emitLog(entry, 'warn', `[兜底] 依赖实体 ${key} 被删除，脚本已暂停（实体恢复后自动继续）`);
     try { entry.child.send({ type: 'suspend', reason: 'entity-missing', entityId: key }); } catch (e) {}
     broadcastScript(entry.sid, entry.version, 'status', { status: 'paused', reason: 'entity-missing' });
-    notifyTaskWatchers(entry.sid, 'entity-missing', entry);
+    notifyCtxWriterObservers(entry.sid, 'entity-missing', entry);
   }
 }
 
@@ -171,7 +168,7 @@ function resumeScriptsForEntity(eid) {
     emitLog(entry, 'info', `[兜底] 依赖实体 ${key} 已恢复，脚本自动继续`);
     try { entry.child.send({ type: 'resume' }); } catch (e) {}
     broadcastScript(entry.sid, entry.version, 'status', { status: 'running', reason: 'entity-restored' });
-    notifyTaskWatchers(entry.sid, 'entity-restored', entry);
+    notifyCtxWriterObservers(entry.sid, 'entity-restored', entry);
   }
 }
 
@@ -327,17 +324,39 @@ function taskStateFor(sid, reason) {
   const info = { scriptId: sid, version: pick.version, mode: 'production', reason: reason || '' };
   return { scriptId: sid, version: pick.version, mode: 'production', state, info };
 }
-function sendTaskState(entry, sid, reason) {
-  if (!store.safeId(sid)) return;
-  const st = taskStateFor(sid, reason);
-  try { entry.child.send({ type: 'taskState', scriptId: sid, state: st.state, info: st.info }); } catch (e) {}
-}
-function notifyTaskWatchers(sid, reason, changedEntry) {
-  const set = taskWatchers.get(sid);
-  if (!set || !set.size) return;
-  /* 只读流统一看正式实例：只有正式实例的状态变化才通知订阅者。 */
+/* 实例状态变化 → 写者状态折叠派发（ctx.global.watch 消费者的唯一状态通知通道；
+ * ctx.task.watch 已删除，订阅类状态通知全部走这里）。只读流统一看正式实例：
+ * 影子实例的状态变化不通知任何人（与原 task.watch / writerState 同一口径）。 */
+function notifyCtxWriterObservers(sid, reason, changedEntry) {
   if (changedEntry && changedEntry.dryRun) return;
-  for (const entry of [...set]) sendTaskState(entry, sid, reason);
+  notifyCtxWriterState(sid, reason);
+}
+
+/* ctx.global.watch 的写者状态折叠：写者实例状态变化时，对它写过的每个 global key 的
+ * 订阅者派发 contextWriterState（value = prev = 当前存量值，旧消费者当作"值没变的通知"
+ * 消化，天然兼容）。防抖在 runner 侧做（虚拟时钟），宿主只如实转发状态事实。 */
+function notifyCtxWriterState(sid, reason) {
+  if (!store.safeId(sid)) return;
+  const keysMap = ctxWatchers.get('production');
+  if (!keysMap) return;
+  const keys = context.keysByWriter('production', sid);
+  if (!keys.length) return;
+  const st = taskStateFor(sid, reason);
+  for (const key of keys) {
+    const subs = keysMap.get(key);
+    if (!subs || !subs.size) continue;
+    const value = context.get('global', sid, key, false, undefined);
+    for (const entry of [...subs]) {
+      if (entry.sid === sid) continue; // 写者不通知自己
+      try {
+        entry.child.send({
+          type: 'contextWriterState', scope: 'global', key,
+          value, prev: value, scriptId: sid, state: st.state,
+          namespace: 'production', reason: reason || '',
+        });
+      } catch (e) {}
+    }
+  }
 }
 
 /* 终态收尾公共段（done / onExit 最终退出 / stop 取消挂起重启 三条路径共用）：
@@ -348,7 +367,7 @@ function settleStatus(sid, version, { status, error, reason, entry }) {
   if (status === 'error') noteError(sid, version, error);
   else clearError(sid, version);
   broadcastScript(sid, version, 'status', { status });
-  notifyTaskWatchers(sid, reason, entry);
+  notifyCtxWriterObservers(sid, reason, entry);
 }
 
 function broadcastScript(id, version, event, extra) {
@@ -494,7 +513,9 @@ function start(id, version, connector, restarts = 0, callInfo = null, opts = {})
     metaForRunner.simulate = true;
     metaForRunner.simStartAt = opts.startAt;
     metaForRunner.simSeed = opts.seed;
-    /* 仿真日志独立文件（§5）：worker 逐行追加 JSON，与线上运行日志分开。 */
+    /* 仿真日志独立文件（§5）：会话开始时主进程清空，worker 与框架日志各自逐行追加。
+     * 统一在这里清，worker 侧改为 'a' 追加——否则 worker 的覆盖写会抹掉先落的框架日志。 */
+    store.clearSimLog(sid, rec.version);
     metaForRunner.simLogFile = store.simLogFile(sid, rec.version);
     /* 崩溃只读快照（§5.2）：新会话开始前清掉上一次的陈旧现场，避免误读。 */
     store.clearSimCrash(sid, rec.version);
@@ -506,7 +527,7 @@ function start(id, version, connector, restarts = 0, callInfo = null, opts = {})
   /* 运行意图持久化：start 全部成功后才落盘，确保重启能按此版本恢复。 */
   runState.mark(sid, rec.version, entry.startedAt);
   broadcastScript(sid, rec.version, 'status', { status: 'running' });
-  notifyTaskWatchers(sid, 'started', entry);
+  notifyCtxWriterObservers(sid, 'started', entry);
   return entry;
 }
 
@@ -561,22 +582,6 @@ function handleChildMessage(entry, msg, connector) {
     } else removeCtxWatcher(entry, key);
     return;
   }
-  if (msg.type === 'taskSubscribe' || msg.type === 'taskUnsubscribe') {
-    if (entry.verifyMode === 'simulate') return; // 仿真不进真实订阅表
-    const sid = String(msg.scriptId || '');
-    if (!store.safeId(sid)) return;
-    let set = taskWatchers.get(sid);
-    if (!set) { set = new Set(); taskWatchers.set(sid, set); }
-    if (msg.type === 'taskSubscribe') {
-      set.add(entry);
-      observeEntry(entry, 'taskDep', sid); // 运行时拓扑：订阅依赖（ctx.task.watch / require 的等待门闩）
-      sendTaskState(entry, sid, 'subscribed'); // 注册即回放当前状态，避免等不到"从无到有"的事件
-    } else {
-      set.delete(entry);
-      if (!set.size) taskWatchers.delete(sid);
-    }
-    return;
-  }
   if (msg.type === 'request') {
     handleRequest(entry, msg, connector)
       .catch((e) => emitLog(entry, 'error', '请求处理异常：' + (e && e.message || e)));
@@ -611,7 +616,15 @@ async function handleRequest(entry, msg, connector) {
       const readScope = data.scope === 'global' ? 'global' : 'local';
       const readDryRun = readScope === 'global' ? false : entry.dryRun;
       observeEntry(entry, 'contextRead', readScope, data.key); // 运行时拓扑：真实读取的上下文
-      return reply(true, context.get(readScope, entry.sid, data.key, readDryRun, data.default));
+      const value = context.get(readScope, entry.sid, data.key, readDryRun, data.default);
+      /* withMeta：global.watch 注册时拉取写者身份与写者当前状态（写者健康 = 正式实例，
+       * 与 taskStateFor 同一裁决口径），供 runner 建 key→写者缓存与启动基线 */
+      if (data.withMeta && readScope === 'global') {
+        const w = context.writerOf(data.key, false);
+        const ws = w ? taskStateFor(w).state : null;
+        return reply(true, { v: value, w, ws });
+      }
+      return reply(true, value);
     }
     if (action === 'contextSet') {
       await context.set(data.scope, entry.sid, data.key, data.value, entry.dryRun);
@@ -674,6 +687,12 @@ async function handleRequest(entry, msg, connector) {
     if (action === 'callService') {
       const { domain, service, data: sd } = data;
       const eid = sd && sd.entity_id;
+      /* 宽限期内脚本续体/裸 callService 仍可能发写请求：entry 已在 stopInstance 标记 stopped，
+       * 这里作为执行器侧硬闸拦截真实下发（与 runner 侧 ctx.write 闸双保险）。 */
+      if (entry.stopped) {
+        emitLog(entry, 'warn', `[兜底] 写操作跳过（实例已停止）：${domain}.${service}${eid ? ' ' + eid : ''}`);
+        return reply(true, { skipped: true, reason: '实例已停止', domain, service, entityId: eid || null });
+      }
       trackRef(entry.key, eid);
       /* 观测放在拦截之前：影子/开发模式的 callService 虽被拦不下发，但"打算写哪个实体"
        * 仍是有效拓扑信息（真实发生了一次写意图），记下来才能给影子脚本展示完整拓扑。 */
@@ -746,9 +765,6 @@ function detachChild(entry) {
       if (set.delete(entry) && !set.size) keys.delete(key);
     }
   }
-  for (const [sid, set] of taskWatchers) {
-    if (set.delete(entry) && !set.size) taskWatchers.delete(sid);
-  }
 }
 
 function cleanup(entry) {
@@ -774,11 +790,12 @@ function stopInstance(entry, reason) {
    * 主动停止/超时 → 清除运行意图，重启不再恢复；
    * 服务关闭（shutdown）→ 保留意图，下次启动按清单恢复。宽限期内若被重启，start() 会重新 mark。 */
   if (reason !== 'shutdown') runState.clear(entry.sid, entry.version);
+  entry.stopped = true; // 宽限期内仍可能收到在途 request：callService 据此拦下发（runner 侧 stopped 是子进程私有标志，此处独立）
   running.delete(entry.key); // 先摘除，避免宽限期内重复 stop / done 误处理
   clearRefs(entry.key);
   clearTimeout(entry.watchdog);
   detachChild(entry);
-  notifyTaskWatchers(entry.sid, reason === 'timeout' ? 'timeout' : 'stopped', entry);
+  notifyCtxWriterObservers(entry.sid, reason === 'timeout' ? 'timeout' : 'stopped', entry);
   try { entry.child.send({ type: 'stop' }); } catch (e) {}
   setTimeout(() => {
     try { entry.child.kill(); } catch (e) {}
@@ -947,8 +964,11 @@ function publish(id, version, opts = {}) {
       }
     }
   }
-  /* 'published' 事件前端不消费；列表/版本条刷新由下面两条 refresh 广播承担 */
-  broadcastRefresh(['scripts', 'versions']);
+  /* 'published' 事件前端不消费；列表/版本条/详情刷新由下面三条 refresh 广播承担。
+   * 必须带 script：publish 把 meta.channel 从 shadow 改为 production，而前端"进入仿真"
+   * 等按钮只看详情里的 meta.channel。MCP 发布不走前端 store.publish 的 open()，若这里
+   * 不广播 script，详情会卡在旧 shadow，按钮残留到用户手动切换脚本才消失。 */
+  broadcastRefresh(['scripts', 'script', 'versions'], { scriptId: sid, version: result.version });
   return { ...result, switchedFrom: switching ? oldVersion : null };
 }
 
@@ -1334,7 +1354,12 @@ function waitExit(entry, timeoutMs = SWITCH_EXIT_TIMEOUT_MS) {
 function emitSwitchLog(sid, version, level, message, targetMode) {
   const line = { ts: Date.now(), scriptId: sid, version, level, message };
   if (targetMode === 'simulate') {
-    hub.broadcast({ type: 'script', event: 'log', ...line, sim: true });
+    /* 模式切换发生在仿真会话的起点：虚拟时刻 at=0。必须带 at——前端按
+     * 「at!=null ? +X.Xs : 墙钟」渲染，缺 at 会显示成具体时分秒，和脚本日志的 +X.Xs 混排。
+     * 同时落进 sim.log（与 worker 脚本日志同文件），刷新页面后这条仍在。 */
+    const simLine = { ...line, at: 0 };
+    store.appendSimLog(sid, version, simLine);
+    hub.broadcast({ type: 'script', event: 'log', ...simLine, sim: true });
     return;
   }
   store.appendLog(sid, version, line);

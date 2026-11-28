@@ -2,7 +2,24 @@
 
 ctx 是脚本唯一能访问的宿主能力。所有 HA 调用经白名单转发执行。
 
-## 静态校验禁用清单（提交时 AST 校验，报错带行号）
+> **阅读顺序建议**：先读 §0 约束与 §1「先选存储层」（决定数据放哪），再按需要查具体接口。每个接口都标注**参数**与**返回值**；简单接口不举例，复杂接口附可运行片段。
+
+## 目录
+
+- §0 约束：禁用清单 / 内建 / 约定
+- §1 存储分层与上下文（global / local / watch 家族 / 写者章踩坑）
+- §2 HA 状态读写（entity / state / num / attr / attrs / listEntities / callService / change）
+- §3 动作与写入口（actions / write）
+- §4 脚本间联动与依赖（scriptId / task / call / params）
+- §5 定时与并发（watch / after / cancel / every / sleep / keepAlive / gate / lock）
+- §6 响应式值单元（ref / hold / 手写持续模式）
+- §7 工具与运行时（log / num / invalid / time / stats / dryRun / stopped / suspended）
+
+---
+
+## §0 约束
+
+### 0.1 静态校验禁用清单（提交时 AST 校验，报错带行号）
 
 | 类别 | 禁止内容 |
 |---|---|
@@ -11,27 +28,199 @@ ctx 是脚本唯一能访问的宿主能力。所有 HA 调用经白名单转发
 | 模块访问 | `fs` / `net` / `http` / `https` / `child_process` / `os` / `path` / `vm` / `dns` / `tls` |
 | 成员访问 | 任何对象的 `.constructor` / `.__proto__` / `.prototype` / `.call` / `.apply` / `.bind`（含 `obj['constructor']` 写法）；**唯一例外：`ctx.call`（`ctx` 直接下属，`ctx['call']` 亦可）** |
 
-## 可用内建
+### 0.2 可用内建
 
 `Math` / `Date` / `JSON` / `Promise` / `console.log` / `console.error` / `setTimeout` / `clearTimeout` / `setInterval` / `clearInterval`
 
-## ctx.ha — HA 状态读写
+### 0.3 全局约定
 
-| 接口 | 签名 | 参数 / 返回值 |
+- **单写者约定**：每个 `ctx.global` key 只有一个权威写者，身份落盘；被其他脚本写入记告警但不拒绝（软约束）。
+- **影子与开发模式正交**：`ctx.dryRun`（通道身份，影子/正式）与 `HA3D_DEV_MODE`（环境写拦截）互不影响。影子写上下文落 `shadow` 桶、正式落 `production`；`ctx.global` 读统一读 `production`，`ctx.local` 读自己的通道桶。
+- **回调同步上限**：订阅/定时器回调的同步部分受 vm timeout 中断（默认 2000ms），异常记日志不冒泡。
+
+---
+
+## §1 存储分层与上下文
+
+### 1.1 先选存储层：按消费者，不按重要性
+
+写脚本前先判"**谁要用这个数据**"，再决定存哪里。**不要因为一个值"重要"就塞进全局**。
+
+| 数据特征 | 存哪里 | 例子 |
 |---|---|---|
-| `entity` | `await ctx.ha.entity(entityId)` | 完整状态对象 `{ entity_id, state, attributes, ... }`；实体不存在或 HA 断线返回 `null` |
-| `state` | `await ctx.ha.state(entityId)` | **原样**返回 `state` 字符串（`'on'` / `'unavailable'`…），有效性由脚本用 `ctx.invalid` 自己判；不存在返回 `null` |
-| `num` | `await ctx.ha.num(entityId, fallback?)` | state 转数字；**实体缺失 / 状态无效（`ctx.invalid` 为真）/ 非数字串三种情况都返回 `fallback`（默认 0）**。传 `null` 或 `100` 会真正兑现，用于保守跳过或安全默认值 |
-| `attr` | `await ctx.ha.attr(entityId, key, fallback?)` | 读**单个**属性（如 `hvac_action`、`timestamp`）；实体/属性缺失返回 `fallback`（默认 `null`） |
-| `attrs` | `await ctx.ha.attrs(entityId, fallback?)` | 读**整个** `attributes` 对象；实体缺失/无属性返回 `fallback`（默认 `null`） |
-| `listEntities` | `await ctx.ha.listEntities(filter?)` | 列出实体，`filter` 可选字符串过滤 |
-| `callService` | `await ctx.ha.callService(domain, service, data)` | HA 服务调用。**只允许写在 `ctx.actions` 注册的函数体内** |
-| `change` | `ctx.ha.change(entityId, cb)` | 订阅变化。回调签名固定 `(nextObj, prevObj)` 两个**完整状态对象**，要字符串取 `nextObj.state` |
+| **另一个脚本要读或写**（跨脚本共享的事实/状态/裁决结果） | **`ctx.global`** 全局上下文 | `home.highPower`（m7 产出、audr76je 消费）、`waterHeater.avoiding` / `pendingStart` |
+| **只有本脚本读，但服务重启后要恢复上次状态** | **`ctx.local`** 本地上下文（按 `脚本id:通道` 隔离） | 阶段标记、上次的加热目标记录 |
+| **只有本脚本读，重启后可重算/归零无所谓** | **脚本内普通变量 / `ctx.ref`**（内存） | `since` / `timer`、`expected` 防自发自收表 |
+| **人要改、人要看的配置** | **HA 实体**（`input_number` / `input_boolean` / `input_datetime`），**不进上下文** | 目标水温、动态开启时间 |
 
-## ctx.actions + ctx.write — 动作与统一写入口
+补充规则：
+
+1. **全局 key 带业务前缀**（如 `home.highPower`），值形态（布尔/对象字段）先定契约；改形态必须同步所有消费者。
+2. **私有状态不镜像 HA**：本项目自用的运行时状态不要为了"看着统一"去建 HA helper 实体；只有 HA 侧确实有外部消费者时才单向输出。
+3. **影子读不隔离的后果**：影子实例 `ctx.global.set` 写 shadow 桶，但 `get` 读 production 桶——"影子写、自己读回"不成立。需要立刻读回自持的状态用内存变量，影子写入以日志为验证依据。
+4. **跨脚本读写用 `ctx.lock` 防并发环**；本脚本自己产生、自己消费的持久化状态用 `ctx.local.watch` 驱动重评。
+5. **写 `ctx.global` 键的脚本（事实源/写者）启动必须无条件写一次基线**：详见 §1.5 踩坑专节。
+
+### 1.2 上下文接口总表
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `await ctx.global.get(key, fallback?)` | `key`: 键名（建议带业务前缀）；`fallback`: 键不存在时的值（缺省 `undefined`） | `Promise<any>`：键存在返回值（JSON 反序列化后的副本），否则返回 `fallback`。**所有实例一律读 `production`** |
+| `await ctx.global.set(key, value)` | `value`: 任意可 JSON 序列化值 | `Promise<{ ok:true, scope:'global', key }>`：写入按调用者模式隔离（影子→`shadow`、正式→`production`）。**同值 set 不触发 watch，但仍会盖章** |
+| `ctx.global.watch(key, cb, opts?)` | `cb`: `(value, prev, info)`；`opts`: `{ debounceMs? }`（写者失效防抖，缺省 5000） | 返回 `off()`（幂等取消订阅）。**默认回放**；只订阅 `production` |
+| `await ctx.local.get(key, fallback?)` | 同上 | `Promise<any>`：读**自己通道**的桶（影子读 `sid:shadow`、正式读 `sid:production`），与 global 的读不隔离不同 |
+| `await ctx.local.set(key, value)` | 同上 | `Promise<{ ok:true, scope:'local', key }>` |
+| `ctx.local.watch(key, cb)` | `cb`: `(value, prev, info)` | 返回 `off()`（幂等）。**默认回放**；脚本内闭环，无跨脚本订阅/写者章/防抖 |
+
+`key` 校验规则：`^[A-Za-z0-9_.:-]{1,128}$`，非法抛错。值必须可 JSON 序列化。
+
+### 1.3 ctx.global.watch — 跨脚本共享桶（双源同回调）
+
+**触发源两类，靠 `info` 区分**：
+
+| 事件 | `info` | `value` / `prev` |
+|---|---|---|
+| 值变化（含回放） | `{ key, writerSid, namespace, source? }`，回放时 `source='replay'`、`prev=null` | 真实值 |
+| 写者状态 | `{ key, writerSid, namespace, type:'writerState', state, reason }` | `value = prev` = 当前存量值（不能当成"值变了"） |
+
+**回放语义**：注册时异步拉 `{v, w, ws}`（值+写者+写者状态）。桶有值立即回调一次（`prev=null`、`source='replay'`）；桶无值不回调（fallback 场景留给 `get`）；回放值未到达前已有真实事件则丢弃回放。**写者状态折叠**：写者实例状态变化（started/stopped/error/paused）折叠进同一回调，非 running 持续 `debounceMs` 才上报 down（到点向宿主复查，漏收恢复事件时静默复位），恢复 running 立即上报并取消计时；注册时写者已非 running 同样过防抖。写者状态看的是**正式实例**（影子写 shadow 桶不影响正式读者）。
+
+**案例：事实 + 写者健康单通道消费**（audr76je 迁移后的真实写法）
 
 ```js
-ctx.actions({ 动作名: (…args) => {…}, ... })            // 重复注册抛错
+const off = ctx.global.watch('home.highPower', (value, prev, info) => {
+  if (info.type === 'writerState') {
+    // 依赖健康：state='running' 恢复 / 其他=失效；value=prev=存量值，绝不当 highPower 事实
+    if (info.state === 'running') depHealthy = true;
+    else { depHealthy = false; forcedByDep = true; }
+    requestEvaluate('写者状态');
+    return;
+  }
+  if (info.source === 'replay') lastPowerFact = value === true; // 基线裁决
+  else lastPowerFact = value === true;                          // 后续通知
+  requestEvaluate('highPower 通知');
+}, { debounceMs: 5000 });
+// 不再需要时 off()
+```
+
+回调内可继续 `set`（跨实例互写要自行用 `ctx.lock` 防循环）；写者自己不收到自己写的回调。
+
+### 1.4 ctx.local.watch — 脚本内闭环（默认回放）
+
+**事件来源只有两个**：本 runner 的 `ctx.local.set`、仿真注入（`inject_context scope=local`）。无跨脚本订阅、无写者章、无防抖。`info = { key, scope:'local', source:'set'|'replay' }`；同值 `set` 不触发；真实事件先到丢弃在途回放值。
+
+**案例：持久化状态驱动重评**（替代手写"set 完再手动调一次评估"）
+
+```js
+// 写者：补烧达标标记，watch 自动驱动后续裁决
+ctx.local.watch('bath.doneDate', (v, prev, info) => {
+  if (info.source === 'replay') ctx.log('info', '恢复：当日达标=' + v);
+  requestEvaluate('达标标记变化');
+});
+await ctx.local.set('bath.doneDate', ctx.time.today()); // 自动触发上面的 watch
+```
+
+### 1.5 踩坑：写者脚本必须无条件写启动基线（m7orioe9 2026-11-28）
+
+凡是**负责写某个 `ctx.global` 键**的脚本（该键的事实源/权威写者），启动段必须**无条件**写一次基线：
+
+```js
+let state = false;                        // 内存默认值，仅作起点
+// ... 从 HA 或历史值恢复出 state ...
+await ctx.global.set(GLOBAL_KEY, state);  // ✅ 无条件：不看 hasSeed、不看值是否变化
+```
+
+**踩过的坑（m7orioe9 v1）**：
+
+```js
+let state = false;
+const hasSeed = await ctx.global.get(GLOBAL_KEY) != null;
+if (!hasSeed) await ctx.global.set(GLOBAL_KEY, false);  // ❌ 全局键已有历史值时永远跳过
+```
+
+表现：脚本重启后读到历史值 `false`，`hasSeed=true` 跳过 `set`，**写者章 `writers[GLOBAL_KEY]` 始终建立不起来**。消费方（如 audr76je）用 `global.watch(..., {debounceMs:5000})` 监听写者状态时，因存储层没有写者章，折叠通道无从派发，`info.type='writerState'` 的失效事件永远不来——依赖失效监管整段形同虚设。初次运行时若 `state === next` 被幂等判断拦掉，同样不建章。**"值是对的"不等于"章是有的"**：章只在 `set` 调用时落盘。
+
+**为什么无条件写是安全的**：框架 `context.js` 的 `set` 是**先盖章 `writers[k]=sid`，再判值变化才发 change 事件**。所以同值 `set` 照样盖章（正是我们要的），但不会向订阅者误发值变化（不会误触发消费者裁决）。写基线是为了建章，不是为了改值。
+
+**两个边界**：
+- 影子实例写 `shadow` 桶、正式实例写 `production` 桶；消费方统一读 `production`，所以章必须等**正式实例**启动写才落地——影子验证阶段看不到生产桶的章是正常的，发布后才生效。
+- 基线值形态（boolean/对象）先定契约；无条件写会把内存里的形态原样落盘，历史值是旧形态时会在启动那一刻触发一次 change，改形态必须同步所有消费者。
+
+### 1.6 watch 家族回放语义对比（注册瞬间会不会收到回调）
+
+| 接口 | 注册即回放？ | 回调参数 | 备注 |
+|---|---|---|---|
+| `ctx.global.watch(key, cb, opts?)` | **是**（桶有值时） | `(value, null, info)`，`info.source='replay'`、`info.writerSid`=存储写者 | 桶无值不回放；真实事件先到丢弃回放值；写者状态事件 `info.type='writerState'` 走同一回调 |
+| `ctx.local.watch(key, cb)` | **是**（桶有值时） | `(value, null, info)`，`info.source='replay'` | 脚本私有桶、runner 内闭环；同值 `set` 不触发；无写者章/健康防抖 |
+| `ctx.ref(v).watch(cb, opts?)` | **否**（`{immediate:true}` 可开） | `(value, null, info)`，`info.source='replay'` | 初始值在创建处已知；要"先跑一遍"直接读 `a.value` 或开 immediate |
+| `ctx.watch(entityIds, cb)`（实体订阅） | **否** | `(nextObj, prevObj)` | 只在实体变化时触发；启动基线自己 `ctx.ha.state/entity` 拉 |
+| `ctx.hold` 的 watch 回调 | **否** | `(satisfied, prev, info)` | 只在状态切换时通知；初始态由 `initial` 决定 |
+
+统一心智：**global/local.watch 注册即知道"现在是什么"**；实体订阅与 hold 只报"变化"，基线自己拉；ref 私有值初始态天然已知。三者都遵守"真实事件先到则丢弃在途回放值"。
+
+---
+
+## §2 HA 状态读写
+
+### 2.1 读取接口
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `await ctx.ha.entity(entityId)` | `entityId`: 实体 id 字符串 | 完整状态对象 `{ entity_id, state, attributes, friendly_name? }`；实体不存在或 HA 断线返回 `null` |
+| `await ctx.ha.state(entityId)` | 同上 | **原样**返回 `state` 字符串（`'on'` / `'unavailable'`…），有效性由脚本用 `ctx.invalid` 判；不存在返回 `null` |
+| `await ctx.ha.num(entityId, fallback?)` | `fallback`: 读不到时的返回值（默认 `0`；传 `null` 表示跳过、传数值表示安全默认） | state 转数字；**实体缺失/状态无效/非数字串**三种情况都返回 `fallback` |
+| `await ctx.ha.attr(entityId, key, fallback?)` | `key`: 属性名（如 `timestamp`）；`fallback` 默认 `null` | 单个属性值；实体/属性缺失返回 `fallback` |
+| `await ctx.ha.attrs(entityId, fallback?)` | `fallback` 默认 `null` | 整个 `attributes` 对象；实体缺失/无属性返回 `fallback` |
+| `await ctx.ha.listEntities(filter?)` | `filter`: 可选子串，按 entityId 与 friendly_name 过滤（大小写不敏感） | 实体数组 `[{ entityId, state, attributes, friendly_name }]` |
+| `ctx.ha.change(entityId, cb)` | `cb`: `(nextObj, prevObj)` 两个完整状态对象；要字符串取 `nextObj.state` | **无返回值**（框架内部订阅表；没有 off，stop 时统一清理） |
+
+**案例：保守读取与属性时间戳**
+
+```js
+const s = await ctx.ha.entity(ID.startTime);
+if (!s) return 20 * 3600 + 30 * 60;                       // 实体缺失 → 默认 20:30
+const sod = s.attributes && typeof s.attributes.timestamp === 'number'
+  ? ctx.num(s.attributes.timestamp)
+  : (() => { const p = String(s.state || '').split(':').map(Number);
+             return (p[0]||0)*3600 + (p[1]||0)*60 + (p[2]||0); })();
+
+const temp = await ctx.ha.num(ID.temp, null);   // 读不到 → null，让判据短路，不能当 0 推进
+if (ctx.invalid(await ctx.ha.state(ID.wh))) return; // 断线保守分支
+```
+
+### 2.2 写入接口
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `await ctx.ha.callService(domain, service, data)` | `domain`/`service`: HA 服务域与名；`data`: 服务参数对象（含 `entity_id`） | `Promise<any>`：正常返回 HA 调用结果；被拦截时返回 `{ skipped:true, reason, domain, service, entityId }`（`reason` 枚举见下）。**业务写一律走 `ctx.write`，不裸调此接口** |
+
+`callService` 的 skipped 分支（都 `reply(true, ...)` 不 reject，脚本要自己看 `skipped` 字段判断写是否真生效）：
+
+| 场景 | 回执特征 |
+|---|---|
+| 实例已停止（2026-11-28 补的执行器侧硬闸，宽限期内裸调也拦） | `{ skipped:true, reason:'实例已停止', ... }` |
+| 影子模式 | `{ shadow:true, skipped:true, ... }`（无 `reason`） |
+| 全局开发模式 | `{ devMode:true, skipped:true, ... }`（无 `reason`） |
+| HA 断线 / 依赖实体缺失已暂停 | `{ skipped:true, reason:'HA 断线'｜'依赖实体缺失已暂停', ... }` |
+| 动作互斥/冷却冲突 | `{ skipped:true, reason:冲突原因, ... }` |
+| HA 下发失败（断线/超时） | `{ skipped:true, reason:'HA 下发失败', error, ... }` |
+
+### 2.3 实体订阅（批量）
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `ctx.watch(entityIds, cb)` | `entityIds`: 单个 id 或 id 数组；`cb`: `(nextObj, prevObj)` | **无返回值**（内部转发 `ctx.ha.change`；框架注册不回放，启动基线自己拉） |
+
+**案例**：`ctx.watch([ID.temp, ID.kw, ID.wh], () => requestEvaluate('实体推送'));`
+
+---
+
+## §3 动作与写入口
+
+### 3.1 ctx.actions + ctx.write
+
+```js
+ctx.actions({ 动作名: (…args) => {…}, ... })            // 注册：重复注册抛错；无返回值
 const ok = await ctx.write(op, desc, nodeId, ...args)    // 唯一写入口
 ```
 
@@ -41,242 +230,223 @@ const ok = await ctx.write(op, desc, nodeId, ...args)    // 唯一写入口
 |---|---|
 | `op` | 动作名，必须已注册（未注册抛错） |
 | `desc` | 日志描述文案 |
-| `nodeId` | 关联画布节点 id（`n_xxx`）：**位置参数，不可省略**（省略会让 `...args` 前移错位）。日志按节点结构化落盘（`get_logs` 返回带 nodeId），并驱动前端画布运行态高亮（`error` 红 / 其余绿） |
+| `nodeId` | 关联画布节点 id（`n_xxx`）：**位置参数，不可省略**（省略会让 `...args` 前移错位）。日志按节点结构化落盘，并驱动前端画布运行态高亮（error 红/其余绿） |
 | `...args` | 透传给动作函数的参数 |
 
-`ctx.write` 行为顺序与返回值：
+返回值：`Promise<boolean>`——`true`=真实执行；`false`=被拦截（挂起/影子/开发模式）。
 
-1. 动作未注册 → 抛错；
-2. 挂起中（`ctx.suspended === true`）→ 跳过，记 `[兜底] 动作已跳过` 日志，返回 `false`；
-3. 影子模式（`ctx.dryRun !== false`）→ 跳过，记 `[影子·拦截写操作]` 日志，返回 `false`；
-4. 全局开发模式（`HA3D_DEV_MODE=true`，含正式通道实例）→ 跳过，记 `[开发模式·拦截写操作]` 日志，返回 `false`；
-5. 正常 → 执行动作，记 `[真实写操作]` 日志，返回 `true`。
+**行为顺序**：动作未注册→抛错；`ctx.stopped`→跳过返回 false；挂起（`ctx.suspended`）→记 `[兜底]` 返回 false；影子→记 `[影子·拦截写操作]` 返回 false；开发模式→记 `[开发模式·拦截写操作]` 返回 false；正常→执行动作、记 `[真实写操作]` 返回 true。
 
-`dryRun`（脚本通道身份）与开发模式（环境写拦截）正交：开发模式下正式实例仍是正式身份、上下文仍写正式桶，只是设备写不下发。主进程 `callService` 有同样的两道闸（影子 / 开发模式），脚本绕过 `ctx.write` 直调 `ctx.ha.callService` 也拦得住。MCP 直调 HA 不受开发模式限制（用户显式 confirmed 操作）。
-
-## ctx.global / ctx.local — 上下文存储
-
-### 先选存储层：按消费者，不按重要性
-
-写脚本前先判"**谁要用这个数据**"，再决定存哪里。**不要因为一个值"重要"就塞进全局**，判据是消费者数量和重启语义：
-
-| 数据特征 | 存哪里 | 例子 |
-|---|---|---|
-| **另一个脚本要读或写**（跨脚本共享的事实/状态/裁决结果） | **`ctx.global`** 全局上下文 | `home.highPower`（m7 产出、audr76je 消费）、`waterHeater.avoiding` / `pendingStart`（两脚本互读写） |
-| **只有本脚本读，但服务重启后要恢复上次状态**（重启可复原，跨脚本不关心） | **`ctx.local`** 本地上下文（按 `脚本id:通道` 隔离） | 本脚本自己的阶段标记、上次的加热目标记录 |
-| **只有本脚本读，重启后可重算/归零无所谓**（纯粹的过程变化） | **脚本内普通变量**（内存） | `since` / `timer` 计时状态、`expected` 防自发自收表、临时中间量 |
-| **人要改、人要看的配置**（阈值、开关、时间点） | **HA 实体**（`input_number` / `input_boolean` / `input_datetime`），**不进上下文** | 目标水温、动态开启时间 |
-
-补充规则：
-
-1. **全局 key 带业务前缀**（如 `home.highPower`），值形态（布尔 / 对象字段）要先定契约；改形态必须同步所有消费者，不能只改写侧。
-2. **私有状态不镜像 HA**：本项目自用的运行时状态不要为了"看着统一"去建 HA helper 实体；只有 HA 侧确实有外部消费者时才单向输出一份。
-3. **影子读不隔离的后果**：影子实例 `ctx.global.set` 写进 shadow 桶，但 `get` 读 production 桶——"影子写、自己读回"这条链路不成立。需要立刻读回自持的状态用内存变量，影子写入以日志为验证依据。
-4. **跨脚本读写用 `ctx.lock` 防并发环**；`ctx.local` 没有 `watch`，本脚本内部状态变化自己维护即可。
-
-| 接口 | 说明 |
-|---|---|
-| `await ctx.global.get(key, fallback?)` | 全局**读**：所有实例（含影子）一律读 `production` 命名空间，读不隔离 |
-| `await ctx.global.set(key, value)` | 全局**写**：仍按调用者模式隔离，影子写进 `shadow`、正式写进 `production`，绝不互相污染 |
-| `ctx.global.watch(key, cb)` | 只订阅 `production` 命名变更；返回 `off()`；回调 `(value, prev, info)`，首次 `prev = null`，`info = { key, writerSid, namespace }`（`namespace` 恒为 `production`） |
-| `await ctx.local.get(key, fallback?)` / `set(key, value)` | 脚本局部，按 `脚本id:通道` 隔离；无 watch（私有桶无需跨脚本通知） |
-
-`key` 建议带业务前缀（如 `'schedule.lastHelperTs'`）。注意影子脚本 `set` 后 `get` 读的是正式桶，**读不到自己刚写的值**——这是读不隔离、写隔离的刻意结果；影子验证看日志里的写入行即可。开发模式下正式通道实例保持正式身份，写入落 `production` 桶、可被所有脚本（含影子）读到；影子实例写入仍落 `shadow` 桶、不影响正式数据。
-
-`ctx.global.watch` 语义：只有写入 `production` 桶才触发，影子写入不触发任何监听者；写者自己不收到回调，同值重复 `set` 不触发。回调内可继续 `set`（跨实例互写要自行用 `ctx.lock` 防循环）。典型用法：
+**案例：定义动作并在业务里调用**
 
 ```js
-const off = ctx.global.watch('avoiding', (value, prev, info) => {
-  if (value === true && prev !== true) ctx.log('info', '进入规避：' + info.writerSid);
+ctx.actions({
+  whOn:  () => ctx.ha.callService('water_heater', 'turn_on',  { entity_id: ID.wh }),
+  whOff: () => ctx.ha.callService('water_heater', 'turn_off', { entity_id: ID.wh }),
+  speak: (v) => ctx.ha.callService('text', 'set_value', { entity_id: ID.speaker, value: v }),
 });
-// 不再需要时 off()
+await ctx.write('whOff', '大功率规避关热水器', 'n_avoid');
+await ctx.write('speak', '播报完成', 'n_announce_done', '热水器烧水完成啦，主人');
 ```
 
-## ctx.call — 脚本间显式联动
+主进程 `callService` 有同样的两道闸（影子/开发模式），脚本绕过 `ctx.write` 直调也拦得住。MCP 直调 HA 不受开发模式限制（用户显式 confirmed）。
 
-```js
-const r = await ctx.call(scriptId, params?);   // 触发另一个短脚本/场景
-// 影子调用者：r = { id, version, mode: 'shadow', started: true, mocked: true }（mock，被调方不执行）
-// 正式调用者：r = { id, version, mode: 'production', started: true }（真实拉起）
-```
+---
 
-| 项 | 规则 |
-|---|---|
-| 等待语义 | 只等启动回执，**不等**被调脚本执行完；失败时 reject（用 `try/catch` 接） |
-| 影子 mock | **影子实例的 ctx.call 不真实拉起被调脚本**（影子硬隔离延伸）：只做与正式路径一致的校验（目标存在影子版 / 非常驻 / params 可序列化），打 `[联动][影子] …已 mock` 日志并回 `mocked:true` 回执，脚本逻辑可继续；影子 mock 不检查 busy/restartable。要验证被调方真实执行，需正式调用或单独触发 |
-| 仿真 | 仿真里 `ctx.call` 同样只回 mock 回执（`started:true, mocked:true, version:0`）：只证明调用链路走到了，被调脚本不执行。验证口径见 `references/simulation.md` §4.4 |
-| `params` | 必须可 JSON 序列化；被调脚本用 `ctx.params` 读取（未被调用时为 `null`） |
-| 版本 | 正式调用拉起目标正式版；影子调用回执里的 version 是目标影子版本号（仅校验用，未执行） |
-| 目标类型 | 只允许一次性脚本/场景（`kind=script/scene`）；常驻自动化（`kind=automation`）不可调用 |
-| 重入 | 目标已在跑默认拒绝；目标 `restartable:true` 则停旧启新 |
-| 递归 | 调用链最多 5 层，超限报错中断 |
+## §4 脚本间联动与依赖
 
-示例：`await ctx.call('ngvgq6ln', { minutes: 30 });` ——被调脚本开头 `const min = ctx.params?.minutes ?? 30;`。
+### 4.1 ctx.scriptId / ctx.task — 依赖运行状态
 
-## ctx.scriptId / ctx.task — 依赖脚本运行状态（status / require / watch）
+任意脚本都能读自己的 id，也能查询/等待**另一个脚本实例**的运行状态。没有配置式 `dependsOn`，依赖写在脚本里。
 
-任意脚本都能读到自己的 id，也能查询/等待/订阅**另一个脚本实例**的运行状态。三种消费方式统一在 `ctx.task.*` 下：查一次 / 等到 running / 订阅变化。没有配置式的 `dependsOn` 声明，依赖关系完全写在脚本里。
+> **`ctx.task.watch` 已删除（2026-11-28）**：依赖健康监控统一走 `ctx.global.watch` 的写者状态折叠（`info.type='writerState'`，`{debounceMs}` 防抖内建）。旧脚本调用会在运行时报错，请迁移。
 
-```js
-ctx.scriptId                                   // 字符串：executor 注入的权威脚本 id
-const st = await ctx.task.status('depId');      // 查一次，不等待
-const dep = await ctx.task.require('depId', { timeout: 30000 }); // 等到 running
-const off = ctx.task.watch('depId', (state, info) => { ... });   // 订阅状态变化
-off();                                         // 注销
-```
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `ctx.scriptId` | —（字符串属性） | executor 注入的权威脚本 id |
+| `await ctx.task.status(scriptId)` | `scriptId`: 被查脚本 id | `Promise<{ scriptId, version, mode, state, info }>`；查一次不等待 |
+| `await ctx.task.require(scriptId, opts?)` | `opts.timeout`: 等待毫秒，缺省 30000 | 同上对象；等到**第一次** `running` 即 resolve；超时抛错；收到 stop 立即中断抛错 |
 
-`status` / `require` 返回 `{ scriptId, version, mode, state, info }`：
+返回对象字段：
 
 | 字段 | 含义 |
 |---|---|
 | `version` | 实际命中的实例版本（查不到实例时取该通道最新版本） |
-| `mode` | 保留字段，恒为 `'production'`（只读接口固定看正式实例，仅用于日志辨识） |
+| `mode` | 保留字段，恒 `'production'`（只读接口固定看正式实例，仅日志辨识） |
 | `state` | `'running'` / `'paused'` / `'stopped'` / `'error'` |
-| `info` | `{ scriptId, version, mode, reason }`，`reason` 说明来源（如 `subscribed` / `started` / `stopped`） |
+| `info` | `{ scriptId, version, mode, reason }`，`reason` 说明来源（`queried`/`started`/`stopped`） |
 
-**通道规则（读不隔离）**：状态查询、等待、监听一律看依赖的**正式实例**，与调用者影子/正式无关。影子实例在跑也不算依赖就绪；没有正式实例时返回 `stopped`。这些接口全是只读，不产生设备副作用，所以不做通道隔离；`mode` 正常恒为 `production`，只用于日志辨识。依赖不健康时的写操作短路由业务脚本自己负责。
+**通道规则（读不隔离）**：一律看依赖的**正式实例**，与调用者影子/正式无关。影子实例在跑不算就绪；无正式实例返回 `stopped`。这些接口只读、无设备副作用，所以不做通道隔离。依赖不健康时的写操作短路由业务脚本自己负责。
 
-**仿真口径**：仿真里这些接口的支撑方式与真实模式有差异——`status` 读虚拟任务表（默认 `stopped`）、`require` 用 `inject_task` 造状态并可 `advance` 验超时、`watch` **注册无回放**（需补一条 `inject_task`）。详见 `references/simulation.md` §4.4。
+**仿真口径**：`status` 读虚拟任务表（默认 `stopped`）、`require` 用 `inject_task` 造状态并可 `advance` 验超时。详见 `simulation.md` §4.4。
 
-`ctx.task.require` 语义：
-
-- 一次性门闩：等到**第一次** `running` 就 resolve，之后依赖重启/停止不再阻断当前脚本；
-- 默认超时 30s（`{ timeout: ms }` 可覆盖），超时抛错，脚本自己决定退出还是降级；
-- 脚本收到 `stop` 时立即中断等待并抛错，不会挂住 stop 流程；
-- 查不到实例时返回的 `state` 是 `stopped`（版本 meta 为异常时是 `error`），不会自动启动依赖。
-
-`ctx.task.watch(scriptId, cb)` 语义：
-
-- 回调 `(state, info)`；**注册时主进程立即回放一次当前状态**，否则依赖早已启动时永远等不到"从无到有"；
-- `off()` 幂等，返回是否成功注销；实例停止时订阅自动摘除；
-- 依赖重启会产生 `stopped → running` 两次事件，**抖动由业务侧防抖吸收**（框架只如实上报，不替业务做判断）；
-- 这是"软通知"，不会让 `ctx.write` 自动跳过。脚本无法写 `ctx.suspended`（只读），要让依赖缺失时停下写操作，只能在自己的判据里加业务标志位短路动作；框架没有声明式 `dependsOn` 硬挂起。
-
-典型用法：
+**案例**（依赖门闩 + 健康监控分工）：
 
 ```js
-const dep = await ctx.task.require('hppowersense', { timeout: 30000 });
+const dep = await ctx.task.require('m7orioe9', { timeout: 30000 }); // 启动门闩：等到 running
 ctx.log('info', `依赖已就绪：v${dep.version}（${dep.mode}）`);
-ctx.task.watch('hppowersense', (state, info) => {
-  if (state !== 'running') ctx.log('warn', '依赖异常，暂停业务裁决：' + info.reason);
-});
+// 之后的健康监控交给 global.watch 写者折叠通道，不再订阅 task
 ```
 
-## 工具接口
+### 4.2 ctx.call / ctx.params — 显式联动
 
-| 接口 | 说明 |
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `await ctx.call(scriptId, params?)` | `scriptId`: 目标脚本/场景 id；`params`: 必须可 JSON 序列化 | 启动回执对象：正式 `{ id, version, mode:'production', started:true }`；影子/仿真 `{ id, version, mode:'shadow', started:true, mocked:true }`（被调方不执行）。只等启动、**不等执行完**；失败 reject |
+| `ctx.params` | —（属性） | 被 `ctx.call` 触发时携带的入参；未被调用时为 `null` |
+
+规则：只允许一次性脚本/场景（`kind=script/scene`），常驻 automation 不可调用；目标在跑默认拒绝（`restartable:true` 则停旧启新）；调用链最多 5 层。
+
+**案例**：`await ctx.call('ngvgq6ln', { minutes: 30 });` —— 被调脚本开头 `const min = ctx.params?.minutes ?? 30;`
+
+---
+
+## §5 定时与并发
+
+### 5.1 定时接口
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `ctx.after(ms, fn)` | `ms`: 延时毫秒；`fn`: 到点回调（受 stopped 闸与 vm timeout 保护） | 定时器 id（数字序号），交给 `ctx.cancel(id)` 取消。对应 HA `for:` / `mode:restart` 语义 |
+| `ctx.cancel(id)` | `id`: `after`/`every` 返回的 id | 布尔：是否成功取消 |
+| `ctx.every(ms, fn)` | `ms`: 周期毫秒；`fn`: 周期回调 | 定时器 id；stop 时自动清理、stopped 后不再触发。**仅用于固定频率兜底/清理**，不用于"持续 N 秒"判定 |
+| `await ctx.sleep(ms)` | `ms`: 毫秒（负数/非数按 0） | `Promise<void>`；走虚拟时钟（仿真 advance 可快进）。**stop 时不再 resolve**（2026-11-28 改走 `scheduleTimer` 纳入 `timers` 注册表，清句柄后续体安静让步，不会在停止后继续做副作用） |
+| `await ctx.keepAlive()` | — | 永不 resolve 的 Promise。**长驻脚本结尾必须调用**（runner 不发 done、实例不被清理）；一次性脚本不调用，自然结束即退出 |
+
+**案例：一次性重排（无漂移累积）**
+
+```js
+let fireTimer = null, fireSod = null;
+function armFire(startSod) {
+  const now = ctx.time.nowSod();
+  const next = startSod > now ? startSod : startSod + 86400;
+  if (fireSod === next) return;                 // 同刻去重
+  if (fireTimer) ctx.cancel(fireTimer);
+  fireTimer = ctx.after((next - now) * 1000, () => {
+    fireTimer = null; fireSod = null;
+    requestEvaluate('到点触发');
+  });
+  fireSod = next;
+}
+```
+
+### 5.2 ctx.gate — 事件驱动评估的合并门
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `ctx.gate()` | — | `gate` 句柄 |
+| `gate.run(fn)` | `fn`: 异步评估函数（异常记 error 日志、不向外抛） | `Promise<boolean>`：`true`=立即执行；`false`=忙被合并 / 脚本已停止 |
+
+**合并语义**：忙时多次调用只保留**最后一次** fn，其余静默丢弃——gate 只回答"现在是什么"，**不保证中间事件序列**；依赖事件序列的判据不能放 gate 里。与 `ctx.lock` 的区别：lock 忙**跳过**（不排队），gate 忙**合并**（不丢最后一次）。
+
+**案例：watch 通知驱动的评估**（audr76je 真实写法）
+
+```js
+const evalGate = ctx.gate();
+function requestEvaluate(reason) {
+  return evalGate.run(async () => {
+    try { await evaluate(reason); }
+    catch (e) { ctx.log('error', `评估异常（${reason}）：${e?.message || e}`, 'n_eval'); }
+  });
+}
+ctx.global.watch(POWER_KEY, (v, p, info) => requestEvaluate('m7 通知'));
+ctx.watch([ID.temp, ID.wh], () => requestEvaluate('实体推送'));
+```
+
+### 5.3 ctx.lock — 防重入锁
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `await ctx.lock(fn)` | `fn`: 单锁回调 | `Promise<boolean>`：`true`=拿到锁并执行完；`false`=忙跳过（不排队） |
+| `await ctx.lock(key, fn)` | `key`: 锁名字符串（多把独立锁）；`fn`: 回调 | 同上 |
+
+**注意**：`ctx.lock` 是 async，判断忙跳过必须 `await`——直接 `const ok = ctx.lock(...)` 恒 truthy。
+
+**案例**：`const ok = await ctx.lock('write', async () => { await doWrite(); }); if (!ok) return;`
+
+---
+
+## §6 响应式值单元
+
+### 6.1 ctx.ref — 脚本内响应式值（内存，重启即失）
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `ctx.ref(initial?)` | `initial`: 初始值，缺省 `null` | `ref` 句柄：`.value` 可读写 accessor；`.watch(cb, opts?)` 返回 `off()` |
+| `ref.watch(cb, opts?)` | `cb`: `(value, prev, info)`，`info={source:'set'|'replay'}`；`opts.immediate`: 打开回放 | `off()`（同一 ref 可多次 watch） |
+
+**赋值判定**：与旧值相等则静默吞掉（标量严格相等、对象/数组按 JSON 结构比较）；不同才更新并按注册顺序同步派发。**默认不回放**（初始值创建处已知），要"先跑一遍"直接读 `a.value` 或开 `{immediate:true}`。stop 后赋值仍更新内部值，但不再触发 watcher。
+
+**案例**：
+
+```js
+const a = ctx.ref(0);
+a.watch((v, prev) => ctx.log('info', `变化：${prev} → ${v}`));
+a.value = 1;                      // 触发
+a.value = 1;                      // 同值：静默吞掉
+a.watch((v, p, i) => ctx.log('info', '回放:' + v), { immediate: true }); // 立即回放当前值
+```
+
+**与 global/local.watch 分工**：ref 是进程内私有状态（不落盘、重启即失），适合"事件驱动的状态翻转"；跨脚本共享用 global.watch，本脚本持久化状态用 local.watch。
+
+### 6.2 ctx.hold — 期待值/条件的双边迟滞确认器（优先用）
+
+框架内置**二态状态机**，把"持续 N 秒"的 `since/timer/翻转重置/到点复核` 全部封装。实现"持续 N 秒"时优先 `ctx.hold`，只有多组判据互锁等不适用时才手写。
+
+**构造参数**（只接受对象，旧语法 `ctx.hold(30000)`/`ms`/`condition`/`fallMs` 已删除，用了直接抛错）：
+
+| 参数 | 含义 |
 |---|---|
-| `ctx.log(level, message, nodeId?)` | 结构化日志。`level`: `'info'` / `'warn'` / `'error'` |
-| `ctx.sleep(ms)` | 等待毫秒（Promise） |
-| `ctx.num(v)` | 数字转换，非数字 → 0。**仅用于明确想当 0 的场合**；"读不到"要用 `ctx.ha.num` 的 fallback 或先判 `ctx.invalid` |
-| `ctx.invalid(v)` | 统一"无效状态"判定，返回布尔：`null` / `undefined` / 空串（含纯空格）/ `'unavailable'` / `'unknown'` / `'none'`（大小写、首尾空格不敏感）/ 数字 `NaN` 均为 `true`；合法枚举（`'on'`/`'Busy'`…）和数字为 `false`。**不对普通字符串做数字转换**，省得把枚举误判为无效 |
-| `ctx.lock(keyOrFn, fn?)` | 防重入锁：传函数 = 默认单锁；传 `key, fn` = 多把独立锁。上次未结束返回 `false`（忙跳过，不排队） |
-| `ctx.watch(entityIds, cb)` | 批量订阅，数组或单个 entityId，回调 `(nextObj, prevObj)` |
-| `ctx.after(ms, fn)` | 可取消延时，返回定时器 id（对应 HA `for:` / `mode:restart` 语义） |
-| `ctx.cancel(id)` | 取消定时器（after/every 通用），返回是否成功 |
-| `ctx.every(ms, fn)` | 周期定时：固定频率反复触发，返回 id 用 `ctx.cancel(id)` 停止；stop 时自动清理、stopped 后不再触发。**仅用于固定频率兜底/清理**；到点触发优先 `ctx.after` 一次性重排（无漂移累积） |
-| `ctx.keepAlive()` | **长驻脚本结尾必须调用**：`await ctx.keepAlive()` 让顶层协程永不结束（runner 不发 done、实例不被清理）。留一条"进入常驻模式"日志。一次性脚本不调用，自然结束即退出 |
-| `ctx.time.today()` | `'YYYY-MM-DD'` |
-| `ctx.time.nowSod()` | 当日秒数（与 HA `input_datetime.timestamp` 同口径） |
-| `ctx.time.weekday()` | `'sun'` / `'mon'` / … / `'sat'` |
-| `ctx.time.nowISO()` | ISO 时间字符串 |
-| `ctx.time.formatSod(sod)` | 秒数 → `'HH:MM:SS'` |
-| `ctx.stats()` | 写计数 `{ intent, sent, blocked }` |
-| `ctx.dryRun` | 布尔 getter：当前是否影子模式（可热切换） |
-| `ctx.stopped` | 布尔 getter：是否收到停止指令（**是属性不是函数**） |
-| `ctx.suspended` | 布尔 getter：是否被兜底挂起（HA 断线 / 实体缺失） |
+| `expect` | 二选一：期待值（raw 等于该值即满足）/ 期待条件 `(raw) => boolean`（只返回 truthy/falsy，不要 null 三态）；**条件函数可返回 Promise，框架会 `await`**，支持异步读 HA |
+| `satisfyMs` | 必填 >0：满足期待持续多久后回调 true |
+| `unsatisfyMs` | 可选：不满足持续多久后回调 false；`null`/`0`/缺省 = 立即回落 |
+| `initial` | 可选：初始已确认状态，默认 false |
+| `nodeId` / `label` | 可选：日志诊断 |
 
-## ctx.hold — 期待值/期待条件的双边迟滞确认器（优先用这个）
+**句柄接口**：
 
-框架内置的**二态状态机**，把上一节手写的 `since/timer/翻转重置/到点复核` 全部封装。**实现"持续 N 秒"时优先 `ctx.hold`，只有它不适用时（如多组条件互锁需共享计时）才手写。**
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `h.value` | 写：当前 raw（唯一重评入口）；读：已确认状态（true/false） | — |
+| `h.watch(cb)` | `cb: (satisfied, prev, info)`，`info={ satisfied, value, reason:'satisfied'|'unsatisfied', raw, expected, state, stable, ms, nodeId }` | `off()`；confirm 时回调一次 true / false，prev 是上次已确认状态 |
+| `h.cancel()` | — | 布尔：是否成功取消（清定时器与 watcher、冻结状态；cancel 后 watch 只拿空 off） |
+| `h.state()` | — | 诊断对象 `{ raw, desired, signal, state, stable, pending, since, active, remaining, ms, satisfyMs, unsatisfyMs, dead }`；`pending` 为 `'satisfied'|'unsatisfied'|null` |
 
-语义：传入一个**期待值**或**期待条件**；`hold` 自己记住当前是否已确认到这个期待。期待状态与当前状态相反时开始计时；持续到点且复核仍相反，才切换状态并回调一次。同一状态持续多久都不会重复回调。
+**语义要点**：构造时立即判定一次（init）；此后 `h.value = x`、到点复核、异常后补排都会重跑 expect。中途翻转回当前状态只取消本轮计时、不回调；重新相反时从 0 重计。同一状态持续多久不重复回调。`expect` 抛错本轮跳过、按剩余时间自动补排重试。无内置实体监听——要基于 HA 实体判断，脚本自己 `ctx.watch` 写 raw 或在 expect 里读 HA。
+
+**边界**：内部纯内存闭包、不存 global/local；重启不续计时；stop 自动清理（不必自己 cancel）。
+
+**案例（三种典型来源）**：
 
 ```js
-ctx.hold({
-  // 二选一：
-  expect: true,                  // 期待值模式：raw 等于该值即"满足期待"
-  expect: (raw) => raw > 800,    // 期待条件模式：返回 truthy/falsy（二态，不要返回 null 三态）
-
-  satisfyMs: 3000,               // 必填，>0：满足期待持续多久后回调 true
-  unsatisfyMs: 30000,            // 可选：不满足持续多久后回调 false；null/0/缺省 = 立即回落
-  initial: false,                // 可选：初始已确认状态，默认 false
-  nodeId: 'n_xxx',               // 可选：日志诊断
-  label: '大功率3s/低功率30s',    // 可选：日志诊断
-});
-```
-
-**只接受对象参数** `{ expect, satisfyMs, unsatisfyMs?, initial?, nodeId?, label? }`。**不使用旧语法**：数字首参 `ctx.hold(30000)`、`ms`、`condition`、`fallMs` 都会直接抛错（框架已删除这些兼容别名）。
-
-**二态回调**：
-
-- `h.value = x`：写 **raw**（当前值）。这是唯一重评入口之一。
-- `h.value`：同步读当前**已确认状态**（`true`=已满足期待，`false`=未满足/已回落），跨 realm getter 有效。
-- `h.watch((satisfied, prev, info) => {...})`：
-  - 满足期待持续满 `satisfyMs` → 回调一次 `satisfied=true`；
-  - 不满足持续满 `unsatisfyMs` → 回调一次 `satisfied=false`；
-  - `prev` 是上一次已确认状态；
-  - `info` 含 `{ satisfied, value, reason:'satisfied'|'unsatisfied', raw, expected, state, stable, ms, nodeId }`；
-  - 返回 `off()` 可注销。
-- `h.cancel()`：清定时器与 watcher、冻结状态，彻底停用（返回是否成功取消）。cancel 后再 `watch` 只会拿到空 `off()`。
-- `h.state()`：`{ raw, desired, signal, state, stable, pending, since, active, remaining, ms, satisfyMs, unsatisfyMs, dead }` 诊断用；`signal` 是 `desired` 的诊断别名、`stable` 同 `state`、`ms` 同 `satisfyMs`（这些只是读侧别名字段，不是入参旧语法）；`pending` 为 `'satisfied' | 'unsatisfied' | null`。
-- `stop`：实例收到停止指令时 hold 自动停止重评、timer 被统一清理，状态冻结；脚本不必自己 `cancel`。
-
-**没有内置实体监听**：框架不订阅任何实体，`raw` 唯一入口就是 `h.value = x`。要基于 HA 实体判断，两种写法自己选：
-
-```js
-// ① 脚本自己订阅实体，在回调里算好值写进 raw（推荐：watch 与 projection 分离，逻辑最清晰）
-const high = ctx.hold({
-  expect: (raw) => raw > 800,
-  satisfyMs: 3000,
-  unsatisfyMs: 10000,
-});
+// ① 订阅实体 → 算好值写 raw（推荐：watch 与 projection 分离）
+const high = ctx.hold({ expect: (raw) => raw > 800, satisfyMs: 3000, unsatisfyMs: 10000 });
 ctx.watch([pWok, pOven, pRice], async () => {
-  const sum = (await ctx.ha.num(pWok)) + (await ctx.ha.num(pOven)) + (await ctx.ha.num(pRice));
-  high.value = sum;                 // 三路功率和 → raw
+  high.value = (await ctx.ha.num(pWok)) + (await ctx.ha.num(pOven)) + (await ctx.ha.num(pRice));
 });
-high.watch((satisfied) => {
-  if (satisfied) ctx.write('setFlag', '大功率', 'n_write', true);
-});
+high.watch((satisfied) => { if (satisfied) ctx.write('setFlag', '大功率', 'n_write', true); });
 
-// ② expect 里自己读 HA（raw 可只当触发信号，甚至不用）
-const stove = ctx.hold({
-  expect: async () => (await ctx.ha.state('binary_sensor.stove')) === 'Busy',
-  satisfyMs: 30000,
-  unsatisfyMs: null,               // 不 Busy 立即回落
-});
-// 构造时已首次判定（此刻就读一次 HA），之后到点复核再读；raw 可完全不写
+// ② expect 里自己读 HA（raw 可只当触发信号）
+const stove = ctx.hold({ expect: async () => (await ctx.ha.state('binary_sensor.stove')) === 'Busy',
+                         satisfyMs: 30000, unsatisfyMs: null });
 
-// ③ 纯脚本内值（非 HA 来源）：期待 true，持续 30s 后确认；false 立即回落
+// ③ 纯脚本内值：期待 true 持续 30s 确认
 const a = ctx.hold({ satisfyMs: 30000, expect: true, unsatisfyMs: null });
 a.value = true;
 ```
 
-- **重评入口**：构造时立即判定一次（init），此后 `h.value = x`、到点复核、异常后的补排都会重跑 `expect`。实体变化本身不触发重评——脚本要么自己 `ctx.watch` 写 raw，要么在 expect 里 `await ctx.ha` 读；两种写法都不需要额外"首次赋值"。
-- **中途翻转**：期待状态与当前状态相反时开始计时；中途回到当前状态只取消本轮计时，不回调。重新相反时从 0 重新计时。
-- **二态约束**：`expect` 只返回 truthy/falsy。断线、`unavailable` 等无效值由脚本层用 `ctx.invalid` / `ctx.ha.num(eid, fallback)` 处理，不要把 `null` 当"保持"三态传进 hold。
-- **`unsatisfyMs`**：`null` / `0` / 不传都表示不满足立即回落；需要"撤销也防抖"时才传正数。
-- `expect` 抛错：本轮跳过、不推进计时，但会按剩余时间（init 失败则按 satisfyMs）自动补排重试，不会让 hold 卡死。
+### 6.3 「持续 N 秒」手写模式（仅 ctx.hold 不适用时）
 
-**边界（重要）**：
-
-- 内部状态是**纯内存闭包**，不存 global/local。影子模式下 `ctx.global.set` 写影子桶、`get` 读正式桶，"写后自己读回"读不到——所以 hold 绝不能把计时状态放上下文。
-- **重启不续计时**：重启后从初始值重新判定，符合"计时起点是纯过程量"的存储分层规范。
-- 多组独立判据：每次 `ctx.hold()` 返回独立闭包，各自持有 `desired/pending/since/timer`，天然隔离。
-- 一个脚本内多个 hold 可用 `.value` 互相组合（读另一个 hold 的已确认状态），但 expect 里这么用需留意求值时序；跨脚本共享仍走 `ctx.global`。
-- 句柄的 `value` 是可读写 accessor，conv 桥接会搬运 setter（`ctx.dryRun` 这类只读 getter 不受影响）。
-
-## 「持续 N 秒」的手写模式（仅 ctx.hold 不适用时）
-
-`ctx.after(ms, fn)` 只是**一次性可取消延时**，框架不会帮你做状态机。若多组条件互锁、`ctx.hold` 不够用，才自己实现成滑动窗口。**注意语义差异**：下面是 HA `for:` 的单边语义（条件掉出立即清零）；`ctx.hold` 是双边迟滞（满足按 `satisfyMs`、不满足按 `unsatisfyMs` 分别计时，未到阈值回到当前状态只取消计时不回调），两者不互通。
+`ctx.after` 只是一次性可取消延时，框架不做状态机。多组条件互锁、`ctx.hold` 不够用时才手写滑动窗口。**注意语义差异**：下面是 HA `for:` 单边语义（条件掉出立即清零）；`ctx.hold` 是双边迟滞，两者不互通。
 
 1. 保存起点 `since` 与定时器 id `timer`；
 2. 条件**首次满足**时才排 `ctx.after(N, ...)`；
-3. 每次实体变化（`ctx.watch`）都重新重算判据：
-   - 仍满足 → 不动计时器（继续累计）；
-   - **不再满足 → 立即 `ctx.cancel(timer)`、`since = 0`**（中断即清零，下次满足从 0 开始）；
-4. 定时器到点回调里**再读一次实体复核条件仍成立**，才执行动作；防止最后一次实体推送后状态已变但没再触发 watch。
-5. 多组判据各用一套 `since/timer`，别共用。
+3. 每次实体变化重算判据：仍满足→不动计时器；**不再满足→立即 `ctx.cancel(timer)`、`since=0`**；
+4. 定时器到点回调里**再读一次实体复核条件仍成立**，才执行动作；
+5. 多组判据各用一套 `since/timer`，别共用；
+6. **重置粒度**：以判据结果翻转为准（如"功率和 >800W"变"≤800W"），不是实体任何数值抖动都重置。
+
+**反例（禁止）**：首次满足排一个定时器，到点只检查一次就触发，中间翻转从不重置——会把"断断续续累计 N 秒"误判为"连续 N 秒"。`ctx.every` 只做固定频率兜底，不用于持续时长判定。
 
 ```js
 let since = 0, timer = null;
@@ -298,6 +468,40 @@ async function evaluate() {
 ctx.watch(ids, () => { evaluate(); });
 ```
 
-**反例（禁止）**：首次满足时排一个定时器，到点只检查一次就触发；中间条件翻转或实体变化从不重置。这会把"断断续续累计 N 秒"误判为"连续 N 秒"。
+---
 
-**重置粒度**：只认**判据结果翻转**（如"功率和 >800W"变为"≤800W"），不是实体任何数值抖动都重置。PWM 类功率传感器在窗口内反复波动但判据仍成立时，不应重置计时；否则持续时长永远凑不满。`ctx.every` 只做固定频率兜底，不用于持续时长判定。
+## §7 工具与运行时
+
+### 7.1 日志与值转换
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `ctx.log(level, message, nodeId?)` | `level`: `'info'|'warn'|'error'`；`message`: 文本（字符串化）；`nodeId`: 可选画布节点 id | 无返回值；结构化落盘，`get_logs` 可读、前端画布高亮 |
+| `ctx.num(v)` | `v`: 任意值 | number：数字转换，非数字 → 0。**仅用于明确想当 0 的场合**；"读不到"用 `ctx.ha.num(eid, fallback)` |
+| `ctx.invalid(v)` | `v`: 任意值 | boolean：无效状态判定——`null`/`undefined`/空串（含纯空格）/`'unavailable'`/`'unknown'`/`'none'`（大小写与首尾空格不敏感）/ `NaN` 为 true；合法枚举（`'on'`/`'Busy'`…）与数字为 false。**不对普通字符串做数字转换** |
+
+### 7.2 时间工具
+
+| 接口 | 参数 | 返回值 |
+|---|---|---|
+| `ctx.time.today()` | — | `'YYYY-MM-DD'` |
+| `ctx.time.nowSod()` | — | 当日秒数（与 HA `input_datetime.timestamp` 同口径） |
+| `ctx.time.weekday()` | — | `'sun'` / `'mon'` / … / `'sat'` |
+| `ctx.time.nowISO()` | — | ISO 时间字符串 |
+| `ctx.time.formatSod(sod)` | `sod`: 秒数 | `'HH:MM:SS'` |
+
+### 7.3 运行时属性
+
+| 接口 | 返回值 |
+|---|---|
+| `ctx.stats()` | `{ intent, sent, blocked }` 写计数 |
+| `ctx.dryRun` | boolean getter：当前是否影子模式（可热切换） |
+| `ctx.stopped` | boolean getter：是否收到停止指令（**属性不是函数**） |
+| `ctx.suspended` | boolean getter：是否被兜底挂起（HA 断线 / 实体缺失） |
+
+**stop 让步的框架代劳边界**（2026-11-28 框架补齐）：stop 只置标志不强杀执行流，500ms 宽限期后 kill。框架**已统一**在各类回调派发入口挡 stopped，脚本不必再写重复检查：
+- 实体订阅 `ctx.watch` / `ctx.ha.change` 回调、global/local 上下文 watch 回调（值事件 / 回放 / 写者状态）、`ctx.after` / `ctx.every` / 裸 `setTimeout` / `setInterval` 定时回调、`ctx.gate.run` / `ctx.ref` / `ctx.hold` 派发、`ctx.write` 动作、`ctx.task.require` —— 这些入口 stopped 后一律不触发 / 不执行。
+- `ctx.sleep` 已纳入 `timers` 注册表，stop 时清句柄、不再唤醒续体。
+- 执行器侧对裸 `ctx.ha.callService` 也有停止硬闸（宽限期内不下发，回 `{ skipped:true, reason:'实例已停止' }`，见 §2.2）。
+
+因此**回调入口第一行**的 `if (ctx.stopped) return;` 属于冗余，新脚本不必写。**仍需脚本自己检查**的只有：长循环内、`await` 之后到下一次业务动作之间有多个同步步骤时（框架无法在续体中间插入检查）。写脚本时优先依赖框架闸，只在真正有长续体 / 循环的地方显式让步。

@@ -17,6 +17,19 @@ test('validateScript：require 被拒绝', () => {
   assert.match(err, /禁止标识符：require/);
 });
 
+test('validateScript：ctx.task.require 两种写法都放行', () => {
+  assert.equal(validateScript("await ctx.task.require('m7orioe9');"), null);
+  assert.equal(validateScript("await ctx.task['require']('m7orioe9');"), null);
+});
+
+test('validateScript：ctx.task.require 例外不可借道绕过', () => {
+  assert.match(validateScript("const r = ctx.require;"), /禁止标识符：require/);
+  assert.match(validateScript("const r = foo.task.require;"), /禁止标识符：require/);
+  assert.match(validateScript("const r = ctx.foo.require;"), /禁止标识符：require/);
+  assert.match(validateScript("ctx.task.require.call(null);"), /禁止成员访问：\.call/);
+  assert.match(validateScript('ctx["task"].require;'), /禁止标识符：require/);
+});
+
 test('validateScript：动态 import 被拒绝', () => {
   assert.match(validateScript("await import('fs');"), /动态 import/);
 });

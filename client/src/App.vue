@@ -40,6 +40,11 @@ function onScriptDeleted(id) {
   if (scripts.current && scripts.current.id === id) scripts.current = null;
   scripts.load();
 }
+/* 点击左上角标识（图标+文字+版本号）返回全局运行拓扑：清空当前选中脚本即可，
+ * 右侧 main 的 v-else 分支会渲染 GlobalTopology。原地点击不占比任何副作用。 */
+function goTopology() {
+  scripts.current = null;
+}
 const actionBusy = ref(false);
 
 /* 自定义确认弹窗：替代 window.confirm；askConfirm 返回 Promise，true=确定 false=取消 */
@@ -287,8 +292,8 @@ async function rollbackTo(version) {
 <template>
   <div class="app">
     <header class="top">
-      <div class="brand">
-        <img class="logo" src="/favicon.svg" alt="居控中枢">居控中枢<span v-if="appVersion" class="version" title="项目版本（根 package.json）">v{{ appVersion }}</span>
+      <div class="brand" @click="goTopology" title="返回全局运行拓扑" role="button" tabindex="0" @keydown.enter="goTopology" @keydown.space.prevent="goTopology">
+        <img class="logo" src="/favicon.svg" alt="居控中枢">居控中枢<span v-if="appVersion" class="version">v{{ appVersion }}</span>
       </div>
       <div class="status">
         <span class="dot" :class="app.haStatus"></span> HA {{ haLabel }}

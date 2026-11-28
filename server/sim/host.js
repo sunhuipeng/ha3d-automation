@@ -40,6 +40,16 @@ function createSimHost(world) {
       case 'contextGet': {
         const scope = d.scope === 'global' ? 'global' : 'local';
         const bucket = world.context[scope] || (world.context[scope] = {});
+        /* withMeta：global.watch 注册拉取写者身份与写者状态（仿真镜像真实执行器口径，
+         * 写者健康读虚拟任务表） */
+        if (d.withMeta && scope === 'global') {
+          const has = Object.prototype.hasOwnProperty.call(bucket, d.key);
+          const v = has ? bucket[d.key] : d.default;
+          const w = (world.writers && world.writers.get(d.key)) || null;
+          let ws = null;
+          if (w) { const t = world.tasks.get(w); ws = t && t.state ? t.state : 'stopped'; }
+          return { v, w, ws };
+        }
         return Object.prototype.hasOwnProperty.call(bucket, d.key) ? bucket[d.key] : d.default;
       }
       case 'contextSet': {
@@ -47,9 +57,14 @@ function createSimHost(world) {
         const bucket = world.context[scope] || (world.context[scope] = {});
         const prev = Object.prototype.hasOwnProperty.call(bucket, d.key) ? bucket[d.key] : null;
         bucket[d.key] = d.value;
-        world.recordWrite({ kind: 'context', op: 'contextSet', desc: `${scope}.${d.key}`, args: [d.key, d.value] });
         if (scope === 'global') {
+          /* 单写者约定镜像：脚本自己写的 global key 盖写者章 */
+          if (!world.writers) world.writers = new Map();
+          world.writers.set(d.key, world.scriptId);
+          world.recordWrite({ kind: 'context', op: 'contextSet', desc: `${scope}.${d.key}`, args: [d.key, d.value] });
           world.dispatch({ type: 'contextChange', scope: 'global', key: d.key, value: d.value, prev, writerSid: world.scriptId, namespace: 'simulation' });
+        } else {
+          world.recordWrite({ kind: 'context', op: 'contextSet', desc: `${scope}.${d.key}`, args: [d.key, d.value] });
         }
         return { ok: true, scope, key: d.key };
       }

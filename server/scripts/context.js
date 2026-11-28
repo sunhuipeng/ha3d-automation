@@ -16,7 +16,15 @@ const changes = new EventEmitter();
 changes.setMaxListeners(0); // 订阅者数量由执行器按实例管理，不受默认 10 个上限约束
 
 function empty() {
-  return { global: { production: {}, shadow: {} }, local: {} };
+  return {
+    global: {
+      production: {}, shadow: {},
+      /* key -> writerSid：global 桶的写者身份（单写者约定的落地）。
+       * 与值分表存（不包 {v,w}）：值结构零变化、无"值恰好像包装对象"的歧义。 */
+      writers: { production: {}, shadow: {} },
+    },
+    local: {},
+  };
 }
 
 function readAll() {
@@ -27,9 +35,14 @@ function readAll() {
       global: {
         production: raw.global && raw.global.production && typeof raw.global.production === 'object' ? raw.global.production : {},
         shadow: raw.global && raw.global.shadow && typeof raw.global.shadow === 'object' ? raw.global.shadow : {},
+        /* 旧数据没有 writers 表：就地补空结构（懒迁移，键在首次 set 后自动盖章） */
+        writers: raw.global && raw.global.writers && typeof raw.global.writers === 'object' ? raw.global.writers : { production: {}, shadow: {} },
       },
       local: raw.local && typeof raw.local === 'object' ? raw.local : {},
     };
+    for (const ns of ['production', 'shadow']) {
+      if (!cache.global.writers[ns] || typeof cache.global.writers[ns] !== 'object') cache.global.writers[ns] = {};
+    }
   } catch (e) {
     cache = empty();
   }
@@ -86,8 +99,20 @@ function set(scope, scriptId, key, value, dryRun) {
   map[ns][k] = copy;
   /* 值未变不发：同值重复 set 是脚本常见写法（防抖/心跳），不能刷屏订阅者。
    * 用序列化比较覆盖对象/数组；undefined → null 这类差异按真实值比较。 */
-  if (scope === 'global' && (!had || JSON.stringify(prev) !== JSON.stringify(copy))) {
-    changes.emit('change', { scope, namespace: ns, key: k, value: clone(copy), prev, writerSid: String(scriptId || '') });
+  if (scope === 'global') {
+    /* 单写者约定落地：写者身份落盘 + 被其他脚本接管时告警（软约束，不拒绝——
+     * 避免误伤一次性接管场景；约定漂移靠告警暴露，由人裁决）。 */
+    const writers = data.global.writers[ns] || (data.global.writers[ns] = {});
+    const prevW = writers[k] || null;
+    const sid = String(scriptId || '');
+    if (prevW && prevW !== sid) {
+      process.emitWarning(`全局上下文单写者约定告警：key=${k} 前写者=${prevW} 本次写入=${sid}`);
+    }
+    writers[k] = sid;
+    /* 值未变不发：同值重复 set 是脚本常见写法（防抖/心跳），不能刷屏订阅者。 */
+    if (!had || JSON.stringify(prev) !== JSON.stringify(copy)) {
+      changes.emit('change', { scope, namespace: ns, key: k, value: clone(copy), prev, writerSid: sid });
+    }
   }
 
   writeChain = writeChain.then(() => {
@@ -116,7 +141,28 @@ function snapshot(dryRun) {
   for (const [ns, value] of Object.entries(data.local)) {
     if (ns.endsWith(':' + nsGlobal)) local[ns] = clone(value);
   }
-  return { global: clone(data.global[nsGlobal] || {}), local };
+  return {
+    global: clone(data.global[nsGlobal] || {}),
+    writers: clone(data.global.writers[nsGlobal] || {}), // key -> 写者脚本 id（单写者约定可观测）
+    local,
+  };
+}
+
+/* key 的写者身份（global 专用；执行器 contextGet withMeta / 写者状态派发共用） */
+function writerOf(key, dryRun) {
+  const k = validKey(key);
+  if (!k) return null;
+  const data = readAll();
+  const ns = dryRun ? 'shadow' : 'production';
+  return data.global.writers[ns][k] || null;
+}
+
+/* 某写者脚本写过的全部 global key（写者停止/重启时派发 writerState 用） */
+function keysByWriter(ns, sid) {
+  const data = readAll();
+  const writers = data.global.writers[ns] || {};
+  const s = String(sid || '');
+  return Object.keys(writers).filter((k) => writers[k] === s);
 }
 
 /* 删除脚本时清理其 ctx.local 命名空间（<sid>:shadow / <sid>:production）。
@@ -146,4 +192,4 @@ function onChange(cb) {
   return () => changes.off('change', cb);
 }
 
-module.exports = { get, set, snapshot, removeScript, onChange, validKey };
+module.exports = { get, set, snapshot, removeScript, onChange, validKey, writerOf, keysByWriter };

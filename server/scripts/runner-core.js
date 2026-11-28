@@ -8,8 +8,8 @@
  *             OS 抢占式公平调度 + terminate 强杀异步续体，内存居中。
  *
  * 消息协议：
- *   core → 宿主 : { log | subscribe | contextSubscribe | contextUnsubscribe | taskSubscribe | taskUnsubscribe | request | done }
- *   宿主 → core : { run | reply | state | contextChange | taskState | mode | suspend | resume | stop }
+ *   core → 宿主 : { log | subscribe | contextSubscribe | contextUnsubscribe | request | done }
+ *   宿主 → core : { run | reply | state | contextChange | contextWriterState | mode | suspend | resume | stop }
  *
  * 安全边界：AST 白名单（提交时校验）+ realm 沙箱（切断宿主逃逸链）+
  * 脚本层 ctx.write 写闸（影子 / 开发模式）+ 主进程 executor 硬拦截。 */
@@ -60,8 +60,12 @@ function createCore({ emit, clock }) {
   const writeStats = { intent: 0, sent: 0, blocked: 0 }; // 提到闭包层，供 simState 快照读取
   const subscriptions = new Map(); // entityId -> [cb]
   const globalSubs = new Map();    // ctx.global.watch：key -> Set<cb>（返回取消订阅函数）
-  const taskSubs = new Map();      // ctx.task.watch：scriptId -> Set<cb>（返回取消订阅函数）
-  const taskWaiters = new Map();   // ctx.task.require：scriptId -> Set<{resolve,timer}>（状态变化提前唤醒）
+  const globalReplay = new Map();  // ctx.global.watch 默认回放：cb -> key（真实事件先到则丢弃回放值）
+  const globalWriter = new Map();  // ctx.global.watch 写者缓存：key -> { w, state }（来自注册时 withMeta）
+  const writerDebounce = new Map(); // 写者失效防抖：key -> timer（持续 debounceMs 仍非 running 才上报）
+  const globalDebounceMs = new Map(); // key -> 防抖时长（首次注册的 opts 定格，默认 5000）
+  const localSubs = new Map();     // ctx.local.watch：key -> Set<cb>（脚本私有桶，runner 内闭环，无 IPC 订阅）
+  const localReplay = new Map();   // ctx.local.watch 默认回放：cb -> key（真实事件先到则丢弃回放值）
   const timers = new Map();        // ctx.after 定时器：id -> timeout（stop 时统一清理）
   const intervals = new Set();     // sandbox.setInterval 建立的循环定时器（stop 时统一 clear）
   let timerSeq = 0;
@@ -86,37 +90,8 @@ function createCore({ emit, clock }) {
     if (msg.ok) w.resolve(msg.result); else w.reject(new Error(msg.error || '主进程请求失败'));
   }
 
-  /* ctx.task.require 的等待门闩：任务状态变化（host 下发 taskState）时提前唤醒，
-   * 未变化则由短超时兜底轮询（防止订阅与状态变更之间的竞态窗口）。 */
-  function waitTaskChange(sid, ms) {
-    return new Promise((resolve) => {
-      let set = taskWaiters.get(sid);
-      if (!set) { set = new Set(); taskWaiters.set(sid, set); }
-      const entry = { resolve, timer: null };
-      entry.timer = clk.setTimeout(() => {
-        set.delete(entry);
-        if (!set.size) taskWaiters.delete(sid);
-        resolve();
-      }, Math.max(0, ms));
-      set.add(entry);
-    });
-  }
-  function notifyTaskWaiters(sid) {
-    const set = taskWaiters.get(sid);
-    if (!set) return;
-    for (const entry of [...set]) {
-      clk.clearTimeout(entry.timer);
-      set.delete(entry);
-      entry.resolve();
-    }
-    taskWaiters.delete(sid);
-  }
-  function clearTaskWaiters() {
-    for (const set of taskWaiters.values()) {
-      for (const entry of set) { clk.clearTimeout(entry.timer); entry.resolve(); }
-    }
-    taskWaiters.clear();
-  }
+  /* ctx.task.require 的等待：无订阅唤醒通道（task.watch 已删除、taskState 消息随之下线），
+   * 纯靠 ≤200ms 短超时轮询 taskStatus——查询粒度对启动门闩足够，逻辑自包含无竞态窗口。 */
 
   /* realm 函数受控调用的唯一通道：同步部分受 vm timeout 中断。
    * wantResult=true → await 结果并把异常抛给调用方（hold 的 condition/watcher 用）；
@@ -274,26 +249,127 @@ function createCore({ emit, clock }) {
     return { sandbox, context, conv };
   }
 
+  /* 写者状态折叠的共享实现（api 定义与事件派发两处共用）：
+   * fireWriterState：按值变化同款签名回调全部订阅者，value = prev = 当前存量值 */
+  function fireWriterState(key, value, sid, state, reason) {
+    const set = globalSubs.get(key);
+    if (!set || !set.size || ctxRuntime.stopped) return;
+    const info = { key, writerSid: sid, namespace: 'production', type: 'writerState', state, reason: reason || '' };
+    for (const cb of [...set]) guardedCall(cb, [value, value, info]);
+  }
+  /* 防抖到点复查：仍非 running 才上报 down；期间恢复（漏收 up 事件）则静默复位 */
+  function armWriterDebounce(key) {
+    if (writerDebounce.has(key)) return;
+    const cached = globalWriter.get(key);
+    if (!cached || !cached.w) return; // 写者未知（存量键未重写）无法派发写者状态
+    writerDebounce.set(key, clk.setTimeout(async () => {
+      writerDebounce.delete(key);
+      if (ctxRuntime.stopped) return;
+      let st = null;
+      try { st = await request('taskStatus', { scriptId: cached.w }); } catch (e) { st = null; }
+      if (ctxRuntime.stopped) return;
+      if (st && st.state === 'running') { cached.state = 'running'; return; }
+      const state = st && st.state ? st.state : 'stopped';
+      cached.state = state;
+      let value;
+      try { value = await request('contextGet', { scope: 'global', key }); } catch (e) { value = undefined; }
+      fireWriterState(key, value === undefined ? null : value, cached.w, state, 'debounced');
+    }, globalDebounceMs.get(key) || 5000));
+  }
+
   function contextApi(scope) {
     const api = {
       get: (key, fallback) => request('contextGet', { scope, key, default: fallback }),
       set: (key, value) => request('contextSet', { scope, key, value }),
     };
-    /* ctx.global.watch(key, cb)：只订阅 global；local 是脚本私有桶，没有跨脚本变更源。
-     * 回调签名 (value, prev, info)，info = { key, writerSid, namespace }。
-     * 读侧统一 production 命名空间，写侧仍按调用者模式隔离；过滤由主进程执行器负责。 */
-    if (scope === 'global') {
+    /* ctx.local：脚本私有桶（按 sid:通道 隔离），产生与消费都在同一 runner 内——
+     * watch 完全在 runner 内部闭环：set 写完后就地派发，不走 IPC 订阅表、
+     * 不盖写者章、无写者健康折叠、无防抖。读侧仍走宿主（仿真/落盘一致）。 */
+    if (scope === 'local') {
+      api.set = async (key, value) => {
+        const k = String(key == null ? '' : key);
+        const watched = localSubs.get(k);
+        /* 写前取旧值：只为给 watcher 一个准确的 prev；无订阅者不付这次 IPC 开销 */
+        const prev = (watched && watched.size) ? await request('contextGet', { scope: 'local', key: k }) : undefined;
+        const result = await request('contextSet', { scope, key, value });
+        if (watched && watched.size && !ctxRuntime.stopped && !signalEquals(prev, value)) {
+          dispatchLocalChange({ key: k, value, prev: prev === undefined ? null : prev, source: 'set' });
+        }
+        return result;
+      };
+      /* ctx.local.watch(key, cb)：默认回放——桶有值立即回调一次（prev=null、source='replay'），
+       * 桶无值不回放；真实事件先到则丢弃在途回放值。回调 (value, prev, info)，
+       * info = { key, scope:'local', source:'set'|'replay' }。返回 off()（幂等）。 */
       api.watch = (key, cb) => {
+        const k = String(key == null ? '' : key);
+        if (!k || typeof cb !== 'function') throw new Error('ctx.local.watch 需要 key 与回调函数');
+        let set = localSubs.get(k);
+        if (!set) { set = new Set(); localSubs.set(k, set); }
+        set.add(cb);
+        localReplay.set(cb, k);
+        request('contextGet', { scope: 'local', key: k }).then((v) => {
+          if (ctxRuntime.stopped) return;
+          if (localReplay.get(cb) !== k) return;  // 真实事件先到，丢弃回放
+          localReplay.delete(cb);
+          if (v === undefined) return;            // 桶无值：不回放
+          if (!set.has(cb)) return;               // 已 off
+          guardedCall(cb, [v, null, { key: k, scope: 'local', source: 'replay' }]);
+        }).catch(() => localReplay.delete(cb));
+        return makeOff(set, cb, () => {
+          localReplay.delete(cb);
+          if (!set.size) localSubs.delete(k);
+        });
+      };
+    }
+    /* ctx.global.watch(key, cb, opts?)：只订阅 global；local 是脚本私有桶，没有跨脚本变更源。
+     * 回调签名 (value, prev, info)。两种事件共用同一签名，靠 info.type 区分：
+     *   ① 值变化（type 缺省）：info = { key, writerSid, namespace, source? }；
+     *   ② 写者状态（info.type='writerState'）：写者实例状态变化折叠进同一回调，
+     *      info = { key, writerSid, namespace, type:'writerState', state, reason }，
+     *      value = prev = 当前存量值（旧消费者当作"值没变的通知"消化，天然兼容）。
+     * opts = { debounceMs? }：写者失效防抖——非 running 持续 debounceMs 才上报 down，
+     *   恢复 running 立即上报并取消计时（防抖计时走虚拟时钟，仿真 advance 可推动）；
+     *   首次注册的 opts 定格该 key 的时长（多回调共享一个 key 通道），缺省 5000。
+     * 回放：注册即拉 {v, w, ws}——桶有值立即按值变化回调一次（prev=null、source='replay'，
+     *   writerSid=存储的真实写者）；写者当前非 running 同样过防抖后才上报（注册即复查）。
+     * 桶无值不回放（fallback 场景留给 ctx.global.get）；真实事件先到则丢弃回放值。 */
+    if (scope === 'global') {
+      api.watch = (key, cb, opts) => {
         const k = String(key == null ? '' : key);
         if (!k || typeof cb !== 'function') throw new Error('ctx.global.watch 需要 key 与回调函数');
         let set = globalSubs.get(k);
         if (!set) { set = new Set(); globalSubs.set(k, set); }
         const first = set.size === 0;
         set.add(cb);
+        if (first && opts && opts.debounceMs !== undefined) {
+          const ms = Number(opts.debounceMs);
+          if (Number.isFinite(ms) && ms >= 0) globalDebounceMs.set(k, ms);
+        }
         if (first) emit({ type: 'contextSubscribe', scope: 'global', key: k });
+        globalReplay.set(cb, k);
+        request('contextGet', { scope: 'global', key: k, withMeta: true }).then((meta) => {
+          if (ctxRuntime.stopped) return;
+          const m = meta && typeof meta === 'object' && 'v' in meta ? meta : { v: meta, w: null, ws: null };
+          if (first && m.w) {
+            globalWriter.set(k, { w: m.w, state: m.ws || 'stopped' });
+            if (m.ws && m.ws !== 'running') armWriterDebounce(k); // 注册即失效：同样过防抖
+          }
+          if (!globalReplay.has(cb) || globalReplay.get(cb) !== k) return;
+          globalReplay.delete(cb);
+          if (m.v === undefined) return; // 桶无值：不回放
+          if (!set.has(cb)) return;      // 已 off
+          guardedCall(cb, [m.v, null, { key: k, writerSid: m.w || '', namespace: 'production', source: 'replay' }]);
+        }).catch(() => globalReplay.delete(cb));
         return makeOff(set, cb, () => {
-          globalSubs.delete(k);
-          emit({ type: 'contextUnsubscribe', scope: 'global', key: k });
+          globalReplay.delete(cb);
+          if (!set.size) {
+            globalSubs.delete(k);
+            globalWriter.delete(k);
+            globalDebounceMs.delete(k);
+            const t = writerDebounce.get(k);
+            if (t) { clk.clearTimeout(t); writerDebounce.delete(k); }
+            emit({ type: 'contextUnsubscribe', scope: 'global', key: k });
+          }
         });
       };
     }
@@ -328,27 +404,13 @@ function createCore({ emit, clock }) {
         if (last && last.state === 'running') return last; // 一次性门闩：首次 running 后不再阻断
         const left = deadline - clk.now();
         if (left <= 0) throw new Error(`等待依赖脚本 ${sid} 超时（${timeoutMs}ms，当前状态：${last && last.state || 'unknown'}）`);
-        await waitTaskChange(sid, Math.min(200, left));
+        await new Promise((r) => clk.setTimeout(r, Math.min(200, left)));
       }
     };
 
-    /* ctx.task.watch(scriptId, cb)：订阅另一个脚本的运行状态（软通知，业务侧自行兜底重启抖动）。
-     * 与 status/require 同属 task.* 家族：查一次 / 等到 running / 订阅变化。
-     * 回调签名 (state, info)，info = { scriptId, version, mode, reason }；
-     * 注册时主进程立即回放当前状态；返回 off() 取消订阅。 */
-    const taskWatch = (scriptId, cb) => {
-      const sid = String(scriptId == null ? '' : scriptId);
-      if (!sid || typeof cb !== 'function') throw new Error('ctx.task.watch 需要脚本 id 与回调函数');
-      let set = taskSubs.get(sid);
-      if (!set) { set = new Set(); taskSubs.set(sid, set); }
-      const first = set.size === 0;
-      set.add(cb);
-      if (first) emit({ type: 'taskSubscribe', scriptId: sid });
-      return makeOff(set, cb, () => {
-        taskSubs.delete(sid);
-        emit({ type: 'taskUnsubscribe', scriptId: sid });
-      });
-    };
+    /* ctx.task.watch 已删除（2026-11-28）：单写者约定下，依赖脚本的健康监控由
+     * ctx.global.watch 的写者状态折叠统一承载（写者失效折叠派发进它写过的 key 的
+     * 同一回调通道，防抖内建）。task.* 只保留 status（查一次）与 require（等到 running）。 */
 
     const ctx = {
       scriptId: String(meta.sid || meta.id || ''),
@@ -368,14 +430,16 @@ function createCore({ emit, clock }) {
         },
       },
       log: (level, message, nodeId) => emit({ type: 'log', level: String(level || 'info'), message: String(message), nodeId: nodeId ? String(nodeId) : undefined }),
-      sleep: (ms) => new Promise((r) => clk.setTimeout(r, Math.max(0, Number(ms) || 0))),
+      /* sleep 走 scheduleTimer：登记进 timers 注册表，stop 时由 cleanupLocal 统一清理
+       * 并因 stopped 闸不再 resolve 续体——脚本从 await 处安静让步，不产生悬挂续体
+       * 继续做副作用（此前裸 setTimeout 不在注册表，stop 后仍会唤醒续体）。 */
+      sleep: (ms) => new Promise((resolve) => scheduleTimer(resolve, Math.max(0, Number(ms) || 0))),
       /* 被 ctx.call 触发时携带的入参（主进程注入 meta.callParams）；未被调用时为 null。
        * 由 buildSandbox 的 conv 转成 realm 安全对象，脚本拿不到宿主对象。 */
       params: meta.callParams === undefined ? null : meta.callParams,
-      /* 依赖脚本状态：status 查一次；require 一直等到 running（默认 30s 超时）；
-       * watch 订阅变化（软通知，注册即回放当前状态）。
-       * status/require 返回 { scriptId, version, mode, state, info }；重启抖动由业务侧用防抖兜底。 */
-      task: { status: taskStatus, require: taskRequire, watch: taskWatch },
+      /* 依赖脚本状态（只读原语）：status 查一次；require 一直等到 running（默认 30s 超时）。
+       * 订阅类能力已并入 ctx.global.watch 的写者状态折叠通道。 */
+      task: { status: taskStatus, require: taskRequire },
       /* 显式联动：触发另一个脚本/场景的正式或影子版本（跟随调用者模式）。
        * 只等"启动回执"，不等被调脚本跑完；目标类型/防重入/防递归全在主进程执行器裁决。 */
       call: (scriptId, params) => {
@@ -542,6 +606,77 @@ function createCore({ emit, clock }) {
       }, period);
       timers.set(id, t);
       return id;
+    };
+
+    /* ctx.gate()：合并门——事件驱动评估的忙时合并执行器（每次调用创建独立门）。
+     * gate.run(fn)：空闲 → 立即执行 fn，返回 Promise<true>；执行中再调 run → 只保留
+     *   最新一次 pending（旧 pending 以"被合并"结束），当前 fn 结束后自动补跑，返回
+     *   Promise<false>；stopped → 直接 false 不执行。
+     * fn 同步/异步异常均记 error 日志、不向外抛（调用方 fire-and-forget 为主）。
+     * 与 ctx.lock 的区别：lock 忙跳过（不排队，适合防重入）；gate 忙合并（不丢最后一次，
+     * 适合 watch 回调驱动的评估——事件合并后只回答"现在是什么"，不保证中间序列）。
+     * stop / cleanup 时 pending 直接丢弃。 */
+    const gateRun = (fn) => Promise.resolve().then(fn).catch((e) => {
+      emit({ type: 'log', level: 'error', message: 'gate 执行异常：' + (e && e.message || e) });
+    });
+    ctx.gate = () => {
+      let running = false;
+      let pending = null; // { fn }
+      const finish = () => {
+        if (ctxRuntime.stopped || !pending) { pending = null; running = false; return; }
+        const { fn } = pending;
+        pending = null;
+        gateRun(fn).finally(finish);
+      };
+      return {
+        run(fn) {
+          if (typeof fn !== 'function') throw new Error('gate.run 需要回调函数');
+          if (ctxRuntime.stopped) return Promise.resolve(false);
+          if (running) { pending = { fn }; return Promise.resolve(false); }
+          running = true;
+          gateRun(fn).finally(finish);
+          return Promise.resolve(true);
+        },
+      };
+    };
+
+    /* ctx.ref(初始值?)：脚本内响应式值单元（纯闭包内存，不落盘、不跨脚本）。
+     * 用法：const a = ctx.ref(0); a.value = 1; a.watch((v, prev, info) => {...})。
+     * 赋值判定：与旧值 signalEquals 相等 → 静默吞掉（标量严格相等，对象/数组按 JSON
+     *   结构比较，与 hold 的 expect 判定同款，结构相同的新对象不会误报"变化"）；
+     *   不同 → 更新内部值并同步回调全部 watcher（按注册顺序）。
+     * watch 回调签名 (value, prev, info)，info = { source: 'set' | 'replay' }；
+     *   返回 off() 取消订阅；同一 ref 可多次 watch。
+     * 注册是否立即通知：默认**不**——ref 由本脚本自己创建，初始值在创建处已知，
+     *   需要"先跑一遍"的消费逻辑请直接读 a.value（或抽成函数手动调一次）；
+     *   opts.immediate = true 可显式打开回放（value=当前值、prev=null、source='replay'）。
+     * 与 ctx.global.watch 的分工：global.watch 订阅跨脚本共享桶（值变化 + 写者失效
+     *   折叠派发，持久化在 data/context.json）；ref 是脚本私有、进程内、重启即失——
+     *   只装"只有本脚本读且重启可重算"的运行时状态（存储分层判据的内存档）。
+     * stop 后赋值仍更新内部值，但不再触发 watcher（与全局订阅派发一致的停止语义）。 */
+    ctx.ref = (initial) => {
+      let value = initial === undefined ? null : initial;
+      const subs = new Set();
+      const notify = (v, prev, info) => {
+        for (const cb of [...subs]) guardedCall(cb, [v, prev, info]);
+      };
+      return {
+        get value() { return value; },
+        set value(nv) {
+          const prev = value;
+          if (signalEquals(prev, nv)) return;
+          value = nv;
+          if (!ctxRuntime.stopped) notify(nv, prev, { source: 'set' });
+        },
+        watch(cb, opts) {
+          if (typeof cb !== 'function') throw new Error('ref.watch 需要回调函数');
+          subs.add(cb);
+          if (opts && opts.immediate && !ctxRuntime.stopped) {
+            guardedCall(cb, [value, null, { source: 'replay' }]);
+          }
+          return () => { subs.delete(cb); };
+        },
+      };
     };
 
     /* ctx.hold：期待值/期待条件的双边迟滞确认器（ref-like 句柄）。
@@ -806,6 +941,9 @@ function createCore({ emit, clock }) {
   }
 
   function dispatchState(eid, state, prev) {
+    /* stop 宽限期内主进程已摘订阅，但在途的 state 消息仍可能到达：入口统一挡一道，
+     * 与 ctx.write 兜底闸同口径——stopped 后不再触发任何脚本回调。 */
+    if (ctxRuntime.stopped) return;
     const key = String(eid || '');
     const cbs = subscriptions.get(key) || [];
     /* 回调签名固定为 (nextObj, prevObj) 完整状态对象，与 ctx.ha.state() 返回字符串不同（契约 §6）。
@@ -814,20 +952,58 @@ function createCore({ emit, clock }) {
     for (const cb of cbs) guardedCall(cb, [state, prev]);
   }
 
+  /* ctx.local 的外部写入事件（仿真 inject_context scope=local 经 world.dispatch 回送）：
+   * 真实执行器的 local 写入不发 IPC 事件（只有本 runner 自己写、已在 api.set 内派发），
+   * 仿真注入是唯一的外部来源——同样清回放、按 key 同步派发本 runner 的订阅者。 */
+  function dispatchLocalChange(msg) {
+    const key = String(msg.key || '');
+    for (const [cb, k] of localReplay) if (k === key) localReplay.delete(cb);
+    const cbs = localSubs.get(key);
+    if (!cbs || !cbs.size || ctxRuntime.stopped) return;
+    const info = { key, scope: 'local', source: msg.source || 'set' };
+    for (const cb of [...cbs]) guardedCall(cb, [msg.value, msg.prev, info]);
+  }
+
   function dispatchGlobalChange(msg) {
     if (msg.scope !== 'global') return;
+    /* stop 宽限期内订阅虽已从主进程摘除，在途 contextChange 仍可能到达；
+     * 入口挡一道，stopped 后 global.watch 的回调（值事件）不再触发。 */
+    if (ctxRuntime.stopped) return;
     const key = String(msg.key || '');
+    /* 真实变更先到：该 key 上等待回放的订阅以事件为准，丢弃随后到达的回放值 */
+    for (const [cb, k] of globalReplay) if (k === key) globalReplay.delete(cb);
+    /* 写者章迟到补建：注册时写者未知（存量键在消费者注册前尚未被写 / 仿真 fixture 后盖章），
+     * 首个带 writerSid 的值事件据此补建缓存——刚写完的写者必然 running。否则写者失效
+     * 防抖永远无从发起（up 事件无缓存也派发、down 事件无缓存静默的不对称）。 */
+    if (msg.writerSid && !globalWriter.has(key)) {
+      globalWriter.set(key, { w: String(msg.writerSid), state: 'running' });
+    }
     const cbs = [...(globalSubs.get(key) || [])];
     const info = { key, writerSid: msg.writerSid || '', namespace: msg.namespace || '' };
     for (const cb of cbs) guardedCall(cb, [msg.value, msg.prev, info]);
   }
 
-  function dispatchTaskState(msg) {
+  /* 写者状态事件（宿主折叠派发）：running → 立即上报并取消防抖；
+   * 非 running → 起/续防抖计时，到点由 armWriterDebounce 复查后上报 */
+  function dispatchWriterState(msg) {
+    if (msg.scope !== 'global') return;
+    if (ctxRuntime.stopped) return;
+    const key = String(msg.key || '');
+    if (!globalSubs.has(key)) return;
+    const cached = globalWriter.get(key);
     const sid = String(msg.scriptId || '');
+    if (cached && cached.w && cached.w !== sid) return; // 写者漂移保护（执行器已过滤，双保险）
     const state = String(msg.state || 'stopped');
-    const info = msg.info || {};
-    for (const cb of [...(taskSubs.get(sid) || [])]) guardedCall(cb, [state, info]);
-    notifyTaskWaiters(sid);
+    if (state === 'running') {
+      const t = writerDebounce.get(key);
+      if (t) { clk.clearTimeout(t); writerDebounce.delete(key); }
+      if (cached) cached.state = 'running';
+      fireWriterState(key, msg.value, sid, 'running', msg.reason);
+      return;
+    }
+    if (cached) cached.state = state;
+    if (writerDebounce.has(key)) return; // 防抖已在计时，不重复起表
+    armWriterDebounce(key);
   }
 
   function handleMessage(msg) {
@@ -847,10 +1023,11 @@ function createCore({ emit, clock }) {
         dispatchState(msg.entityId, msg.state, msg.prev);
         return;
       case 'contextChange':
-        dispatchGlobalChange(msg);
+        if (msg.scope === 'local') dispatchLocalChange(msg);
+        else dispatchGlobalChange(msg);
         return;
-      case 'taskState':
-        dispatchTaskState(msg);
+      case 'contextWriterState':
+        dispatchWriterState(msg);
         return;
       case 'mode':
         /* 只切换通道身份（dryRun），devMode 是环境属性、发布热切不改变它。 */
@@ -890,8 +1067,13 @@ function createCore({ emit, clock }) {
   /* stop 的清理体（不含日志）：订阅只对活实例有效、定时器退出后不得再触发写操作。 */
   function cleanupLocal() {
     globalSubs.clear();
-    taskSubs.clear();
-    clearTaskWaiters(); // 唤醒 require 的 await，让它检查 stopped 后自行让步退出
+    globalReplay.clear(); // 回放请求即使还在途，stopped 后回调前有 stopped 闸
+    localSubs.clear();
+    localReplay.clear();
+    for (const t of writerDebounce.values()) clk.clearTimeout(t);
+    writerDebounce.clear();
+    globalWriter.clear();
+    globalDebounceMs.clear();
     for (const t of timers.values()) clearTimeout(t);
     timers.clear();
     for (const id of intervals) clearInterval(id);
@@ -916,7 +1098,7 @@ function createCore({ emit, clock }) {
     const watchers = [];
     for (const key of subscriptions.keys()) watchers.push({ kind: 'entity', key });
     for (const key of globalSubs.keys()) watchers.push({ kind: 'context', scope: 'global', key });
-    for (const key of taskSubs.keys()) watchers.push({ kind: 'task', scriptId: key });
+    for (const key of localSubs.keys()) watchers.push({ kind: 'context', scope: 'local', key });
     return {
       execution: { state: runActive ? 'running' : 'idle', lastNodeId: null, runCount, lastError: null },
       watchers,
